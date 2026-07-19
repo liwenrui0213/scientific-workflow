@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "gpu_protocol_threshold_hours": 10.0,
+  "expensive_cpu_threshold_hours": 100.0,
+  "scientific_critical_path_patterns": [
+    "src/**",
+    "lib/**",
+    "models/**",
+    "evaluators/**"
+  ],
+  "protected_path_patterns": [
+    "studies/*/BRIEF.md",
+    "studies/*/BRIEF.approval.json",
+    "studies/*/formal/EVALUATOR.json",
+    "studies/*/formal/DATASET_SPLIT.json",
+    "studies/*/formal/ACCEPTANCE_CRITERIA.json",
+    "studies/*/runs/*/manifest.json",
+    "studies/*/evidence/*.json",
+    "studies/*/VERDICT*.json"
+  ],
+  "formal_artifacts": {
+    "METHOD": "formal/METHOD.md",
+    "PROTOCOL": "formal/PROTOCOL.json",
+    "EVALUATOR": "formal/EVALUATOR.json",
+    "PLAN": "formal/PLAN.json"
+  },
+  "formalization_debt_levels": [
+    "advisory",
+    "required_before_expensive_run",
+    "required_before_evidence",
+    "required_before_review",
+    "blocking_now"
+  ],
+  "default_hardware_class": "unspecified",
+  "default_precision": "unspecified"
+}

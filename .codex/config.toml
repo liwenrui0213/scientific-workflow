@@ -1,0 +1,25 @@
+model = "gpt-5.6"
+model_reasoning_effort = "high"
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+review_model = "gpt-5.6"
+project_root_markers = [".git", "AGENTS.md"]
+
+[sandbox_workspace_write]
+network_access = false
+
+[agents]
+max_threads = 2
+max_depth = 1
+
+[features]
+hooks = true
+
+[[hooks.PreToolUse]]
+matcher = "^(Bash|apply_patch|Edit|Write)$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = '/usr/bin/python3 "$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.codex/hooks/pre_tool_policy.py"'
+timeout = 30
+statusMessage = "Checking scientific workflow policy"

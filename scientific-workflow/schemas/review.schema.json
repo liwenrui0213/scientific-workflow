@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/scientific-workflow/review.schema.json",
+  "title": "Independent structured scientific review",
+  "type": "object",
+  "required": [
+    "schema_version", "study_id", "reviewed_at", "reviewer", "review_packet_sha256",
+    "summary", "requirement_coverage", "implementation_findings",
+    "protected_condition_findings", "cohort_findings", "reproducibility_findings",
+    "scientific_claim_findings", "contradictory_evidence_findings",
+    "formalization_findings", "open_questions", "recommended_human_checks"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "study_id": {"type": "string", "pattern": "^SC-[0-9]{4,}$"},
+    "reviewed_at": {"type": "string", "minLength": 1},
+    "reviewer": {
+      "type": "object",
+      "required": ["identity"],
+      "properties": {
+        "identity": {"type": "string", "minLength": 1},
+        "source": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "review_packet_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "summary": {"type": "string", "minLength": 1},
+    "requirement_coverage": {"type": "array", "items": {"$ref": "#/$defs/finding"}},
+    "implementation_findings": {"type": "array", "items": {"$ref": "#/$defs/finding"}},
+    "protected_condition_findings": {"type": "array", "items": {"$ref": "#/$defs/finding"}},
+    "cohort_findings": {"type": "array", "items": {"$ref": "#/$defs/finding"}},
+    "reproducibility_findings": {"type": "array", "items": {"$ref": "#/$defs/finding"}},
+    "scientific_claim_findings": {"type": "array", "items": {"$ref": "#/$defs/finding"}},
+    "contradictory_evidence_findings": {"type": "array", "items": {"$ref": "#/$defs/finding"}},
+    "formalization_findings": {"type": "array", "items": {"$ref": "#/$defs/finding"}},
+    "open_questions": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "recommended_human_checks": {"type": "array", "items": {"type": "string", "minLength": 1}}
+  },
+  "$defs": {
+    "source": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": {"enum": ["file", "commit", "run", "evidence", "claim", "brief", "checkpoint"]},
+        "path": {"type": "string", "minLength": 1},
+        "symbol": {"type": "string", "minLength": 1},
+        "line": {"type": "integer", "minimum": 1},
+        "commit": {"type": "string", "minLength": 1},
+        "run_id": {"type": "string", "pattern": "^RUN-[0-9]{6}$"},
+        "evidence_id": {"type": "string", "pattern": "^EVID-[0-9]{4,}$"},
+        "version": {"type": "integer", "minimum": 1},
+        "claim_id": {"type": "string", "pattern": "^CLAIM-[0-9]{4,}$"},
+        "checkpoint_id": {"type": "string", "pattern": "^CHECKPOINT-[0-9]{6}$"},
+        "note": {"type": "string", "minLength": 1}
+      },
+      "oneOf": [
+        {"required": ["path"], "properties": {"kind": {"const": "file"}}},
+        {"required": ["path"], "properties": {"kind": {"const": "brief"}}},
+        {"required": ["commit"], "properties": {"kind": {"const": "commit"}}},
+        {"required": ["run_id"], "properties": {"kind": {"const": "run"}}},
+        {"required": ["evidence_id"], "properties": {"kind": {"const": "evidence"}}},
+        {"required": ["claim_id"], "properties": {"kind": {"const": "claim"}}},
+        {"required": ["checkpoint_id"], "properties": {"kind": {"const": "checkpoint"}}}
+      ],
+      "additionalProperties": false
+    },
+    "finding": {
+      "type": "object",
+      "required": ["finding_id", "severity", "title", "description", "sources", "recommendation"],
+      "properties": {
+        "finding_id": {"type": "string", "minLength": 1},
+        "severity": {"enum": ["critical", "major", "minor", "info"]},
+        "title": {"type": "string", "minLength": 1},
+        "description": {"type": "string", "minLength": 1},
+        "sources": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/source"}},
+        "recommendation": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

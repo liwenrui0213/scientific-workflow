@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/scientific-workflow/evidence.schema.json",
+  "title": "Versioned scientific Evidence",
+  "type": "object",
+  "required": [
+    "schema_version", "study_id", "evidence_id", "version", "status",
+    "created_at", "updated_at", "addresses", "runs", "analysis", "result",
+    "scope", "uncertainty", "limitations", "assessment", "related_evidence",
+    "record_sha256"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "study_id": {"type": "string", "pattern": "^SC-[0-9]{4,}$"},
+    "evidence_id": {"type": "string", "pattern": "^EVID-[0-9]{4,}$"},
+    "version": {"type": "integer", "minimum": 1},
+    "status": {"enum": ["draft", "finalized"]},
+    "created_at": {"type": "string", "minLength": 1},
+    "updated_at": {"type": "string", "minLength": 1},
+    "addresses": {
+      "type": "object",
+      "required": ["claim_ids", "question"],
+      "properties": {
+        "claim_ids": {"type": "array", "minItems": 1, "items": {"type": "string", "pattern": "^CLAIM-[0-9]{4,}$"}},
+        "question": {"type": ["string", "null"]}
+      },
+      "additionalProperties": false
+    },
+    "runs": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/run_ref"}},
+    "analysis": {
+      "type": "object",
+      "required": ["method", "comparison"],
+      "properties": {
+        "method": {"type": ["string", "null"]},
+        "comparison": {"$ref": "#/$defs/comparison"}
+      },
+      "additionalProperties": false
+    },
+    "result": {"type": ["object", "string", "number", "array", "boolean", "null"]},
+    "scope": {"type": ["string", "null"]},
+    "uncertainty": {"type": ["string", "object", "null"]},
+    "limitations": {"type": "array", "items": {"type": "string"}},
+    "assessment": {"enum": ["supports", "contradicts", "mixed", "inconclusive", null]},
+    "related_evidence": {
+      "type": "object",
+      "required": ["supporting", "contradictory"],
+      "properties": {
+        "supporting": {"type": "array", "items": {"$ref": "#/$defs/evidence_ref"}},
+        "contradictory": {"type": "array", "items": {"$ref": "#/$defs/evidence_ref"}}
+      },
+      "additionalProperties": false
+    },
+    "record_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"}
+  },
+  "$defs": {
+    "run_ref": {
+      "type": "object",
+      "required": ["run_id", "manifest_sha256", "role"],
+      "properties": {
+        "run_id": {"type": "string", "pattern": "^RUN-[0-9]{6}$"},
+        "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "role": {"enum": ["supporting", "contradictory", "failed_direction", "context"]}
+      },
+      "additionalProperties": false
+    },
+    "comparison": {
+      "type": "object",
+      "required": ["mode", "cohort_fingerprints", "changed_fields", "compatibility_justification"],
+      "properties": {
+        "mode": {"enum": ["single_cohort", "compatible_cohorts"]},
+        "cohort_fingerprints": {"type": "array", "minItems": 1, "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}},
+        "changed_fields": {"type": "array", "items": {"type": "string"}},
+        "compatibility_justification": {"type": ["string", "null"]}
+      },
+      "additionalProperties": false
+    },
+    "evidence_ref": {
+      "type": "object",
+      "required": ["evidence_id", "version", "sha256"],
+      "properties": {
+        "evidence_id": {"type": "string", "pattern": "^EVID-[0-9]{4,}$"},
+        "version": {"type": "integer", "minimum": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

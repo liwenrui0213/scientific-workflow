@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/scientific-workflow/brief-approval.schema.json",
+  "title": "Procedural local Brief approval",
+  "type": "object",
+  "required": ["schema_version", "study_id", "brief", "protected_artifacts", "approved_at", "reviewer", "repository", "approval_sha256"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "study_id": {"type": "string", "pattern": "^SC-[0-9]{4,}$"},
+    "brief": {
+      "type": "object",
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "protected_artifacts": {
+      "type": "object",
+      "required": ["evaluator", "dataset_split", "acceptance_criteria"],
+      "properties": {
+        "evaluator": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/file_ref"}]},
+        "dataset_split": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/file_ref"}]},
+        "acceptance_criteria": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/file_ref"}]}
+      },
+      "additionalProperties": false
+    },
+    "approved_at": {"type": "string", "minLength": 1},
+    "reviewer": {
+      "type": "object",
+      "required": ["identity", "source"],
+      "properties": {
+        "identity": {"type": "string", "minLength": 1},
+        "source": {"enum": ["STUDYCTL_REVIEWER", "git_config", "local_account"]}
+      },
+      "additionalProperties": false
+    },
+    "repository": {
+      "type": "object",
+      "required": ["available", "commit", "dirty", "status", "status_sha256"],
+      "properties": {
+        "available": {"type": "boolean"},
+        "commit": {"type": ["string", "null"]},
+        "dirty": {"type": ["boolean", "null"]},
+        "status": {"type": "array", "items": {"type": "string"}},
+        "status_sha256": {"type": ["string", "null"]}
+      },
+      "additionalProperties": false
+    },
+    "approval_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "$defs": {
+    "file_ref": {
+      "type": "object",
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "study_id": "{{STUDY_ID}}",
+  "revision": 1,
+  "updated_at": "{{TIMESTAMP}}",
+  "claims": [],
+  "frontier": {
+    "summary": null,
+    "claim_ids": [],
+    "open_questions": [],
+    "next_actions": [],
+    "human_decisions_required": []
+  },
+  "formalization_debt": []
+}

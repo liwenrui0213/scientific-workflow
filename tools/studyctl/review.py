@@ -1,0 +1,214 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+from .formalization import check_formalization, collect_formalization_debt
+from .git_state import git_diff_metadata, git_state
+from .hashing import atomic_write_bytes, atomic_write_json, load_json, record_digest, sha256_file
+from .models import SCHEMA_VERSION, StudyPaths, ValidationError
+from .rendering import active_formal_artifacts, render_review_markdown
+from .validation import (
+    brief_approval_issues,
+    checkpoint_paths,
+    evidence_index,
+    object_schema_issues,
+    protected_artifact_snapshot,
+    run_index,
+    validate_study,
+)
+
+
+def _evidence_key(ref: dict[str, Any]) -> tuple[str, int]:
+    return str(ref.get("evidence_id")), int(ref.get("version", 0))
+
+
+def _claim_refs(claims: dict[str, Any], field: str) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+    for claim in claims.get("claims", []):
+        for ref in claim.get(field, []):
+            key = _evidence_key(ref)
+            if key not in seen:
+                refs.append(ref)
+                seen.add(key)
+    return refs
+
+
+def _manifests_for_evidence(
+    refs: list[dict[str, Any]],
+    evidence: dict[tuple[str, int], tuple[Path, dict[str, Any]]],
+    runs: dict[str, tuple[Path, dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    run_ids: list[str] = []
+    for ref in refs:
+        record = evidence.get(_evidence_key(ref))
+        if not record:
+            continue
+        for run_ref in record[1].get("runs", []):
+            run_id = str(run_ref.get("run_id"))
+            if run_id not in run_ids:
+                run_ids.append(run_id)
+    return [runs[run_id][1] for run_id in run_ids if run_id in runs]
+
+
+def _latest_checkpoint(paths: StudyPaths) -> dict[str, Any] | None:
+    files = checkpoint_paths(paths)
+    if not files:
+        return None
+    value = load_json(files[-1])
+    return value if isinstance(value, dict) else None
+
+
+def create_review_packet(paths: StudyPaths, base_ref: str = "main") -> Path:
+    validation_issues = validate_study(paths)
+    validation_errors = [item for item in validation_issues if item.level == "ERROR"]
+    approval = load_json(paths.brief_approval) if paths.brief_approval.is_file() else None
+    claims = load_json(paths.claims)
+    if not isinstance(claims, dict):
+        raise ValidationError("CLAIMS.json must be an object")
+    evidence = evidence_index(paths)
+    runs = run_index(paths)
+    if validation_errors:
+        decisive_refs = []
+        contradictory_refs = []
+    else:
+        decisive_refs = _claim_refs(claims, "supporting_evidence")
+        contradictory_refs = _claim_refs(claims, "contradictory_evidence")
+    decisive_manifests = _manifests_for_evidence(decisive_refs, evidence, runs)
+    contradictory_manifests = _manifests_for_evidence(contradictory_refs, evidence, runs)
+    all_critical_manifests: list[dict[str, Any]] = []
+    seen_runs: set[str] = set()
+    for manifest in [*decisive_manifests, *contradictory_manifests]:
+        if manifest["run_id"] not in seen_runs:
+            all_critical_manifests.append(manifest)
+            seen_runs.add(manifest["run_id"])
+
+    approval_issues = brief_approval_issues(paths)
+    current_brief_hash = sha256_file(paths.brief)
+    current_protected = protected_artifact_snapshot(paths)
+    protected_checks = {
+        "brief_current_hash": current_brief_hash,
+        "approval_present": approval is not None,
+        "approval_current": not any(item.level == "ERROR" for item in approval_issues),
+        "approval_brief_hash": approval.get("brief", {}).get("sha256") if isinstance(approval, dict) else None,
+        "current_protected_artifacts": current_protected,
+        "approved_protected_artifacts": approval.get("protected_artifacts") if isinstance(approval, dict) else None,
+        "issues": [item.render() for item in approval_issues],
+        "critical_run_checks": [
+            {
+                "run_id": manifest["run_id"],
+                "brief_hash_matches_active": manifest.get("brief", {}).get("sha256") == current_brief_hash,
+                "approval_hash_matches_active": (
+                    isinstance(approval, dict)
+                    and manifest.get("brief", {}).get("approval_sha256") == approval.get("approval_sha256")
+                ),
+            }
+            for manifest in all_critical_manifests
+        ],
+    }
+    cohort_fingerprints = {
+        manifest["run_id"]: manifest.get("cohort", {}) for manifest in all_critical_manifests
+    }
+    git = git_diff_metadata(paths.root, base_ref)
+    deviations: list[str] = []
+    if validation_errors:
+        deviations.append(
+            f"authoritative Study validation failed with {len(validation_errors)} error(s); no Evidence was labeled decisive"
+        )
+    if not git.get("available"):
+        deviations.append(str(git.get("deviation") or "Git diff unavailable"))
+    if git_state(paths.root).get("dirty"):
+        deviations.append("working tree is dirty")
+    for manifest in all_critical_manifests:
+        if manifest.get("status") != "succeeded":
+            deviations.append(f"critical Run {manifest['run_id']} has status {manifest.get('status')}")
+        if manifest.get("brief", {}).get("sha256") != current_brief_hash:
+            deviations.append(
+                f"critical Run {manifest['run_id']} used a different Brief hash"
+            )
+        if not isinstance(approval, dict) or manifest.get("brief", {}).get(
+            "approval_sha256"
+        ) != approval.get("approval_sha256"):
+            deviations.append(
+                f"critical Run {manifest['run_id']} used a different Brief approval"
+            )
+        if manifest.get("git", {}).get("dirty"):
+            deviations.append(f"critical Run {manifest['run_id']} used a dirty working tree")
+        if manifest.get("code_state", {}).get("changed_during_run"):
+            deviations.append(f"critical Run {manifest['run_id']} changed tracked code during execution")
+        if any(record.get("changed_during_run") for record in manifest.get("inputs", [])):
+            deviations.append(f"critical Run {manifest['run_id']} had an input change during execution")
+    formalization = check_formalization(paths, {"for_review": True})
+    if formalization.blocked:
+        deviations.append("progressive-formalization review gate is BLOCKED")
+    packet = {
+        "schema_version": SCHEMA_VERSION,
+        "study_id": paths.study_id,
+        "brief": {
+            "path": paths.brief.relative_to(paths.root).as_posix(),
+            "sha256": current_brief_hash,
+            "approval": approval,
+        },
+        "active_formal_artifacts": [item for item in active_formal_artifacts(paths) if item["active"]],
+        "claims": claims,
+        "evidence": [
+            {"path": path.relative_to(paths.root).as_posix(), "object": item}
+            for _, (path, item) in sorted(evidence.items())
+        ],
+        "decisive_evidence": decisive_refs,
+        "contradictory_evidence": contradictory_refs,
+        "decisive_run_manifests": decisive_manifests,
+        "contradictory_run_manifests": contradictory_manifests,
+        "cohort_fingerprints": cohort_fingerprints,
+        "protected_condition_hash_checks": protected_checks,
+        "git_diff_metadata": git,
+        "unresolved_formalization_debt": collect_formalization_debt(paths),
+        "formalization_check": {
+            "outcome": formalization.outcome,
+            "requirements": formalization.requirements,
+        },
+        "reproducibility_commands": [
+            {
+                "run_id": manifest["run_id"],
+                "cwd": manifest.get("execution", {}).get("cwd"),
+                "argv": manifest.get("execution", {}).get("argv"),
+                "inputs": manifest.get("inputs", []),
+                "expected_outputs": manifest.get("outputs", []),
+            }
+            for manifest in all_critical_manifests
+        ],
+        "known_deviations": sorted(set(deviations)),
+        "authority_validation": {
+            "passed": not validation_errors,
+            "errors": [item.render() for item in validation_errors],
+            "warnings": [item.render() for item in validation_issues if item.level == "WARNING"],
+        },
+        "latest_checkpoint": _latest_checkpoint(paths),
+        "packet_sha256": "",
+    }
+    packet["packet_sha256"] = record_digest(packet, "packet_sha256")
+    output = paths.generated / "REVIEW_PACKET.json"
+    atomic_write_json(output, packet)
+    return output
+
+
+def import_and_render_review(paths: StudyPaths, source: Path) -> Path:
+    review = load_json(source.resolve())
+    if not isinstance(review, dict):
+        raise ValidationError("structured review must be a JSON object")
+    issues = object_schema_issues(paths.root, "review", source, review)
+    if issues:
+        raise ValidationError("invalid structured review:\n" + "\n".join(item.render() for item in issues))
+    if review.get("study_id") != paths.study_id:
+        raise ValidationError("review study_id does not match Study")
+    packet = paths.generated / "REVIEW_PACKET.json"
+    if not packet.is_file():
+        raise ValidationError("generate REVIEW_PACKET.json before importing a review")
+    if review.get("review_packet_sha256") != sha256_file(packet):
+        raise ValidationError("review does not reference the current REVIEW_PACKET.json")
+    structured_output = paths.generated / "REVIEW.json"
+    markdown_output = paths.generated / "REVIEW.md"
+    atomic_write_json(structured_output, review)
+    atomic_write_bytes(markdown_output, render_review_markdown(review))
+    return markdown_output

@@ -1,0 +1,201 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/scientific-workflow/run.schema.json",
+  "title": "Immutable scientific Run manifest",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "study_id",
+    "run_id",
+    "purpose",
+    "status",
+    "execution",
+    "git",
+    "code_state",
+    "brief",
+    "formal_artifacts",
+    "formalization",
+    "cohort",
+    "environment",
+    "budget",
+    "inputs",
+    "outputs",
+    "logs",
+    "integrity"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "study_id": {"type": "string", "pattern": "^SC-[0-9]{4,}$"},
+    "run_id": {"type": "string", "pattern": "^RUN-[0-9]{6}$"},
+    "purpose": {"type": "string", "minLength": 1},
+    "status": {"enum": ["succeeded", "failed", "interrupted", "running"]},
+    "execution": {
+      "type": "object",
+      "required": ["argv", "cwd", "started_at", "ended_at", "duration_seconds", "exit_code", "seed"],
+      "properties": {
+        "argv": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "cwd": {"type": "string", "minLength": 1},
+        "started_at": {"type": "string", "minLength": 1},
+        "ended_at": {"type": ["string", "null"]},
+        "duration_seconds": {"type": ["number", "null"], "minimum": 0},
+        "exit_code": {"type": ["integer", "null"]},
+        "seed": {"type": ["integer", "string", "null"]}
+      },
+      "additionalProperties": false
+    },
+    "git": {
+      "type": "object",
+      "required": ["available", "commit", "dirty", "status", "status_sha256"],
+      "properties": {
+        "available": {"type": "boolean"},
+        "commit": {"type": ["string", "null"]},
+        "dirty": {"type": ["boolean", "null"]},
+        "status": {"type": "array", "items": {"type": "string"}},
+        "status_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "code_state": {
+      "type": "object",
+      "required": ["before", "after", "changed_during_run"],
+      "properties": {
+        "before": {"$ref": "#/$defs/tracked_code_state"},
+        "after": {"$ref": "#/$defs/tracked_code_state"},
+        "changed_during_run": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "brief": {
+      "type": "object",
+      "required": ["path", "sha256", "approval_sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "approval_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "formal_artifacts": {"type": "array", "items": {"$ref": "#/$defs/file_hash"}},
+    "formalization": {
+      "type": "object",
+      "required": ["changed_paths", "scientific_critical", "shared_across_runs", "outcome", "requirements"],
+      "properties": {
+        "changed_paths": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "scientific_critical": {"type": "boolean"},
+        "shared_across_runs": {"type": "boolean"},
+        "outcome": {"enum": ["PASS", "ADVISORY", "BLOCKED"]},
+        "requirements": {"type": "array", "items": {"type": "object"}}
+      },
+      "additionalProperties": false
+    },
+    "cohort": {
+      "type": "object",
+      "required": ["cohort_id", "fields", "fingerprint_sha256"],
+      "properties": {
+        "cohort_id": {"type": ["string", "null"], "pattern": "^COHORT-[0-9]{3,}$"},
+        "fields": {"type": "object"},
+        "fingerprint_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "environment": {
+      "type": "object",
+      "required": [
+        "python_executable", "python_version", "python_implementation",
+        "platform", "system", "release", "machine", "processor",
+        "hardware_class", "precision", "environment_variables"
+      ],
+      "properties": {
+        "python_executable": {"type": "string", "minLength": 1},
+        "python_version": {"type": "string", "minLength": 1},
+        "python_implementation": {"type": "string", "minLength": 1},
+        "platform": {"type": "string", "minLength": 1},
+        "system": {"type": "string", "minLength": 1},
+        "release": {"type": "string"},
+        "machine": {"type": "string"},
+        "processor": {"type": "string"},
+        "hardware_class": {"type": "string", "minLength": 1},
+        "precision": {"type": "string", "minLength": 1},
+        "environment_variables": {"type": "object"}
+      },
+      "additionalProperties": false
+    },
+    "budget": {
+      "type": "object",
+      "required": ["estimated_gpu_hours", "estimated_cpu_hours"],
+      "properties": {
+        "estimated_gpu_hours": {"type": "number", "minimum": 0},
+        "estimated_cpu_hours": {"type": "number", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "inputs": {"type": "array", "items": {"$ref": "#/$defs/input_record"}},
+    "outputs": {"type": "array", "items": {"$ref": "#/$defs/output_record"}},
+    "logs": {
+      "type": "object",
+      "required": ["stdout", "stderr"],
+      "properties": {
+        "stdout": {"$ref": "#/$defs/file_hash"},
+        "stderr": {"$ref": "#/$defs/file_hash"}
+      },
+      "additionalProperties": false
+    },
+    "integrity": {
+      "type": "object",
+      "required": ["sealed_at", "manifest_sha256"],
+      "properties": {
+        "sealed_at": {"type": ["string", "null"]},
+        "manifest_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "$defs": {
+    "tracked_code_state": {
+      "type": "object",
+      "required": ["available", "commit", "diff_sha256"],
+      "properties": {
+        "available": {"type": "boolean"},
+        "commit": {"type": ["string", "null"]},
+        "diff_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "file_hash": {
+      "type": "object",
+      "required": ["path", "size", "sha256"],
+      "properties": {
+        "kind": {"type": "string"},
+        "path": {"type": "string", "minLength": 1},
+        "size": {"type": "integer", "minimum": 0},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "input_record": {
+      "type": "object",
+      "required": ["path", "size", "sha256_before", "sha256_after", "changed_during_run"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "size": {"type": "integer", "minimum": 0},
+        "sha256_before": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "sha256_after": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "changed_during_run": {"type": ["boolean", "null"]}
+      },
+      "additionalProperties": false
+    },
+    "output_record": {
+      "type": "object",
+      "required": ["path", "present", "size", "sha256", "classification", "pinned"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "present": {"type": "boolean"},
+        "size": {"type": ["integer", "null"], "minimum": 0},
+        "sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "classification": {"enum": ["ordinary", "baseline", "unique_anomaly"]},
+        "pinned": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

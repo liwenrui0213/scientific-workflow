@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "status": "draft",
+  "purpose": null,
+  "hypotheses": [],
+  "inputs": [],
+  "evaluator": null,
+  "dataset_split": null,
+  "baseline": null,
+  "acceptance_criteria": [],
+  "compute_budget": {
+    "estimated_gpu_hours": null,
+    "estimated_cpu_hours": null
+  },
+  "seeds": [],
+  "cohort_fields": {},
+  "known_deviations": []
+}
