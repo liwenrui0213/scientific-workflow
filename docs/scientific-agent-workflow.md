@@ -1,6 +1,8 @@
 # Claim-to-Evidence Scientific Workflow, V1
 
-This repository uses a local, deterministic workflow for long-running computational research. `studyctl` records and checks facts; it does not infer scientific conclusions.
+This repository uses Python 3.11 or newer and a local, deterministic workflow for long-running computational research. `studyctl` records and checks facts; it does not infer scientific conclusions.
+
+The normal human interface is a scientific idea stated in ordinary language. Codex turns that idea into the internal Study structure; the scientist does not need to choose IDs, edit templates, or manually route workflow stages.
 
 ## The two chains
 
@@ -18,21 +20,73 @@ Work -> Run -> Evidence -> Claim -> human Verdict
 
 `work/active/` is a mutable scratch space. A Run records what actually executed under fixed code, inputs, configuration, environment and Cohort fields. Evidence states an explicit analysis of one or more Runs, including scope, uncertainty, limitations and contradictions. A Claim may reference only a finalized, hash-pinned Evidence version. A Verdict separately judges implementation and scientific Claims.
 
-## Start the first Study
+## Start directly from a scientific idea
 
-Use Python 3.11 or newer. From the repository root:
+Give Codex the idea, goal, and any constraints you already know. For example:
 
-```bash
-python -m tools.studyctl init SC-0001 --title "Short study title"
+```text
+研究在现有 VMC 模型中加入等变 attention，目标是在保持精度的同时降低
+Laplacian 计算成本。请直接建立研究任务并准备后续研究。
 ```
 
-Edit `studies/SC-0001/BRIEF.md` and replace every placeholder. Keep the machine-readable metadata block. Then a human, in an interactive terminal, approves the exact displayed hash:
+When no existing Study ID is named, Codex uses the repository `start-scientific-study` skill. It will:
+
+1. inspect only enough of the repository to interpret the idea;
+2. allocate the next Study ID and initialize the Study;
+3. draft the Brief, non-goals, protected conditions, Evidence requirements, and proposed Claims;
+4. distinguish human-supplied assumptions from Agent-inferred assumptions;
+5. record open scientific questions and ask only about ambiguities that truly block authorization;
+6. regenerate STATUS and run deterministic checks; and
+7. stop before approval, implementation, formalization, Runs, or compute use.
+
+The response should contain the Study ID, a concise interpretation, blocking decisions if any, and—when no blocker remains—one approval command. Correct the interpretation in chat if needed; Codex revises the same draft instead of opening another Study. The internal path is:
+
+```text
+Natural-language idea
+  -> Agent-drafted Brief and proposed Claims
+  -> human review and Brief approval
+  -> scientific-study execution loop
+```
+
+The Brief is still an authority boundary, but it is an Agent-produced internal record rather than a form the scientist must author. Missing budgets, thresholds, data splits, evaluator principles, or baseline permissions are recorded explicitly; Codex must not invent them. Only omissions that change the research intent, a protected condition, the hard budget, or permission for the immediate next action block authorization. Technical choices that Codex can safely investigate—such as candidate methods, benchmark design, baseline implementation, evaluator details, or hardware—remain non-blocking open questions until a later progressive-formalization boundary. An omitted budget never authorizes expensive compute.
+
+### Just-in-time alignment
+
+Codex does not run a general requirements interview. It first inspects available repository evidence and drafts the best current interpretation, then classifies each ambiguity:
+
+| Ambiguity | Treatment |
+|---|---|
+| It changes the scientific question, desired Claim, protected conditions, hard budget, or permission for the immediate consequential action, and no safe reversible default exists | Ask now |
+| It matters only when choosing a method, formalizing an evaluator or protocol, spending substantial compute, or interpreting Evidence | Record and align at that later boundary |
+| A conservative, reversible provisional interpretation exists | Record it as an unconfirmed assumption and continue |
+
+At one decision boundary, Codex asks at most one compact batch of three questions. Each question states the current interpretation and why the answer is needed. It may ask one follow-up batch only if the answer creates a genuinely new material branch; it must not repeat or rephrase the same unresolved question.
+
+If alignment remains unresolved, the Study stays in `DRAFT`. Only the blocked action pauses; safe read-only or low-cost reversible investigation may continue. Codex aligns again later only when new Evidence exposes a new material ambiguity or the Study reaches a protected, expensive, or hard-to-reverse boundary.
+
+After reviewing the draft, a human approves the exact displayed hash in an interactive terminal:
 
 ```bash
 python -m tools.studyctl approve-brief SC-0001
 ```
 
-This is a procedural local approval, not cryptographic identity. Reviewer identity comes from `STUDYCTL_REVIEWER`, then local Git configuration, then the local account. Codex is blocked from invoking this command by the project hook.
+Codex is blocked from invoking this human-only command. After approval, say `继续执行 SC-0001` or otherwise ask Codex to continue; the `scientific-study` skill takes over automatically.
+
+## Manual initialization fallback
+
+From the repository root:
+
+```bash
+python -m tools.studyctl init SC-0001 --title "Short study title"
+```
+
+This command-line path is intended for automation, recovery, or users who explicitly prefer manual control. Edit `studies/SC-0001/BRIEF.md`, replace every placeholder, and keep the machine-readable metadata block. Then approve the exact displayed hash:
+
+```bash
+python -m tools.studyctl approve-brief SC-0001
+```
+
+This is a procedural local approval, not cryptographic identity. Reviewer identity comes from `STUDYCTL_REVIEWER`, then local Git configuration, then the local account.
 
 To change an approved Brief safely:
 
