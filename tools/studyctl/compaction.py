@@ -6,7 +6,13 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .formalization import collect_formalization_debt
-from .hashing import atomic_write_json, load_json, record_digest, sha256_file
+from .hashing import (
+    atomic_write_json,
+    load_json,
+    record_digest,
+    sha256_file,
+    sha256_json,
+)
 from .models import SCHEMA_VERSION, StudyPaths, ValidationError, WorkflowError, utc_now
 from .rendering import active_formal_artifacts, render_status
 from .validation import (
@@ -19,6 +25,10 @@ from .validation import (
     run_file_references,
     run_index,
 )
+from .workspace import evaluate_changes, repository_profile_path
+
+
+_STUDY_CHANGE_CLASSIFICATIONS = {"study_state", "other_study"}
 
 
 def _claim_evidence_keys(claims: dict[str, Any]) -> set[tuple[str, int]]:
@@ -55,6 +65,157 @@ def _file_inventory(base: Path, root: Path) -> list[dict[str, Any]]:
     return records
 
 
+def _tree_inventory(base: Path, root: Path) -> list[dict[str, Any]]:
+    """Inventory files and directories without following symbolic links."""
+
+    records: list[dict[str, Any]] = []
+    if not base.is_dir():
+        return records
+    for path in sorted(base.rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        if path.is_symlink():
+            records.append(
+                {
+                    "path": relative,
+                    "kind": "symlink",
+                    "target": os.readlink(path),
+                }
+            )
+        elif path.is_file():
+            metadata = path.stat()
+            records.append(
+                {
+                    "path": relative,
+                    "kind": "file",
+                    "mode": metadata.st_mode & 0o7777,
+                    "size": metadata.st_size,
+                    "sha256": sha256_file(path),
+                }
+            )
+        elif path.is_dir():
+            records.append(
+                {
+                    "path": relative,
+                    "kind": "directory",
+                    "mode": path.stat().st_mode & 0o7777,
+                }
+            )
+        else:
+            records.append({"path": relative, "kind": "other"})
+    return records
+
+
+def _repository_path_identity(root: Path, relative: str) -> dict[str, Any]:
+    """Return a deterministic identity for one Git-reported repository path."""
+
+    path = root / relative
+    if path.is_symlink():
+        return {
+            "kind": "symlink",
+            "target": os.readlink(path),
+        }
+    if not path.exists():
+        return {"kind": "missing"}
+    if path.is_file():
+        metadata = path.stat()
+        return {
+            "kind": "file",
+            "mode": metadata.st_mode & 0o7777,
+            "size": metadata.st_size,
+            "sha256": sha256_file(path),
+        }
+    if path.is_dir():
+        return {
+            "kind": "directory",
+            "mode": path.stat().st_mode & 0o7777,
+        }
+    return {
+        "kind": "other",
+        "mode": path.stat().st_mode & 0o7777,
+    }
+
+
+def _host_change_scope(paths: StudyPaths) -> dict[str, Any]:
+    """Seal only host-repository changes, excluding every Study-state path."""
+
+    state = evaluate_changes(paths, require_validation=True)
+    if state.get("outcome") == "BLOCKED":
+        details = "; ".join(
+            f"{item.get('rule')}: {item.get('reason')}"
+            for item in state.get("violations", [])
+        )
+        suffix = f": {details}" if details else ""
+        raise ValidationError(
+            "cannot compact while the current host repository change scope is BLOCKED"
+            + suffix
+        )
+    records: list[dict[str, Any]] = []
+    for item in state.get("changed_paths", []):
+        if item.get("classification") in _STUDY_CHANGE_CLASSIFICATIONS:
+            continue
+        relative = str(item.get("path"))
+        records.append(
+            {
+                "path": relative,
+                "classification": str(item.get("classification")),
+                "tracked": bool(item.get("tracked")),
+                "states": sorted(str(value) for value in item.get("states", [])),
+                "identity": _repository_path_identity(paths.root, relative),
+            }
+        )
+    records.sort(key=lambda item: item["path"])
+    return {
+        "outcome": state.get("outcome"),
+        "git_available": bool(state.get("git", {}).get("available")),
+        "consequential_paths": records,
+        "fingerprint_sha256": sha256_json(records),
+    }
+
+
+def _validate_prepared_bindings(
+    paths: StudyPaths,
+    compaction_state: dict[str, Any],
+) -> None:
+    profile_record = compaction_state.get("repository_profile")
+    if not isinstance(profile_record, dict):
+        raise ValidationError("COMPACTION_INPUT.json lacks a repository profile binding")
+    profile_path = repository_profile_path(paths.root)
+    expected_profile_path = profile_path.relative_to(paths.root).as_posix()
+    if profile_record.get("path") != expected_profile_path:
+        raise ValidationError("COMPACTION_INPUT.json repository profile path is invalid")
+    if profile_record.get("sha256") != sha256_file(profile_path):
+        raise ValidationError("repository profile changed after compact-prepare")
+
+    prepared_scope = compaction_state.get("host_change_scope")
+    if not isinstance(prepared_scope, dict):
+        raise ValidationError("COMPACTION_INPUT.json lacks a host change-scope binding")
+    prepared_paths = prepared_scope.get("consequential_paths")
+    if not isinstance(prepared_paths, list) or prepared_scope.get(
+        "fingerprint_sha256"
+    ) != sha256_json(prepared_paths):
+        raise ValidationError("COMPACTION_INPUT.json host change-scope binding is invalid")
+    current_scope = _host_change_scope(paths)
+    if (
+        current_scope["outcome"] != prepared_scope.get("outcome")
+        or current_scope["git_available"] != prepared_scope.get("git_available")
+        or current_scope["fingerprint_sha256"]
+        != prepared_scope.get("fingerprint_sha256")
+    ):
+        raise ValidationError(
+            "host consequential change scope changed after compact-prepare"
+        )
+
+    prepared_work = compaction_state.get("active_work_inventory")
+    prepared_work_hash = compaction_state.get("active_work_inventory_sha256")
+    if not isinstance(prepared_work, list) or prepared_work_hash != sha256_json(
+        prepared_work
+    ):
+        raise ValidationError("COMPACTION_INPUT.json active-work binding is invalid")
+    current_work = _tree_inventory(paths.active_work, paths.root)
+    if sha256_json(current_work) != prepared_work_hash:
+        raise ValidationError("work/active inventory changed after compact-prepare")
+
+
 def budget_totals(runs: dict[str, tuple[Path, dict[str, Any]]]) -> dict[str, Any]:
     gpu = 0.0
     cpu = 0.0
@@ -85,6 +246,7 @@ def _reference_mentions_path(references: set[str], *candidates: str) -> bool:
 
 def prepare_compaction(paths: StudyPaths) -> Path:
     assert_valid_study(paths)
+    host_change_scope = _host_change_scope(paths)
     runs = run_index(paths)
     evidence = evidence_index(paths)
     claims = load_json(paths.claims)
@@ -102,6 +264,7 @@ def prepare_compaction(paths: StudyPaths) -> Path:
         cohort_status[str(cohort)][str(item.get("status"))] += 1
     formal = active_formal_artifacts(paths)
     work_files = _file_inventory(paths.active_work, paths.root)
+    work_inventory = _tree_inventory(paths.active_work, paths.root)
     authoritative_refs = authoritative_string_references(paths) | run_file_references(paths)
     candidates: list[str] = []
     for record in work_files:
@@ -128,6 +291,13 @@ def prepare_compaction(paths: StudyPaths) -> Path:
             "claims": sha256_file(paths.claims),
             "evidence": current_evidence_hashes(paths),
         },
+        "repository_profile": {
+            "path": repository_profile_path(paths.root)
+            .relative_to(paths.root)
+            .as_posix(),
+            "sha256": sha256_file(repository_profile_path(paths.root)),
+        },
+        "host_change_scope": host_change_scope,
         "run_counts_by_status": dict(sorted(status_counts.items())),
         "run_counts_by_cohort_and_status": {
             cohort: dict(sorted(counts.items())) for cohort, counts in sorted(cohort_status.items())
@@ -141,6 +311,8 @@ def prepare_compaction(paths: StudyPaths) -> Path:
         "active_formal_artifacts": [item for item in formal if item["active"]],
         "stale_formal_artifacts": [item for item in formal if not item["active"]],
         "active_work_files": work_files,
+        "active_work_inventory": work_inventory,
+        "active_work_inventory_sha256": sha256_json(work_inventory),
         "previous_checkpoints": checkpoints,
         "current_claims": claims.get("claims", []),
         "current_frontier": claims.get("frontier", {}),
@@ -231,6 +403,10 @@ def _finalize_compaction_locked(paths: StudyPaths, plan_path: Path) -> Path:
         raise ValidationError("run compact-prepare before compact-finalize")
     if plan.get("compaction_input_sha256") != sha256_file(compaction_input):
         raise ValidationError("compaction plan is stale relative to COMPACTION_INPUT.json")
+    compaction_state = load_json(compaction_input)
+    if not isinstance(compaction_state, dict):
+        raise ValidationError("COMPACTION_INPUT.json must be a JSON object")
+    _validate_prepared_bindings(paths, compaction_state)
     if plan.get("claims_sha256") != sha256_file(paths.claims):
         raise ValidationError("CLAIMS.json changed after the compaction plan was written")
     if plan.get("evidence_sha256") != current_evidence_hashes(paths):
@@ -350,6 +526,11 @@ def _finalize_compaction_locked(paths: StudyPaths, plan_path: Path) -> Path:
             "sha256": approval["brief"]["sha256"],
             "approval_sha256": approval["approval_sha256"],
         },
+        "repository_profile": compaction_state["repository_profile"],
+        "host_change_scope": compaction_state["host_change_scope"],
+        "prepared_active_work_inventory_sha256": compaction_state[
+            "active_work_inventory_sha256"
+        ],
         "active_formal_artifacts": [item for item in formal if item["active"]],
         "claims_file_sha256": sha256_file(paths.claims),
         "claims_snapshot": claims.get("claims", []),

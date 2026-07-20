@@ -17,6 +17,7 @@ from .validation import (
     run_index,
     validate_study,
 )
+from .workspace import evaluate_changes, load_repository_profile, profile_summary
 
 
 def _evidence_key(ref: dict[str, Any]) -> tuple[str, int]:
@@ -60,7 +61,10 @@ def _latest_checkpoint(paths: StudyPaths) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-def create_review_packet(paths: StudyPaths, base_ref: str = "main") -> Path:
+def create_review_packet(paths: StudyPaths, base_ref: str | None = None) -> Path:
+    effective_base_ref = base_ref or str(
+        load_repository_profile(paths.root)["git"]["base_ref"]
+    )
     validation_issues = validate_study(paths)
     validation_errors = [item for item in validation_issues if item.level == "ERROR"]
     approval = load_json(paths.brief_approval) if paths.brief_approval.is_file() else None
@@ -110,7 +114,9 @@ def create_review_packet(paths: StudyPaths, base_ref: str = "main") -> Path:
     cohort_fingerprints = {
         manifest["run_id"]: manifest.get("cohort", {}) for manifest in all_critical_manifests
     }
-    git = git_diff_metadata(paths.root, base_ref)
+    git = git_diff_metadata(paths.root, effective_base_ref)
+    repository_profile = profile_summary(paths.root)
+    change_scope = evaluate_changes(paths, write_projection=True)
     deviations: list[str] = []
     if validation_errors:
         deviations.append(
@@ -118,6 +124,10 @@ def create_review_packet(paths: StudyPaths, base_ref: str = "main") -> Path:
         )
     if not git.get("available"):
         deviations.append(str(git.get("deviation") or "Git diff unavailable"))
+    if change_scope.get("outcome") != "PASS":
+        deviations.append(
+            f"current repository change scope is {change_scope.get('outcome')}"
+        )
     if git_state(paths.root).get("dirty"):
         deviations.append("working tree is dirty")
     for manifest in all_critical_manifests:
@@ -163,6 +173,8 @@ def create_review_packet(paths: StudyPaths, base_ref: str = "main") -> Path:
         "cohort_fingerprints": cohort_fingerprints,
         "protected_condition_hash_checks": protected_checks,
         "git_diff_metadata": git,
+        "repository_profile": repository_profile,
+        "change_scope": change_scope,
         "unresolved_formalization_debt": collect_formalization_debt(paths),
         "formalization_check": {
             "outcome": formalization.outcome,

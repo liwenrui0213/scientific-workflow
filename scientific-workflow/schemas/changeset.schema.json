@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Study source and test change contract",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "study_id",
+    "status",
+    "created_at",
+    "base_ref",
+    "base_commit",
+    "branch",
+    "allowed_write_patterns",
+    "required_validation",
+    "supersedes_sha256",
+    "record_sha256"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "study_id": {"type": "string", "pattern": "^SC-[0-9]{4,}$"},
+    "status": {"enum": ["active", "finalized"]},
+    "created_at": {"type": "string", "minLength": 1},
+    "base_ref": {"type": "string", "minLength": 1},
+    "base_commit": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+    "branch": {"type": "string", "minLength": 1},
+    "allowed_write_patterns": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "required_validation": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "argv"],
+        "properties": {
+          "name": {"type": "string", "minLength": 1},
+          "argv": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "string", "minLength": 1}
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "supersedes_sha256": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "record_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "additionalProperties": false
+}

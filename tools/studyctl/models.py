@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import json
+import os
 from pathlib import Path
 import re
+import stat
 from typing import Any, Iterable
 
 
@@ -83,54 +86,209 @@ class FormalizationResult:
 class StudyPaths:
     root: Path
     study_id: str
+    study_root: str = "studies"
+
+    def _safe_repository_path(self, relative: Path, *, label: str) -> Path:
+        """Return a repository path after rejecting escapes and symlink traversal."""
+
+        if relative.is_absolute() or ".." in relative.parts or "\x00" in str(relative):
+            raise ValidationError(f"{label} must be a safe repository-relative path")
+        repository = self.root.resolve()
+        candidate = repository / relative
+        try:
+            candidate.relative_to(repository)
+        except ValueError as exc:
+            raise ValidationError(f"{label} must stay inside the repository") from exc
+        _assert_no_symlink_components(repository, candidate, label=label)
+        _assert_resolves_within(candidate, repository, label=label)
+        return candidate
+
+    def _safe_study_path(self, relative: Path, *, label: str) -> Path:
+        study = self.study
+        candidate = study / relative
+        try:
+            candidate.relative_to(study)
+        except ValueError as exc:
+            raise ValidationError(f"{label} must stay inside Study {self.study_id}") from exc
+        _assert_no_symlink_components(self.study_root_path, candidate, label=label)
+        _assert_resolves_within(candidate, self.study_root_path, label=label)
+        return candidate
+
+    @property
+    def study_root_path(self) -> Path:
+        return self._safe_repository_path(Path(self.study_root), label="configured Study root")
 
     @property
     def study(self) -> Path:
-        return self.root / "studies" / self.study_id
+        candidate = self.study_root_path / self.study_id
+        _assert_no_symlink_components(self.study_root_path, candidate, label="Study directory")
+        _assert_resolves_within(candidate, self.study_root_path, label="Study directory")
+        return candidate
 
     @property
     def brief(self) -> Path:
-        return self.study / "BRIEF.md"
+        return self._safe_study_path(Path("BRIEF.md"), label="BRIEF.md")
 
     @property
     def brief_approval(self) -> Path:
-        return self.study / "BRIEF.approval.json"
+        return self._safe_study_path(
+            Path("BRIEF.approval.json"), label="BRIEF.approval.json"
+        )
 
     @property
     def claims(self) -> Path:
-        return self.study / "CLAIMS.json"
+        return self._safe_study_path(Path("CLAIMS.json"), label="CLAIMS.json")
 
     @property
     def verdict(self) -> Path:
-        return self.study / "VERDICT.json"
+        return self._safe_study_path(Path("VERDICT.json"), label="VERDICT.json")
 
     @property
     def formal(self) -> Path:
-        return self.study / "formal"
+        return self._safe_study_path(Path("formal"), label="formal directory")
+
+    @property
+    def work(self) -> Path:
+        return self._safe_study_path(Path("work"), label="work directory")
 
     @property
     def runs(self) -> Path:
-        return self.study / "runs"
+        return self._safe_study_path(Path("runs"), label="runs directory")
 
     @property
     def evidence(self) -> Path:
-        return self.study / "evidence"
+        return self._safe_study_path(Path("evidence"), label="evidence directory")
+
+    @property
+    def failed_directions(self) -> Path:
+        return self._safe_study_path(
+            Path("failed-directions"), label="failed-directions directory"
+        )
 
     @property
     def checkpoints(self) -> Path:
-        return self.study / "checkpoints"
+        return self._safe_study_path(Path("checkpoints"), label="checkpoints directory")
 
     @property
     def generated(self) -> Path:
-        return self.study / "generated"
+        return self._safe_study_path(Path("generated"), label="generated directory")
+
+    @property
+    def brief_history(self) -> Path:
+        return self._safe_study_path(Path("brief-history"), label="brief-history directory")
 
     @property
     def active_work(self) -> Path:
-        return self.study / "work" / "active"
+        return self._safe_study_path(Path("work/active"), label="active work directory")
 
     @property
     def archived_work(self) -> Path:
-        return self.study / "work" / "archived"
+        return self._safe_study_path(Path("work/archived"), label="archived work directory")
+
+    def assert_safe_layout(self, *, must_exist: bool = True) -> None:
+        """Reject a Study layout that can redirect workflow I/O through symlinks.
+
+        Missing leaf paths are safe during initialization.  Every existing
+        component below the configured Study root, including dynamic Run,
+        Evidence, formal, work, checkpoint, and generated files, is checked
+        without following symbolic links.
+        """
+
+        repository = self.root.resolve()
+        study_root = self.study_root_path
+        if study_root.exists() and not study_root.is_dir():
+            raise ValidationError("configured Study root must be a directory")
+        study = self.study
+        if not study.exists():
+            if must_exist:
+                raise WorkflowError(f"study does not exist: {self.study_id}")
+            return
+        if not study.is_dir():
+            raise ValidationError(f"Study path must be a directory: {study}")
+
+        _assert_resolves_within(study_root, repository, label="configured Study root")
+        _assert_managed_tree_safe(study, study_root=study_root, repository=repository)
+
+        for directory in (
+            self.formal,
+            self.work,
+            self.active_work,
+            self.archived_work,
+            self.runs,
+            self.evidence,
+            self.failed_directions,
+            self.checkpoints,
+            self.generated,
+            self.brief_history,
+        ):
+            if directory.exists() and not directory.is_dir():
+                raise ValidationError(f"managed Study directory is not a directory: {directory}")
+        for artifact in (
+            self.brief,
+            self.brief_approval,
+            self.claims,
+            self.verdict,
+        ):
+            if artifact.exists() and not artifact.is_file():
+                raise ValidationError(f"managed Study artifact is not a regular file: {artifact}")
+
+
+def _assert_no_symlink_components(anchor: Path, path: Path, *, label: str) -> None:
+    try:
+        relative = path.relative_to(anchor)
+    except ValueError as exc:
+        raise ValidationError(f"{label} must stay inside {anchor}") from exc
+    current = anchor
+    for part in relative.parts:
+        current = current / part
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            # A descendant cannot exist before its parent exists.  The lexical
+            # containment check still protects the not-yet-created tail.
+            break
+        except OSError as exc:
+            raise ValidationError(f"cannot inspect {label} path {current}: {exc}") from exc
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValidationError(f"{label} must not use a symbolic link: {current}")
+
+
+def _assert_resolves_within(path: Path, boundary: Path, *, label: str) -> None:
+    try:
+        resolved = path.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise ValidationError(f"cannot resolve {label} path {path}: {exc}") from exc
+    try:
+        resolved.relative_to(boundary.resolve())
+    except ValueError as exc:
+        raise ValidationError(f"{label} resolves outside {boundary}: {path}") from exc
+
+
+def _assert_managed_tree_safe(study: Path, *, study_root: Path, repository: Path) -> None:
+    pending = [study]
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = list(os.scandir(directory))
+        except OSError as exc:
+            raise ValidationError(f"cannot inspect managed Study directory {directory}: {exc}") from exc
+        for entry in entries:
+            candidate = Path(entry.path)
+            try:
+                if entry.is_symlink():
+                    raise ValidationError(
+                        f"managed Study paths must not use symbolic links: {candidate}"
+                    )
+                _assert_resolves_within(candidate, study_root, label="managed Study path")
+                _assert_resolves_within(candidate, repository, label="managed Study path")
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(candidate)
+                elif not entry.is_file(follow_symlinks=False):
+                    raise ValidationError(
+                        f"managed Study entry must be a regular file or directory: {candidate}"
+                    )
+            except OSError as exc:
+                raise ValidationError(f"cannot inspect managed Study path {candidate}: {exc}") from exc
 
 
 def utc_now() -> str:
@@ -160,9 +318,36 @@ def get_repo_root(start: Path | None = None) -> Path:
 
 def study_paths(root: Path, study_id: str, *, must_exist: bool = True) -> StudyPaths:
     require_id("study", study_id)
-    paths = StudyPaths(root.resolve(), study_id)
-    if must_exist and not paths.study.is_dir():
-        raise WorkflowError(f"study does not exist: {study_id}")
+    resolved_root = root.resolve()
+    configured_root = "studies"
+    profile = resolved_root / "scientific-workflow" / "repository-profile.json"
+    if profile.is_symlink():
+        raise ValidationError("repository profile must not be a symbolic link")
+    if profile.exists():
+        if not profile.is_file():
+            raise ValidationError("repository profile must be a regular file")
+        try:
+            value = json.loads(profile.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValidationError(f"cannot read repository profile {profile}: {exc}") from exc
+        raw_root = value.get("study_root") if isinstance(value, dict) else None
+        if not isinstance(raw_root, str) or not raw_root.strip():
+            raise ValidationError("repository profile study_root must be a non-empty string")
+        candidate = Path(raw_root)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            raise ValidationError("repository profile study_root must stay inside the repository")
+        if candidate.as_posix().rstrip("/") in {"", "."}:
+            raise ValidationError("repository profile study_root must not be the repository root")
+        configured_path = resolved_root / candidate
+        _assert_no_symlink_components(
+            resolved_root, configured_path, label="repository profile study_root"
+        )
+        _assert_resolves_within(
+            configured_path, resolved_root, label="repository profile study_root"
+        )
+        configured_root = candidate.as_posix().rstrip("/")
+    paths = StudyPaths(resolved_root, study_id, configured_root)
+    paths.assert_safe_layout(must_exist=must_exist)
     return paths
 
 

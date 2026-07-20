@@ -438,7 +438,11 @@ class CoreWorkflowTests(WorkflowTestCase):
         self.assertEqual(disk_manifest, manifest)
         self.assertEqual(
             {path.name for path in run_directory.iterdir()},
-            {"manifest.json", "stdout.log", "stderr.log"},
+            {"manifest.json", "stdout.log", "stderr.log", "governance"},
+        )
+        self.assertEqual(
+            {path.name for path in (run_directory / "governance").iterdir()},
+            {"repository-profile.json"},
         )
         temporary_files = [
             path for path in run_directory.rglob("*") if path.name.endswith(".tmp")
@@ -638,30 +642,28 @@ class CoreWorkflowTests(WorkflowTestCase):
     def test_claim_evidence_roles_must_match_final_assessments(self) -> None:
         cases = (
             (
-                "SC-1204",
                 "inconclusive",
                 "supporting_evidence",
                 "numerically_supported",
                 "as supporting",
+                "EVID-0001",
             ),
             (
-                "SC-1205",
                 "supports",
                 "contradictory_evidence",
                 "contradicted",
                 "as contradictory",
+                "EVID-0002",
             ),
         )
-        for study_id, assessment, role, state, expected in cases:
+        paths = self.initialize_approved_with_claim()
+        for assessment, role, state, expected, evidence_id in cases:
             with self.subTest(assessment=assessment, role=role):
-                paths = self.initialize(study_id)
-                self.fill_brief(paths)
-                self.add_proposed_claim(paths)
-                self.approve(paths)
                 manifest = self.successful_run(paths)
                 evidence = self.finalized_supporting_evidence(
                     paths,
                     [manifest],
+                    evidence_id=evidence_id,
                     assessment=assessment,
                 )
                 reference = {
@@ -681,6 +683,13 @@ class CoreWorkflowTests(WorkflowTestCase):
 
                 messages = self.error_messages(paths)
                 self.assertTrue(any(expected in message for message in messages), messages)
+
+                claim[role] = []
+                claim["state"] = "proposed"
+                claim["uncertainty"] = None
+                claims["revision"] += 1
+                claims["updated_at"] = utc_now()
+                atomic_write_json(paths.claims, claims)
 
     def test_validation_rechecks_related_evidence_targets(self) -> None:
         paths = self.initialize_approved_with_claim()

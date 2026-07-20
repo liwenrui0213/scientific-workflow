@@ -178,7 +178,7 @@ def file_record(path: Path, root: Path) -> dict[str, Any]:
     except ValueError:
         relative = str(resolved)
     if not resolved.is_file():
-        raise ValidationError(f"only regular files are supported in V1: {path}")
+        raise ValidationError(f"only regular files are supported: {path}")
     return {
         "path": relative,
         "size": resolved.stat().st_size,

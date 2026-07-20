@@ -31,7 +31,7 @@ from tools.studyctl.validation import errors_only, run_index, validate_study
 
 
 class DemonstrationLifecycleTests(WorkflowTestCase):
-    """A non-scientific fixture exercising the complete V1 authority chain."""
+    """A non-scientific fixture exercising the complete V2 authority chain."""
 
     def compaction_plan(
         self,
@@ -40,7 +40,7 @@ class DemonstrationLifecycleTests(WorkflowTestCase):
     ) -> Path:
         compaction_input = prepare_compaction(paths)
         claims = load_json(paths.claims)
-        destination = self.root / "demonstration-compaction-plan.json"
+        destination = paths.work / "demonstration-compaction-plan.json"
         atomic_write_json(
             destination,
             {

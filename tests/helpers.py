@@ -49,6 +49,9 @@ class WorkflowTestCase(unittest.TestCase):
         )
         (self.root / ".objects").mkdir()
         (self.root / ".objects" / ".gitignore").write_text("*\n!.gitignore\n", encoding="utf-8")
+        (self.root / ".gitignore").write_text("__pycache__/\n*.py[cod]\n", encoding="utf-8")
+        self.initialize_git()
+        self.commit_all("initialize workflow fixture")
 
     def tearDown(self) -> None:
         self._temporary.cleanup()
@@ -197,8 +200,9 @@ class WorkflowTestCase(unittest.TestCase):
         atomic_write_json(paths.claims, claims)
 
     def initialize_git(self) -> None:
-        result = completed_process(["git", "init", "-b", "main"], self.root)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        if not (self.root / ".git").exists():
+            result = completed_process(["git", "init", "-b", "main"], self.root)
+            self.assertEqual(result.returncode, 0, result.stderr)
         for key, value in (("user.name", "Test Reviewer"), ("user.email", "reviewer@example.test")):
             result = completed_process(["git", "config", key, value], self.root)
             self.assertEqual(result.returncode, 0, result.stderr)

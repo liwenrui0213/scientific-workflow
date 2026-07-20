@@ -102,6 +102,13 @@ class HookPolicyTests(WorkflowTestCase):
                 "Run manifests are sealed execution records and must not be changed or removed.",
             ),
             (
+                self.patch_event(
+                    "Add",
+                    f"studies/{paths.study_id}/runs/RUN-999999/manifest.json",
+                ),
+                "Run manifests are sealed execution records and must not be changed or removed.",
+            ),
+            (
                 self.bash_event(
                     f"rm -rf studies/{paths.study_id}/runs/{manifest['run_id']}"
                 ),
@@ -123,6 +130,32 @@ class HookPolicyTests(WorkflowTestCase):
                     f"studies/{paths.study_id}/BRIEF.approval.json",
                 ),
                 "Brief approval records may be written only by the interactive studyctl gate.",
+            ),
+            (
+                self.patch_event(
+                    "Add",
+                    f"studies/{paths.study_id}/formal/CHANGESET.json",
+                ),
+                "CHANGESET records may be written only by studyctl changeset-new.",
+            ),
+            (
+                self.bash_event(
+                    f"tee studies/{paths.study_id}/formal/VALIDATION.json"
+                ),
+                "Validation proofs may be written only by studyctl validate-changes.",
+            ),
+            (
+                self.bash_event(
+                    "python -c \"open('studies/SC-0001/formal/CHANGESET.json', 'w').write('{}')\""
+                ),
+                "CHANGESET records may be written only by studyctl changeset-new.",
+            ),
+            (
+                self.bash_event(
+                    "python -c \"from pathlib import Path; "
+                    "Path('studies/SC-0001/formal/VALIDATION.json').open('r+').write('{}')\""
+                ),
+                "Validation proofs may be written only by studyctl validate-changes.",
             ),
             (
                 self.direct_file_event(
@@ -152,6 +185,30 @@ class HookPolicyTests(WorkflowTestCase):
         for event in permitted:
             with self.subTest(event=event):
                 self.assertIsNone(HOOK_POLICY.decide(event))
+
+    def test_hook_uses_profile_configured_study_root(self) -> None:
+        profile_path = self.root / "scientific-workflow" / "repository-profile.json"
+        profile = load_json(profile_path)
+        profile["study_root"] = "research/studies"
+        profile["generated_patterns"] = [
+            "**/__pycache__/**",
+            "research/studies/*/generated/**",
+        ]
+        atomic_write_json(profile_path, profile)
+        paths = self.initialize_approved_with_claim()
+
+        custom_path = paths.brief.relative_to(self.root.resolve()).as_posix()
+        reason = HOOK_POLICY.decide(self.patch_event("Update", custom_path))
+
+        self.assertEqual(
+            reason,
+            "An approved Brief must be revised through studyctl brief-new-version.",
+        )
+        self.assertIsNone(
+            HOOK_POLICY.decide(
+                self.patch_event("Update", f"studies/{paths.study_id}/BRIEF.md")
+            )
+        )
 
     def test_malformed_hook_input_fails_closed(self) -> None:
         for malformed in ("{", "[]"):

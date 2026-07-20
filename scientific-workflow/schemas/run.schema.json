@@ -12,6 +12,7 @@
     "execution",
     "git",
     "code_state",
+    "change_scope",
     "brief",
     "formal_artifacts",
     "formalization",
@@ -24,17 +25,21 @@
     "integrity"
   ],
   "properties": {
-    "schema_version": {"const": 1},
+    "schema_version": {"const": 2},
     "study_id": {"type": "string", "pattern": "^SC-[0-9]{4,}$"},
     "run_id": {"type": "string", "pattern": "^RUN-[0-9]{6}$"},
     "purpose": {"type": "string", "minLength": 1},
     "status": {"enum": ["succeeded", "failed", "interrupted", "running"]},
     "execution": {
       "type": "object",
-      "required": ["argv", "cwd", "started_at", "ended_at", "duration_seconds", "exit_code", "seed"],
+      "required": [
+        "argv", "cwd", "cwd_relative", "started_at", "ended_at",
+        "duration_seconds", "exit_code", "seed"
+      ],
       "properties": {
         "argv": {"type": "array", "minItems": 1, "items": {"type": "string"}},
         "cwd": {"type": "string", "minLength": 1},
+        "cwd_relative": {"type": "string", "minLength": 1},
         "started_at": {"type": "string", "minLength": 1},
         "ended_at": {"type": ["string", "null"]},
         "duration_seconds": {"type": ["number", "null"], "minimum": 0},
@@ -65,6 +70,36 @@
       },
       "additionalProperties": false
     },
+    "change_scope": {
+      "type": "object",
+      "required": [
+        "repository_profile",
+        "changeset",
+        "validation",
+        "before",
+        "after",
+        "evidence_eligible"
+      ],
+      "properties": {
+        "repository_profile": {"$ref": "#/$defs/file_hash"},
+        "changeset": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/file_hash"}
+          ]
+        },
+        "validation": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/file_hash"}
+          ]
+        },
+        "before": {"$ref": "#/$defs/change_check"},
+        "after": {"$ref": "#/$defs/change_check"},
+        "evidence_eligible": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
     "brief": {
       "type": "object",
       "required": ["path", "sha256", "approval_sha256"],
@@ -78,11 +113,23 @@
     "formal_artifacts": {"type": "array", "items": {"$ref": "#/$defs/file_hash"}},
     "formalization": {
       "type": "object",
-      "required": ["changed_paths", "scientific_critical", "shared_across_runs", "outcome", "requirements"],
+      "required": [
+        "changed_paths",
+        "declared_changed_paths",
+        "actual_changed_paths",
+        "scientific_critical",
+        "shared_across_runs",
+        "artifacts_unchanged_during_run",
+        "outcome",
+        "requirements"
+      ],
       "properties": {
         "changed_paths": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "declared_changed_paths": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "actual_changed_paths": {"type": "array", "items": {"type": "string", "minLength": 1}},
         "scientific_critical": {"type": "boolean"},
         "shared_across_runs": {"type": "boolean"},
+        "artifacts_unchanged_during_run": {"type": "boolean"},
         "outcome": {"enum": ["PASS", "ADVISORY", "BLOCKED"]},
         "requirements": {"type": "array", "items": {"type": "object"}}
       },
@@ -151,6 +198,61 @@
     }
   },
   "$defs": {
+    "change_check": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "study_id",
+        "outcome",
+        "git",
+        "changeset",
+        "validation",
+        "changed_paths",
+        "violations",
+        "advisories"
+      ],
+      "properties": {
+        "schema_version": {"const": 1},
+        "study_id": {"type": "string", "pattern": "^SC-[0-9]{4,}$"},
+        "outcome": {"enum": ["PASS", "ADVISORY", "BLOCKED"]},
+        "git": {"type": "object"},
+        "changeset": {"type": ["object", "null"]},
+        "validation": {"type": ["object", "null"]},
+        "changed_paths": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["path", "classification", "tracked", "states"],
+            "properties": {
+              "path": {"type": "string", "minLength": 1},
+              "classification": {
+                "enum": [
+                  "study_state",
+                  "other_study",
+                  "output_object",
+                  "generated",
+                  "vendor",
+                  "test",
+                  "experiment",
+                  "workflow",
+                  "source",
+                  "other"
+                ]
+              },
+              "tracked": {"type": "boolean"},
+              "states": {
+                "type": "array",
+                "items": {"enum": ["committed", "staged", "unstaged", "untracked"]}
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "violations": {"type": "array", "items": {"type": "object"}},
+        "advisories": {"type": "array", "items": {"type": "string"}}
+      },
+      "additionalProperties": false
+    },
     "tracked_code_state": {
       "type": "object",
       "required": ["available", "commit", "diff_sha256"],

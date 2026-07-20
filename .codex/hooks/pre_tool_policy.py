@@ -12,23 +12,17 @@ from typing import Any
 
 _MUTATION = re.compile(
     r"(?:^|[;&|]\s*|\s)(?:rm|unlink|mv|cp|install|truncate|tee|sed\s+-i|perl\s+-i)\b"
-    r"|(?:>>?|\.write_(?:text|bytes)|\.unlink\(|os\.remove|os\.replace)",
+    r"|(?:>>?|\.write_(?:text|bytes)|\.unlink\(|\.touch\(|os\.remove|os\.replace)"
+    r"|(?:\bopen\s*\(\s*[^,]+,\s*(?:mode\s*=\s*)?['\"][^'\"]*[wax+][^'\"]*['\"])"
+    r"|(?:\.open\s*\(\s*(?:mode\s*=\s*)?['\"][^'\"]*[wax+][^'\"]*['\"])"
+    r"|(?:\bPath\.open\s*\(\s*[^,]+,\s*(?:mode\s*=\s*)?['\"][^'\"]*[wax+][^'\"]*['\"])"
+    r"|(?:\bos\.open\s*\([^)]*\bO_(?:WRONLY|RDWR|CREAT|TRUNC|APPEND)\b)",
     re.IGNORECASE,
 )
 _HUMAN_COMMAND = re.compile(
     r"(?:studyctl|tools\.studyctl).*\b(?:approve-brief|verdict)\b",
     re.IGNORECASE | re.DOTALL,
 )
-_BRIEF = re.compile(
-    r"(?:^|/)studies/(SC-[0-9]{4,})/BRIEF\.md$",
-    re.IGNORECASE,
-)
-_EVIDENCE = re.compile(
-    r"(?:^|/)studies/(SC-[0-9]{4,})/evidence/(EVID-[0-9]{4,})\.v([0-9]{4,})\.json$",
-    re.IGNORECASE,
-)
-
-
 def _deny(reason: str) -> dict[str, Any]:
     return {
         "hookSpecificOutput": {
@@ -74,78 +68,142 @@ def _patch_targets(payload: str) -> list[tuple[str, str]]:
     return targets
 
 
-def _referenced_evidence(cwd: Path, study_id: str) -> set[tuple[str, int]] | None:
+def _workflow_context(cwd: Path) -> tuple[Path, str]:
+    fallback_root: Path | None = None
     for root in (cwd, *cwd.parents):
-        claims_path = root / "studies" / study_id / "CLAIMS.json"
-        if not claims_path.is_file():
+        if fallback_root is None and (
+            (root / "scientific-workflow" / "policy.json").is_file()
+            or (root / ".git").exists()
+        ):
+            fallback_root = root
+        profile_path = root / "scientific-workflow" / "repository-profile.json"
+        if not profile_path.is_file():
             continue
+        if profile_path.is_symlink():
+            raise ValueError("repository profile must not be a symbolic link")
+        profile = json.loads(profile_path.read_text(encoding="utf-8"))
+        raw_study_root = profile.get("study_root") if isinstance(profile, dict) else None
+        if not isinstance(raw_study_root, str) or not raw_study_root.strip():
+            raise ValueError("repository profile has no valid study_root")
+        study_root = raw_study_root.strip().replace("\\", "/").rstrip("/")
+        parts = Path(study_root).parts
+        if Path(study_root).is_absolute() or ".." in parts or study_root in {"", "."}:
+            raise ValueError("repository profile study_root escapes or equals the repository root")
+        resolved = (root / study_root).resolve(strict=False)
         try:
-            claims = json.loads(claims_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            resolved.relative_to(root.resolve())
+        except ValueError as exc:
+            raise ValueError("repository profile study_root resolves outside the repository") from exc
+        return root, study_root
+    # Compatibility fallback for a partially installed V1 repository. The
+    # deterministic CLI still rejects a missing profile; the hook remains able
+    # to protect the original default paths during migration.
+    return fallback_root or cwd, "studies"
+
+
+def _study_regex(study_root: str, suffix: str) -> re.Pattern[str]:
+    return re.compile(
+        rf"(?<![A-Za-z0-9_.-]){re.escape(study_root)}/(SC-[0-9]{{4,}})/{suffix}",
+        re.IGNORECASE,
+    )
+
+
+def _referenced_evidence(
+    repository_root: Path,
+    study_root: str,
+    study_id: str,
+) -> set[tuple[str, int]] | None:
+    claims_path = repository_root / study_root / study_id / "CLAIMS.json"
+    if not claims_path.is_file():
+        return None
+    try:
+        claims = json.loads(claims_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(claims, dict) or not isinstance(claims.get("claims"), list):
+        return None
+    refs: set[tuple[str, int]] = set()
+    for claim in claims.get("claims", []):
+        if not isinstance(claim, dict):
             return None
-        if not isinstance(claims, dict) or not isinstance(claims.get("claims"), list):
-            return None
-        refs: set[tuple[str, int]] = set()
-        for claim in claims.get("claims", []):
-            if not isinstance(claim, dict):
+        for field in ("supporting_evidence", "contradictory_evidence", "other_evidence"):
+            field_refs = claim.get(field, [])
+            if not isinstance(field_refs, list):
                 return None
-            for field in ("supporting_evidence", "contradictory_evidence", "other_evidence"):
-                field_refs = claim.get(field, [])
-                if not isinstance(field_refs, list):
+            for ref in field_refs:
+                if not isinstance(ref, dict):
                     return None
-                for ref in field_refs:
-                    if not isinstance(ref, dict):
-                        return None
-                    try:
-                        refs.add((str(ref["evidence_id"]), int(ref["version"])))
-                    except (KeyError, TypeError, ValueError):
-                        return None
-        return refs
-    return None
+                try:
+                    refs.add((str(ref["evidence_id"]), int(ref["version"])))
+                except (KeyError, TypeError, ValueError):
+                    return None
+    return refs
 
 
-def _approval_exists(cwd: Path, study_id: str) -> bool:
-    return any((root / "studies" / study_id / "BRIEF.approval.json").is_file() for root in (cwd, *cwd.parents))
+def _approval_exists(repository_root: Path, study_root: str, study_id: str) -> bool:
+    return (
+        repository_root / study_root / study_id / "BRIEF.approval.json"
+    ).is_file()
 
 
 def decide(event: dict[str, Any]) -> str | None:
     tool_name, payload = _tool_payload(event)
     cwd = Path(str(event.get("cwd") or Path.cwd())).resolve()
+    repository_root, study_root = _workflow_context(cwd)
+    brief_pattern = _study_regex(study_root, r"BRIEF\.md(?:\b|$)")
+    approval_pattern = _study_regex(study_root, r"BRIEF\.approval\.json(?:\b|$)")
+    verdict_pattern = _study_regex(study_root, r"VERDICT(?:\.v[0-9]+)?\.json(?:\b|$)")
+    run_pattern = _study_regex(
+        study_root,
+        r"runs(?:\b|/RUN-[0-9]{6}(?:\b|/manifest\.json(?:\b|$)))",
+    )
+    evidence_pattern = _study_regex(
+        study_root,
+        r"evidence/(EVID-[0-9]{4,})\.v([0-9]{4,})\.json(?:\b|$)",
+    )
+    evidence_directory_pattern = _study_regex(study_root, r"evidence(?:\s|/|$)")
+    changeset_pattern = _study_regex(
+        study_root, r"formal/CHANGESET\.json(?:\b|$)"
+    )
+    validation_pattern = _study_regex(
+        study_root, r"formal/VALIDATION\.json(?:\b|$)"
+    )
     if tool_name == "Bash" or "bash" in tool_name.lower():
         if _HUMAN_COMMAND.search(payload):
             return "Codex must not invoke the human-only approve-brief or verdict command."
         if not _MUTATION.search(payload):
             return None
         lowered = payload.lower()
-        if "brief.approval.json" in lowered:
+        if approval_pattern.search(lowered):
             return "Brief approval records may be written only by the interactive studyctl gate."
-        if re.search(r"verdict(?:\.v[0-9]+)?\.json", lowered):
+        if verdict_pattern.search(lowered):
             return "Finalized Verdict records must not be directly created, changed, or removed."
-        if re.search(
-            r"studies/sc-[0-9]{4,}/runs(?:\b|/run-[0-9]{6}(?:\b|/manifest\.json))",
-            lowered,
-        ):
+        if changeset_pattern.search(lowered):
+            return "CHANGESET records may be written only by studyctl changeset-new."
+        if validation_pattern.search(lowered):
+            return "Validation proofs may be written only by studyctl validate-changes."
+        if run_pattern.search(lowered):
             return "Run manifests are sealed execution records and must not be changed or removed."
-        brief_match = re.search(r"studies/(sc-[0-9]{4,})/brief\.md", lowered)
-        if brief_match and _approval_exists(cwd, brief_match.group(1).upper()):
-            return "An approved Brief must be revised through studyctl brief-new-version."
-        for evidence_match in re.finditer(
-            r"studies/(sc-[0-9]{4,})/evidence/(evid-[0-9]{4,})\.v([0-9]{4,})\.json",
-            lowered,
+        brief_match = brief_pattern.search(lowered)
+        if brief_match and _approval_exists(
+            repository_root, study_root, brief_match.group(1).upper()
         ):
+            return "An approved Brief must be revised through studyctl brief-new-version."
+        for evidence_match in evidence_pattern.finditer(lowered):
             study_id = evidence_match.group(1).upper()
             key = (evidence_match.group(2).upper(), int(evidence_match.group(3)))
-            referenced = _referenced_evidence(cwd, study_id)
+            referenced = _referenced_evidence(repository_root, study_root, study_id)
             if referenced is None:
                 return "Cannot safely verify Claim references; repair CLAIMS.json before changing Evidence."
             if key in referenced:
                 return "Evidence referenced by a Claim is immutable; create a new Evidence version."
-        evidence_directory = re.search(
-            r"studies/(sc-[0-9]{4,})/evidence(?:\s|/|$)",
-            lowered,
-        )
+        evidence_directory = evidence_directory_pattern.search(lowered)
         if evidence_directory:
-            referenced = _referenced_evidence(cwd, evidence_directory.group(1).upper())
+            referenced = _referenced_evidence(
+                repository_root,
+                study_root,
+                evidence_directory.group(1).upper(),
+            )
             if referenced is None:
                 return "Cannot safely verify Claim references; repair CLAIMS.json before changing Evidence."
             if referenced:
@@ -155,19 +213,29 @@ def decide(event: dict[str, Any]) -> str | None:
     for action, raw_path in [*_patch_targets(payload), *_direct_targets(event)]:
         normalized = raw_path.replace("\\", "/").lstrip("./")
         lowered = normalized.lower()
-        if lowered.endswith("brief.approval.json"):
+        if approval_pattern.search(lowered):
             return "Brief approval records may be written only by the interactive studyctl gate."
-        if re.search(r"(?:^|/)verdict(?:\.v[0-9]+)?\.json$", lowered):
+        if verdict_pattern.search(lowered):
             return "Verdict records may be written only by the interactive studyctl gate."
-        if re.search(r"(?:^|/)runs/run-[0-9]{6}/manifest\.json$", lowered) and action in {"update", "delete"}:
+        if changeset_pattern.search(lowered):
+            return "CHANGESET records may be written only by studyctl changeset-new."
+        if validation_pattern.search(lowered):
+            return "Validation proofs may be written only by studyctl validate-changes."
+        if run_pattern.search(lowered) and action in {"add", "update", "delete"}:
             return "Run manifests are sealed execution records and must not be changed or removed."
-        brief_match = _BRIEF.search(normalized)
-        if brief_match and _approval_exists(cwd, brief_match.group(1).upper()):
+        brief_match = brief_pattern.search(normalized)
+        if brief_match and _approval_exists(
+            repository_root, study_root, brief_match.group(1).upper()
+        ):
             return "An approved Brief must be revised through studyctl brief-new-version."
-        evidence_match = _EVIDENCE.search(normalized)
+        evidence_match = evidence_pattern.search(normalized)
         if evidence_match and action in {"update", "delete"}:
             key = (evidence_match.group(2).upper(), int(evidence_match.group(3)))
-            referenced = _referenced_evidence(cwd, evidence_match.group(1).upper())
+            referenced = _referenced_evidence(
+                repository_root,
+                study_root,
+                evidence_match.group(1).upper(),
+            )
             if referenced is None:
                 return "Cannot safely verify Claim references; repair CLAIMS.json before changing Evidence."
             if key in referenced:

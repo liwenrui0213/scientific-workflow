@@ -6,7 +6,7 @@ from typing import Any, Iterable
 
 from .formalization import artifact_ready, collect_formalization_debt, load_policy
 from .hashing import atomic_write_bytes, load_json, sha256_file
-from .models import StudyPaths, ValidationError
+from .models import StudyPaths, ValidationError, WorkflowError
 from .validation import (
     brief_approval_issues,
     evidence_index,
@@ -51,9 +51,14 @@ def active_formal_artifacts(paths: StudyPaths) -> list[dict[str, Any]]:
     for path in sorted(paths.formal.rglob("*"), key=lambda item: item.as_posix()):
         if path.is_symlink() or not path.is_file():
             continue
+        relative = path.relative_to(paths.formal)
+        if relative.parts and relative.parts[0] == "changeset-history":
+            # Superseded CHANGESET records remain historical provenance, not
+            # active scientific/formal context.
+            continue
         kind = known.get(path.resolve())
         if kind is None:
-            kind = path.relative_to(paths.formal).with_suffix("").as_posix().upper()
+            kind = relative.with_suffix("").as_posix().upper()
         records.append(
             {
                 "kind": kind,
@@ -181,6 +186,21 @@ def render_status(paths: StudyPaths) -> Path:
     debt = collect_formalization_debt(paths)
     budget = _budget_state(paths, runs)
     checkpoint = _latest_checkpoint(paths)
+    try:
+        from .workspace import evaluate_changes, repository_profile_path
+
+        change_scope = evaluate_changes(paths)
+        profile_path = repository_profile_path(paths.root).relative_to(paths.root).as_posix()
+        change_scope_error = None
+    except (ValidationError, WorkflowError, OSError, ValueError) as exc:
+        change_scope = {
+            "outcome": "INVALID",
+            "changed_paths": [],
+            "violations": [],
+            "advisories": [],
+        }
+        profile_path = "scientific-workflow/repository-profile.json"
+        change_scope_error = str(exc)
     lines = [
         f"# Study Status: {paths.study_id}",
         "",
@@ -223,6 +243,43 @@ def render_status(paths: StudyPaths) -> Path:
             lines.append(f"- {issue.render()}")
     else:
         lines.append("Authoritative records and references pass deterministic validation.")
+
+    lines.extend(
+        [
+            "",
+            "## Repository Adaptation and Change Scope",
+            "",
+            f"- Profile: `{profile_path}`",
+            f"- Current scope outcome: **{change_scope['outcome']}**",
+        ]
+    )
+    changeset = change_scope.get("changeset")
+    lines.append(
+        f"- Active CHANGESET: `{changeset['path']}`"
+        if isinstance(changeset, dict)
+        else "- Active CHANGESET: none"
+    )
+    validation_proof = change_scope.get("validation")
+    lines.append(
+        f"- Validation proof: `{validation_proof['path']}` "
+        f"(passed={validation_proof.get('passed')})"
+        if isinstance(validation_proof, dict)
+        else "- Validation proof: none"
+    )
+    if change_scope_error:
+        lines.append(f"- Profile/scope error: {change_scope_error}")
+    for record in change_scope.get("changed_paths", []):
+        states = ", ".join(record.get("states", [])) or "unknown"
+        lines.append(
+            f"- `{record.get('classification')}` / {states}: `{record.get('path')}`"
+        )
+    for violation in change_scope.get("violations", []):
+        target = violation.get("path") or "<repository>"
+        lines.append(
+            f"- BLOCKED `{violation.get('rule')}` at `{target}`: {violation.get('reason')}"
+        )
+    for advisory in change_scope.get("advisories", []):
+        lines.append(f"- Advisory: {advisory}")
 
     lines.extend(["", "## Current Claims", ""])
     if claims:
@@ -296,6 +353,14 @@ def render_status(paths: StudyPaths) -> Path:
         attention.append("Repair deterministic validation errors before relying on Claims or Evidence summaries.")
     if authority_warnings:
         attention.append("Review deterministic validation warnings before claiming reproducibility.")
+    if change_scope.get("outcome") in {"BLOCKED", "INVALID"}:
+        attention.append(
+            "Resolve repository change-scope violations before recording an Evidence-eligible Run."
+        )
+    elif change_scope.get("outcome") == "ADVISORY":
+        attention.append(
+            "Git change scope is not fully verifiable; resulting Runs cannot enter formal Evidence."
+        )
     _append_items(lines, attention)
 
     lines.extend(["", "## Next Actions", ""])

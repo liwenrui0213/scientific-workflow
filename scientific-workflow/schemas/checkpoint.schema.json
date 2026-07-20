@@ -25,6 +25,12 @@
       },
       "additionalProperties": false
     },
+    "repository_profile": {"$ref": "#/$defs/file_binding"},
+    "host_change_scope": {"$ref": "#/$defs/host_change_scope"},
+    "prepared_active_work_inventory_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
     "active_formal_artifacts": {"type": "array", "items": {"$ref": "#/$defs/formal_file"}},
     "claims_file_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "claims_snapshot": {"type": "array", "items": {"type": "object"}},
@@ -47,6 +53,64 @@
     "checkpoint_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
   },
   "$defs": {
+    "file_binding": {
+      "type": "object",
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "host_change_scope": {
+      "type": "object",
+      "required": [
+        "outcome", "git_available", "consequential_paths", "fingerprint_sha256"
+      ],
+      "properties": {
+        "outcome": {"enum": ["PASS", "ADVISORY"]},
+        "git_available": {"type": "boolean"},
+        "consequential_paths": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/host_path"}
+        },
+        "fingerprint_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "host_path": {
+      "type": "object",
+      "required": ["path", "classification", "tracked", "states", "identity"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "classification": {"type": "string", "minLength": 1},
+        "tracked": {"type": "boolean"},
+        "states": {"type": "array", "items": {"type": "string"}},
+        "identity": {"$ref": "#/$defs/path_identity"}
+      },
+      "additionalProperties": false
+    },
+    "path_identity": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": {"enum": ["file", "missing", "symlink", "directory", "other"]},
+        "mode": {"type": "integer", "minimum": 0},
+        "size": {"type": "integer", "minimum": 0},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "target": {"type": "string"}
+      },
+      "oneOf": [
+        {"properties": {"kind": {"const": "file"}}, "required": ["mode", "size", "sha256"]},
+        {"properties": {"kind": {"const": "missing"}}},
+        {"properties": {"kind": {"const": "symlink"}}, "required": ["target"]},
+        {"properties": {"kind": {"enum": ["directory", "other"]}}, "required": ["mode"]}
+      ],
+      "additionalProperties": false
+    },
     "evidence_ref": {
       "type": "object",
       "required": ["evidence_id", "version", "sha256"],

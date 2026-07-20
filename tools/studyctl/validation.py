@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 from typing import Any, Iterable, Iterator
 
 from .hashing import (
@@ -21,6 +22,7 @@ from .models import (
     StudyPaths,
     ValidationError,
     ValidationIssue,
+    WorkflowError,
     errors_only,
     require_id,
 )
@@ -44,6 +46,9 @@ SCHEMA_FILES = {
     "verdict": "verdict.schema.json",
     "brief_approval": "brief-approval.schema.json",
     "compaction_plan": "compaction-plan.schema.json",
+    "repository_profile": "repository-profile.schema.json",
+    "changeset": "changeset.schema.json",
+    "change_validation": "change-validation.schema.json",
 }
 
 
@@ -101,7 +106,7 @@ def validate_schema_instance(
     root_schema: dict[str, Any] | None = None,
     location: str = "$",
 ) -> list[str]:
-    """Validate the deliberately small Draft 2020-12 subset used by V1."""
+    """Validate the deliberately small Draft 2020-12 subset used by the workflow."""
     root = root_schema or schema
     if "$ref" in schema:
         target = _resolve_ref(root, schema["$ref"])
@@ -206,9 +211,73 @@ def object_schema_issues(
     root: Path, name: str, path: Path, value: Any
 ) -> list[ValidationIssue]:
     schema = load_schema(root, name)
+    validation_value = value
+    if (
+        name == "run"
+        and isinstance(value, dict)
+        and isinstance(value.get("schema_version"), int)
+        and not isinstance(value.get("schema_version"), bool)
+        and value.get("schema_version") == 1
+    ):
+        # V1 manifests are immutable historical records.  Validate a transient
+        # V2-shaped view instead of rewriting the on-disk manifest.  Synthetic
+        # scope is deliberately Evidence-ineligible; no attestation is invented.
+        validation_value = copy.deepcopy(value)
+        validation_value["schema_version"] = 2
+        execution = validation_value.get("execution")
+        if isinstance(execution, dict):
+            execution.setdefault("cwd_relative", ".")
+        formalization = validation_value.get("formalization")
+        if isinstance(formalization, dict):
+            changed_paths = list(formalization.get("changed_paths", []))
+            formalization.setdefault("declared_changed_paths", changed_paths)
+            formalization.setdefault("actual_changed_paths", [])
+            formalization.setdefault("artifacts_unchanged_during_run", False)
+        validation_value.setdefault(
+            "change_scope",
+            {
+                "repository_profile": {
+                    "path": "<legacy-v1-unattested>",
+                    "size": 0,
+                    "sha256": "0" * 64,
+                },
+                "changeset": None,
+                "validation": None,
+                "before": {
+                    "schema_version": 1,
+                    "study_id": str(value.get("study_id") or "SC-0000"),
+                    "outcome": "ADVISORY",
+                    "git": {},
+                    "changeset": None,
+                    "validation": None,
+                    "changed_paths": [],
+                    "violations": [],
+                    "advisories": ["legacy V1 Run has no attested repository change scope"],
+                },
+                "after": {
+                    "schema_version": 1,
+                    "study_id": str(value.get("study_id") or "SC-0000"),
+                    "outcome": "ADVISORY",
+                    "git": {},
+                    "changeset": None,
+                    "validation": None,
+                    "changed_paths": [],
+                    "violations": [],
+                    "advisories": ["legacy V1 Run has no attested repository change scope"],
+                },
+                "evidence_eligible": False,
+            },
+        )
+        legacy_scope = validation_value.get("change_scope")
+        if isinstance(legacy_scope, dict):
+            legacy_scope.setdefault("validation", None)
+            for stage in ("before", "after"):
+                check = legacy_scope.get(stage)
+                if isinstance(check, dict):
+                    check.setdefault("validation", None)
     return [
         ValidationIssue("ERROR", str(path), message)
-        for message in validate_schema_instance(value, schema)
+        for message in validate_schema_instance(validation_value, schema)
     ]
 
 
@@ -355,6 +424,261 @@ def _resolve_recorded_path(root: Path, raw: str) -> Path:
     return path if path.is_absolute() else root / path
 
 
+def _has_symlink_component(path: Path) -> bool:
+    """Return whether any existing component of ``path`` is a symbolic link."""
+    absolute = path.absolute()
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current /= part
+        if current.is_symlink():
+            return True
+    return False
+
+
+def _recorded_regular_file_issue(
+    root: Path,
+    record: dict[str, Any],
+    *,
+    label: str,
+    missing_level: str,
+) -> list[ValidationIssue]:
+    raw = record.get("path")
+    if not isinstance(raw, str) or not raw:
+        return [ValidationIssue("ERROR", label, "recorded path is missing")]
+    path = _resolve_recorded_path(root, raw)
+    if _has_symlink_component(path):
+        return [ValidationIssue("ERROR", raw, f"{label} uses a symbolic-link path")]
+    try:
+        metadata = path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return [ValidationIssue(missing_level, raw, f"{label} is unavailable")]
+    except OSError as exc:
+        return [ValidationIssue("ERROR", raw, f"cannot inspect {label}: {exc}")]
+    if not stat.S_ISREG(metadata.st_mode):
+        return [ValidationIssue("ERROR", raw, f"{label} is not a regular file")]
+
+    issues: list[ValidationIssue] = []
+    expected_size = record.get("size")
+    if expected_size != metadata.st_size:
+        issues.append(
+            ValidationIssue(
+                "ERROR",
+                raw,
+                f"{label} size mismatch: recorded {expected_size!r}, current {metadata.st_size}",
+            )
+        )
+    expected_hash = record.get("sha256")
+    try:
+        current_hash = sha256_file(path)
+    except WorkflowError as exc:
+        issues.append(ValidationIssue("ERROR", raw, f"cannot hash {label}: {exc}"))
+    else:
+        if expected_hash != current_hash:
+            issues.append(ValidationIssue("ERROR", raw, f"{label} hash mismatch"))
+    return issues
+
+
+def run_dependency_integrity_issues(
+    paths: StudyPaths,
+    manifest: dict[str, Any],
+    *,
+    for_evidence: bool,
+) -> list[ValidationIssue]:
+    """Reverify immutable Run logs, declared outputs, and declared inputs.
+
+    A legacy V1 manifest remains a readable historical fact, but it predates
+    the V2 dependency-integrity contract and therefore cannot support formal
+    Evidence without a separate attestation mechanism.
+    """
+    issues: list[ValidationIssue] = []
+    run_id = str(manifest.get("run_id") or "<unknown Run>")
+    schema_version = manifest.get("schema_version")
+    if isinstance(schema_version, int) and not isinstance(schema_version, bool) and schema_version == 1:
+        issues.append(
+            ValidationIssue(
+                "ERROR" if for_evidence else "WARNING",
+                run_id,
+                "legacy V1 Run is historical and Evidence-ineligible without separate attestation",
+            )
+        )
+    elif (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version != 2
+    ):
+        issues.append(
+            ValidationIssue("ERROR", run_id, f"unsupported Run schema_version: {schema_version!r}")
+        )
+
+    change_scope = manifest.get("change_scope")
+    if isinstance(change_scope, dict) and schema_version == 2:
+        for key, required in (
+            ("repository_profile", True),
+            ("changeset", False),
+            ("validation", False),
+        ):
+            record = change_scope.get(key)
+            if record is None:
+                if required:
+                    issues.append(
+                        ValidationIssue(
+                            "ERROR",
+                            run_id,
+                            f"Run change-scope {key} snapshot is missing",
+                        )
+                    )
+                continue
+            if not isinstance(record, dict):
+                issues.append(
+                    ValidationIssue(
+                        "ERROR",
+                        run_id,
+                        f"Run change-scope {key} snapshot is invalid",
+                    )
+                )
+                continue
+            authority_issues = _recorded_regular_file_issue(
+                paths.root,
+                record,
+                label=f"Run change-scope {key} snapshot",
+                missing_level="ERROR" if for_evidence else "WARNING",
+            )
+            if not for_evidence:
+                authority_issues = [
+                    ValidationIssue(
+                        "WARNING" if issue.level == "ERROR" else issue.level,
+                        issue.path,
+                        issue.message,
+                    )
+                    for issue in authority_issues
+                ]
+            issues.extend(authority_issues)
+
+    formal_artifacts = manifest.get("formal_artifacts")
+    if isinstance(formal_artifacts, list):
+        for index, record in enumerate(formal_artifacts):
+            if not isinstance(record, dict):
+                continue
+            formal_issues = _recorded_regular_file_issue(
+                paths.root,
+                record,
+                label=f"formal artifact[{index}]",
+                missing_level="ERROR" if for_evidence else "WARNING",
+            )
+            if not for_evidence:
+                formal_issues = [
+                    ValidationIssue(
+                        "WARNING" if issue.level == "ERROR" else issue.level,
+                        issue.path,
+                        issue.message,
+                    )
+                    for issue in formal_issues
+                ]
+            issues.extend(formal_issues)
+
+    logs = manifest.get("logs")
+    if isinstance(logs, dict):
+        for name in ("stdout", "stderr"):
+            record = logs.get(name)
+            if isinstance(record, dict):
+                issues.extend(
+                    _recorded_regular_file_issue(
+                        paths.root,
+                        record,
+                        label=f"{name} log",
+                        missing_level="ERROR",
+                    )
+                )
+
+    outputs = manifest.get("outputs")
+    if isinstance(outputs, list):
+        for index, record in enumerate(outputs):
+            if not isinstance(record, dict):
+                continue
+            raw = str(record.get("path") or f"output[{index}]")
+            if record.get("present") is not True:
+                issues.append(
+                    ValidationIssue(
+                        "ERROR" if for_evidence else "WARNING",
+                        raw,
+                        "declared Run output was not produced",
+                    )
+                )
+                continue
+            issues.extend(
+                _recorded_regular_file_issue(
+                    paths.root,
+                    record,
+                    label="Run output",
+                    missing_level="ERROR" if for_evidence else "WARNING",
+                )
+            )
+
+    inputs = manifest.get("inputs")
+    if isinstance(inputs, list):
+        for index, record in enumerate(inputs):
+            if not isinstance(record, dict):
+                continue
+            raw = str(record.get("path") or f"input[{index}]")
+            if record.get("changed_during_run") is not False:
+                issues.append(
+                    ValidationIssue(
+                        "ERROR" if for_evidence else "WARNING",
+                        raw,
+                        "Run input changed or became unavailable during execution",
+                    )
+                )
+            current_record = {
+                "path": record.get("path"),
+                "size": record.get("size"),
+                "sha256": record.get("sha256_after"),
+            }
+            input_issues = _recorded_regular_file_issue(
+                paths.root,
+                current_record,
+                label="Run input",
+                missing_level="ERROR" if for_evidence else "WARNING",
+            )
+            if not for_evidence:
+                input_issues = [
+                    ValidationIssue(
+                        "WARNING" if issue.level == "ERROR" else issue.level,
+                        issue.path,
+                        issue.message,
+                    )
+                    for issue in input_issues
+                ]
+            issues.extend(input_issues)
+    return issues
+
+
+def sealed_run_evidence_eligible(manifest: dict[str, Any]) -> bool:
+    if manifest.get("schema_version") != 2:
+        return False
+    from .workspace import change_state_evidence_eligible
+
+    change_scope = manifest.get("change_scope", {})
+    return (
+        isinstance(change_scope, dict)
+        and change_state_evidence_eligible(change_scope.get("before", {}))
+        and change_state_evidence_eligible(change_scope.get("after", {}))
+        and all(
+            record.get("changed_during_run") is False
+            for record in manifest.get("inputs", [])
+            if isinstance(record, dict)
+        )
+        and all(
+            record.get("present") is True
+            for record in manifest.get("outputs", [])
+            if isinstance(record, dict)
+        )
+        and manifest.get("formalization", {}).get(
+            "artifacts_unchanged_during_run"
+        )
+        is True
+    )
+
+
 def _changed_cohort_fields(manifests: list[dict[str, Any]]) -> list[str]:
     fields = [manifest.get("cohort", {}).get("fields", {}) for manifest in manifests]
     keys = sorted({str(key) for item in fields if isinstance(item, dict) for key in item})
@@ -413,6 +737,25 @@ def _run_issues(paths: StudyPaths) -> tuple[list[ValidationIssue], dict[str, tup
                         "WARNING", str(path), "tracked code changed during Run"
                     )
                 )
+            change_scope = manifest.get("change_scope", {})
+            if manifest.get("schema_version") == 2:
+                expected_eligibility = sealed_run_evidence_eligible(manifest)
+                if change_scope.get("evidence_eligible") is not expected_eligibility:
+                    issues.append(
+                        ValidationIssue(
+                            "ERROR",
+                            str(path),
+                            "change_scope.evidence_eligible does not match sealed dependencies",
+                        )
+                    )
+            if not change_scope.get("evidence_eligible", False):
+                issues.append(
+                    ValidationIssue(
+                        "WARNING",
+                        str(path),
+                        "Run is not eligible for formal Evidence because its change scope is unverifiable or blocked",
+                    )
+                )
             cohort = manifest.get("cohort", {})
             fields = cohort.get("fields", {})
             expected_fingerprint = sha256_json(fields)
@@ -427,31 +770,13 @@ def _run_issues(paths: StudyPaths) -> tuple[list[ValidationIssue], dict[str, tup
                             "ERROR", str(path), f"Cohort {cohort_id} has more than one fingerprint"
                         )
                     )
-            for log_name in ("stdout", "stderr"):
-                record = manifest.get("logs", {}).get(log_name, {})
-                log_path = _resolve_recorded_path(paths.root, str(record.get("path", "")))
-                if not log_path.is_file():
-                    issues.append(ValidationIssue("ERROR", str(path), f"missing {log_name} log"))
-                elif record.get("sha256") != sha256_file(log_path):
-                    issues.append(ValidationIssue("ERROR", str(path), f"{log_name} hash mismatch"))
-            for record in manifest.get("outputs", []):
-                if not record.get("present"):
-                    continue
-                output_path = _resolve_recorded_path(paths.root, str(record.get("path", "")))
-                if output_path.is_file() and record.get("sha256") != sha256_file(output_path):
-                    issues.append(ValidationIssue("ERROR", str(path), f"output hash mismatch: {record.get('path')}"))
-                elif not output_path.exists():
-                    issues.append(ValidationIssue("WARNING", str(path), f"output is unavailable: {record.get('path')}"))
-            for record in manifest.get("inputs", []):
-                input_path = _resolve_recorded_path(paths.root, str(record.get("path", "")))
-                if input_path.is_file() and record.get("sha256_after") != sha256_file(input_path):
-                    issues.append(ValidationIssue("WARNING", str(path), f"input changed since Run: {record.get('path')}"))
-                elif not input_path.exists():
-                    issues.append(
-                        ValidationIssue(
-                            "WARNING", str(path), f"input is unavailable: {record.get('path')}"
-                        )
-                    )
+            issues.extend(
+                run_dependency_integrity_issues(
+                    paths,
+                    manifest,
+                    for_evidence=False,
+                )
+            )
         except (ValidationError, OSError, ValueError) as exc:
             issues.append(ValidationIssue("ERROR", str(path), str(exc)))
     return issues, runs
@@ -503,6 +828,32 @@ def _evidence_issues(
                     record.get("changed_during_run") for record in manifest.get("inputs", [])
                 ):
                     issues.append(ValidationIssue("ERROR", str(path), f"finalized Evidence uses Run with changing input: {run_id}"))
+                if item.get("status") == "finalized":
+                    for dependency_issue in errors_only(
+                        run_dependency_integrity_issues(
+                            paths,
+                            manifest,
+                            for_evidence=True,
+                        )
+                    ):
+                        issues.append(
+                            ValidationIssue(
+                                "ERROR",
+                                str(path),
+                                f"finalized Evidence uses integrity-invalid Run {run_id}: "
+                                f"{dependency_issue.message}",
+                            )
+                        )
+                if item.get("status") == "finalized" and not manifest.get(
+                    "change_scope", {}
+                ).get("evidence_eligible", False):
+                    issues.append(
+                        ValidationIssue(
+                            "ERROR",
+                            str(path),
+                            f"finalized Evidence uses Run with unverifiable or blocked change scope: {run_id}",
+                        )
+                    )
             declared = set(item.get("analysis", {}).get("comparison", {}).get("cohort_fingerprints", []))
             if actual_fingerprints != declared:
                 issues.append(ValidationIssue("ERROR", str(path), "declared cohort fingerprints do not match Runs"))
@@ -1001,6 +1352,15 @@ def _verdict_issues(
 def validate_study(paths: StudyPaths) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
     issues.extend(schema_issues(paths.root))
+    from .workspace import changeset_issues, repository_profile_issues
+
+    issues.extend(repository_profile_issues(paths.root))
+    try:
+        paths.assert_safe_layout(must_exist=True)
+    except (ValidationError, WorkflowError) as exc:
+        issues.append(ValidationIssue("ERROR", str(paths.root), str(exc)))
+        return issues
+    issues.extend(changeset_issues(paths))
     issues.extend(brief_content_issues(paths))
     issues.extend(brief_approval_issues(paths))
     run_issues, runs = _run_issues(paths)

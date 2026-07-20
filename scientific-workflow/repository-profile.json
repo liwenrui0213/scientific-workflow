@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "workflow_version": 2,
+  "study_root": "studies",
+  "object_root": ".objects",
+  "run_cwd": ".",
+  "source_roots": [
+    "tools/studyctl"
+  ],
+  "test_roots": [
+    "tests"
+  ],
+  "experiment_roots": [],
+  "workflow_roots": [
+    "AGENTS.md",
+    ".agents/skills",
+    ".codex",
+    "docs/scientific-agent-workflow.md",
+    "scientific-workflow",
+    "tools/studyctl"
+  ],
+  "scientific_critical_patterns": [
+    "tools/studyctl/**"
+  ],
+  "protected_patterns": [
+    "AGENTS.md",
+    ".agents/skills/**",
+    ".codex/**",
+    "docs/scientific-agent-workflow.md",
+    "scientific-workflow/**",
+    "tools/studyctl/**"
+  ],
+  "generated_patterns": [
+    "**/__pycache__/**",
+    "studies/*/generated/**"
+  ],
+  "vendor_patterns": [],
+  "commands": {
+    "full_validation": [
+      "python",
+      "-m",
+      "unittest",
+      "discover",
+      "-s",
+      "tests",
+      "-v"
+    ]
+  },
+  "git": {
+    "base_ref": "main",
+    "branch_template": "study/{study_id}/{slug}",
+    "require_study_branch": true,
+    "require_linked_worktree": false
+  }
+}

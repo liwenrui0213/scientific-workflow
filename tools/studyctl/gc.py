@@ -7,6 +7,7 @@ from typing import Any
 from .hashing import nested_record_digest, sha256_file
 from .models import StudyPaths
 from .validation import authoritative_string_references, evidence_index, run_index
+from .workspace import load_repository_profile
 
 
 def _resolve_recorded_path(root: Path, raw: str) -> Path:
@@ -41,6 +42,8 @@ def _manifest_reproducible(paths: StudyPaths, manifest: dict[str, Any]) -> tuple
             return False, f"input is unavailable: {record.get('path')}"
         if record.get("sha256_after") != sha256_file(input_path):
             return False, f"input hash changed: {record.get('path')}"
+    if not manifest.get("change_scope", {}).get("evidence_eligible", False):
+        return False, "Run change scope is not Evidence-eligible"
     return True, "reproducible terminal Run"
 
 
@@ -56,7 +59,9 @@ def garbage_collection_report(paths: StudyPaths) -> dict[str, Any]:
     for value in authoritative_strings:
         protected_run_ids.update(re.findall(r"RUN-[0-9]{6}", value))
 
-    object_root = (paths.root / ".objects").resolve()
+    profile = load_repository_profile(paths.root)
+    object_relative = Path(str(profile["object_root"]))
+    object_root = (paths.root / object_relative).resolve()
     registered: dict[Path, list[tuple[str, dict[str, Any], dict[str, Any], bool, str]]] = {}
     retained: list[dict[str, str]] = []
     candidates: list[dict[str, Any]] = []
@@ -80,7 +85,7 @@ def garbage_collection_report(paths: StudyPaths) -> dict[str, Any]:
     # deletable through a second unreferenced Run.
     for resolved, registrations in sorted(registered.items(), key=lambda item: str(item[0])):
         relative = resolved.relative_to(object_root)
-        display = (Path(".objects") / relative).as_posix()
+        display = (object_relative / relative).as_posix()
         run_ids = sorted({item[0] for item in registrations})
         reason: str | None = None
         if any(run_id in protected_run_ids for run_id in run_ids):
@@ -123,7 +128,7 @@ def garbage_collection_report(paths: StudyPaths) -> dict[str, Any]:
             if resolved not in registered:
                 retained.append(
                     {
-                        "path": (Path(".objects") / resolved.relative_to(object_root)).as_posix(),
+                        "path": (object_relative / resolved.relative_to(object_root)).as_posix(),
                         "run_id": "unregistered",
                         "reason": "object has no reproducible Run manifest",
                     }

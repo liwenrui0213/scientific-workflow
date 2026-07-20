@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import platform
@@ -13,6 +14,7 @@ from typing import Any, Sequence
 from .formalization import check_formalization, load_policy
 from .git_state import git_state, git_tracked_state
 from .hashing import (
+    atomic_write_bytes,
     atomic_write_json,
     file_record,
     load_json,
@@ -23,7 +25,6 @@ from .hashing import (
 )
 from .models import (
     RunInterrupted,
-    SCHEMA_VERSION,
     StudyPaths,
     ValidationError,
     WorkflowError,
@@ -31,9 +32,19 @@ from .models import (
     utc_now,
 )
 from .validation import brief_approval_issues, brief_content_issues, errors_only
+from .workspace import (
+    change_validation_path,
+    change_state_evidence_eligible,
+    changeset_path,
+    critical_actual_paths,
+    evaluate_changes,
+    load_repository_profile,
+    repository_profile_path,
+)
 
 
 _RUN_DIRECTORY_RE = re.compile(r"^RUN-([0-9]{6})$")
+_RUN_SCHEMA_VERSION = 2
 _REPRODUCIBILITY_ENVIRONMENT_KEYS = (
     "CONDA_DEFAULT_ENV",
     "CONDA_PREFIX",
@@ -59,6 +70,266 @@ def _display_path(path: Path, root: Path) -> str:
 def _user_path(root: Path, raw: str | os.PathLike[str]) -> Path:
     path = Path(raw)
     return path if path.is_absolute() else root / path
+
+
+def _symlink_component(root: Path, path: Path) -> Path | None:
+    try:
+        relative = path.absolute().relative_to(root.absolute())
+    except ValueError:
+        # External scientific inputs are allowed and are canonicalized by
+        # file_record(). Their leaf may not itself be a symbolic link, but a
+        # platform path alias such as macOS /var -> /private/var is harmless
+        # once the canonical absolute path and content hash are recorded.
+        return None
+    current = root.absolute()
+    for part in relative.parts:
+        current /= part
+        if current.is_symlink():
+            return current
+    return None
+
+
+def _require_output_root(
+    root: Path,
+    object_root: Path,
+    raw_paths: Sequence[str | os.PathLike[str]] | None,
+) -> None:
+    resolved_object_root = object_root.resolve(strict=False)
+    for raw in raw_paths or ():
+        if Path(raw).is_absolute():
+            raise ValidationError(
+                "Run output paths must be repository-relative paths below the "
+                f"configured object_root {resolved_object_root}: {raw!r}"
+            )
+        lexical_candidate = _user_path(root, raw)
+        link = _symlink_component(root, lexical_candidate)
+        if link is not None:
+            raise ValidationError(
+                f"Run output must not use a symbolic-link component: {link}"
+            )
+        candidate = lexical_candidate.resolve(strict=False)
+        try:
+            candidate.relative_to(resolved_object_root)
+        except ValueError as exc:
+            raise ValidationError(
+                f"Run output must stay below configured object_root "
+                f"{resolved_object_root}: {raw!r}"
+            ) from exc
+
+
+def _require_new_output_paths(
+    root: Path,
+    raw_paths: Sequence[str | os.PathLike[str]] | None,
+) -> None:
+    for raw in raw_paths or ():
+        candidate = _user_path(root, raw)
+        if candidate.is_symlink() or candidate.exists():
+            raise ValidationError(
+                f"Run output path must be new and immutable; refusing to overwrite: {raw!r}"
+            )
+
+
+def _argument_literal_values(argument: str) -> list[str]:
+    raw_candidates = [argument]
+    if "=" in argument:
+        _, value = argument.split("=", 1)
+        if value:
+            raw_candidates.append(value)
+    raw_candidates.extend(
+        match.group(1)
+        for match in re.finditer(r"['\"]([^'\"]+)['\"]", argument)
+        if match.group(1)
+    )
+    return raw_candidates
+
+
+def _argument_file_candidates(configured_cwd: Path, argument: str) -> list[Path]:
+    raw_candidates = _argument_literal_values(argument)
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+    for raw in raw_candidates:
+        path = Path(raw)
+        candidate = path if path.is_absolute() else configured_cwd / path
+        if not candidate.is_symlink() and not candidate.is_file():
+            continue
+        resolved = candidate.resolve(strict=False)
+        if resolved not in seen:
+            seen.add(resolved)
+            candidates.append(candidate)
+    return candidates
+
+
+def _fixed_by_head(root: Path, candidate: Path) -> bool:
+    resolved = candidate.resolve(strict=False)
+    try:
+        relative = resolved.relative_to(root.resolve()).as_posix()
+    except ValueError:
+        return False
+    tracked = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", "--", relative],
+        cwd=root,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        shell=False,
+    )
+    if tracked.returncode != 0:
+        return False
+    clean = subprocess.run(
+        ["git", "diff", "--quiet", "HEAD", "--", relative],
+        cwd=root,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        shell=False,
+    )
+    return clean.returncode == 0
+
+
+def _active_work_mentions(
+    paths: StudyPaths,
+    configured_cwd: Path,
+    argv: Sequence[str],
+) -> list[Path]:
+    active = paths.active_work.resolve()
+    if not active.is_dir():
+        return []
+    files = [
+        path
+        for path in sorted(active.rglob("*"))
+        if not path.is_symlink() and path.is_file()
+    ]
+    root = paths.root.resolve()
+    active_representations = {
+        str(active),
+        active.relative_to(root).as_posix(),
+    }
+    try:
+        active_representations.add(active.relative_to(configured_cwd).as_posix())
+    except ValueError:
+        pass
+    mentioned: set[Path] = set()
+    literal_values = {
+        raw
+        for argument in argv
+        for raw in _argument_literal_values(argument)
+    }
+    for file_path in files:
+        representations = {
+            str(file_path),
+            file_path.relative_to(root).as_posix(),
+        }
+        try:
+            representations.add(file_path.relative_to(configured_cwd).as_posix())
+        except ValueError:
+            pass
+        if any(representation in literal_values for representation in representations):
+            mentioned.add(file_path)
+            continue
+        if any(
+            representation in literal_values
+            for representation in active_representations
+        ):
+            mentioned.add(file_path)
+    return sorted(mentioned)
+
+
+def _python_module_file_candidates(
+    configured_cwd: Path,
+    argv: Sequence[str],
+) -> list[Path]:
+    """Resolve the direct target of ``python -m package.module`` when local.
+
+    This is a narrow static safeguard, not general import tracing.  It catches
+    the common case where an ignored or untracked research module would
+    otherwise be invisible to Git and absent as a literal path in ``argv``.
+    """
+
+    if len(argv) < 3 or argv[1] != "-m":
+        return []
+    executable = Path(argv[0]).name.lower()
+    if not executable.startswith("python"):
+        return []
+    module = argv[2]
+    if re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", module) is None:
+        return []
+    relative = Path(*module.split("."))
+    candidates = (
+        configured_cwd / relative.with_suffix(".py"),
+        configured_cwd / relative / "__main__.py",
+    )
+    return [path for path in candidates if not path.is_symlink() and path.is_file()]
+
+
+def _require_declared_mutable_command_inputs(
+    paths: StudyPaths,
+    configured_cwd: Path,
+    argv: Sequence[str],
+    raw_inputs: Sequence[str | os.PathLike[str]] | None,
+) -> None:
+    """Require mutable files named by argv to be pinned as Run inputs.
+
+    Clean files tracked by ``HEAD`` are already fixed by the Run commit. Study
+    files, external files, ignored files, and dirty/untracked repository files
+    are not, so every statically visible dependency must be declared.
+    """
+    root = paths.root.resolve()
+    study = paths.study.resolve()
+    declared = {
+        _user_path(root, raw).resolve(strict=False)
+        for raw in raw_inputs or ()
+    }
+    missing: list[str] = []
+    candidates: list[tuple[int, Path]] = []
+    for index, argument in enumerate(argv):
+        for candidate in _argument_file_candidates(configured_cwd, argument):
+            candidates.append((index, candidate))
+    candidates.extend(
+        (-1, candidate)
+        for candidate in _python_module_file_candidates(configured_cwd, argv)
+    )
+    candidates.extend((-1, candidate) for candidate in _active_work_mentions(paths, configured_cwd, argv))
+    seen: set[Path] = set()
+    for index, candidate in candidates:
+        resolved = candidate.resolve(strict=False)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        try:
+            resolved.relative_to(root)
+            inside_repository = True
+        except ValueError:
+            inside_repository = False
+        try:
+            resolved.relative_to(study)
+            inside_study = True
+        except ValueError:
+            inside_study = False
+        # argv[0] may be an external system executable whose identity is
+        # captured in the environment record rather than as scientific input.
+        if index == 0 and not inside_repository:
+            continue
+        requires_input = inside_study or not _fixed_by_head(root, candidate)
+        if requires_input and resolved not in declared:
+            missing.append(_display_path(candidate, root))
+    if missing:
+        joined = ", ".join(sorted(set(missing)))
+        raise ValidationError(
+            "command references mutable or uncommitted file(s) that are not "
+            f"declared Run inputs: {joined}; add each path with --input"
+        )
+
+
+def _seal_output_paths(
+    root: Path,
+    raw_paths: Sequence[str | os.PathLike[str]] | None,
+) -> None:
+    for raw in raw_paths or ():
+        candidate = _user_path(root, raw)
+        if not candidate.is_symlink() and candidate.is_file():
+            os.chmod(candidate, 0o444)
 
 
 def _require_fresh_brief(paths: StudyPaths) -> dict[str, Any]:
@@ -93,24 +364,122 @@ def _allocate_run_directory(paths: StudyPaths) -> tuple[str, Path]:
     raise WorkflowError("Run ID space is exhausted")
 
 
-def _formal_artifact_records(paths: StudyPaths, policy: dict[str, Any]) -> list[dict[str, Any]]:
+def _capture_formal_artifacts(
+    paths: StudyPaths,
+    policy: dict[str, Any],
+) -> list[tuple[Path, str, str, bytes]]:
     if not paths.formal.is_dir():
         return []
     known_kinds = {
         (paths.study / str(relative)).resolve(): str(kind)
         for kind, relative in policy.get("formal_artifacts", {}).items()
     }
-    records: list[dict[str, Any]] = []
+    records: list[tuple[Path, str, str, bytes]] = []
     for path in sorted(paths.formal.rglob("*"), key=lambda item: item.as_posix()):
         if path.is_symlink():
             raise ValidationError(f"symbolic links are not accepted as formal artifacts: {path}")
         if not path.is_file():
             continue
-        record = file_record(path, paths.root)
-        record["kind"] = known_kinds.get(
+        relative = path.relative_to(paths.formal)
+        if path.name in {"CHANGESET.json", "VALIDATION.json"} or (
+            relative.parts and relative.parts[0] == "changeset-history"
+        ):
+            # These governance records are pinned separately in change_scope.
+            continue
+        payload = path.read_bytes()
+        digest = hashlib.sha256(payload).hexdigest()
+        kind = known_kinds.get(
             path.resolve(), path.relative_to(paths.formal).as_posix()
         )
+        records.append((path, kind, digest, payload))
+    return records
+
+
+def _formal_capture_digest(
+    paths: StudyPaths,
+    captured: Sequence[tuple[Path, str, str, bytes]],
+) -> str:
+    return sha256_json(
+        [
+            {
+                "path": source.relative_to(paths.formal).as_posix(),
+                "kind": kind,
+                "sha256": digest,
+            }
+            for source, kind, digest, _ in captured
+        ]
+    )
+
+
+def _snapshot_formal_artifacts(
+    root: Path,
+    paths: StudyPaths,
+    run_directory: Path,
+    captured: Sequence[tuple[Path, str, str, bytes]],
+) -> list[dict[str, Any]]:
+    snapshot_root = run_directory / "formal-artifacts"
+    records: list[dict[str, Any]] = []
+    for source, kind, digest, payload in captured:
+        relative = source.relative_to(paths.formal)
+        destination = snapshot_root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_bytes(destination, payload, overwrite=False, mode=0o444)
+        record = file_record(destination, root)
+        if record["sha256"] != digest:
+            raise ValidationError(
+                f"formal artifact changed while its Run snapshot was created: {source}"
+            )
+        record["kind"] = kind
         records.append(record)
+    return records
+
+
+def _formal_artifacts_unchanged(
+    paths: StudyPaths,
+    policy: dict[str, Any],
+    before_digest: str,
+) -> bool:
+    try:
+        current = _capture_formal_artifacts(paths, policy)
+    except (OSError, WorkflowError, ValidationError):
+        return False
+    return _formal_capture_digest(paths, current) == before_digest
+
+
+def _snapshot_change_authorities(
+    root: Path,
+    paths: StudyPaths,
+    run_directory: Path,
+) -> dict[str, dict[str, Any] | None]:
+    """Copy mutable governance records into the immutable Run directory."""
+
+    governance = run_directory / "governance"
+    governance.mkdir()
+    sources: tuple[tuple[str, Path, str, bool], ...] = (
+        (
+            "repository_profile",
+            repository_profile_path(root),
+            "repository-profile.json",
+            True,
+        ),
+        ("changeset", changeset_path(paths), "CHANGESET.json", False),
+        ("validation", change_validation_path(paths), "VALIDATION.json", False),
+    )
+    records: dict[str, dict[str, Any] | None] = {}
+    for key, source, filename, required in sources:
+        if not source.is_file():
+            if required:
+                raise ValidationError(f"required Run authority is unavailable: {source}")
+            records[key] = None
+            continue
+        destination = governance / filename
+        atomic_write_bytes(
+            destination,
+            source.read_bytes(),
+            overwrite=False,
+            mode=0o444,
+        )
+        records[key] = file_record(destination, root)
     return records
 
 
@@ -275,10 +644,15 @@ def _input_records(
     records: list[tuple[Path, dict[str, Any]]] = []
     for raw in raw_paths or ():
         path = _user_path(root, raw)
+        link = _symlink_component(root, path)
+        if link is not None:
+            raise ValidationError(f"Run input uses a symbolic-link component: {link}")
         snapshot = file_record(path, root)
+        recorded_path = Path(snapshot["path"])
+        canonical_path = recorded_path if recorded_path.is_absolute() else root / recorded_path
         records.append(
             (
-                path,
+                canonical_path,
                 {
                     "path": snapshot["path"],
                     "size": snapshot["size"],
@@ -318,6 +692,9 @@ def _output_records(
     records: list[dict[str, Any]] = []
     for raw in raw_paths or ():
         path = _user_path(root, raw)
+        link = _symlink_component(root, path)
+        if link is not None:
+            raise ValidationError(f"Run output uses a symbolic-link component: {link}")
         base: dict[str, Any] = {
             "path": _display_path(path, root),
             "present": False,
@@ -452,6 +829,17 @@ def execute_run(
         raise ValidationError("changed paths must not be repeated")
 
     root = paths.root.resolve()
+    profile = load_repository_profile(root)
+    configured_cwd = _user_path(root, str(profile["run_cwd"])).resolve()
+    try:
+        configured_cwd.relative_to(root)
+    except ValueError as exc:
+        raise ValidationError("repository profile run_cwd must stay inside the repository") from exc
+    if not configured_cwd.is_dir():
+        raise ValidationError(f"repository profile run_cwd does not exist: {configured_cwd}")
+    object_root = _user_path(root, str(profile["object_root"]))
+    _require_output_root(root, object_root, output_paths)
+    _require_new_output_paths(root, output_paths)
     output_policies = _output_policies(
         root,
         output_paths,
@@ -459,16 +847,34 @@ def execute_run(
         baseline_outputs=baseline_outputs,
         unique_anomaly_outputs=unique_anomaly_outputs,
     )
+    _require_declared_mutable_command_inputs(
+        paths,
+        configured_cwd,
+        argv,
+        input_paths,
+    )
     approval = _require_fresh_brief(paths)
+    change_scope_before = evaluate_changes(paths)
+    if change_scope_before["outcome"] == "BLOCKED":
+        details = "\n".join(
+            f"- {item['rule']}: {item['path'] or '<repository>'}: {item['reason']}"
+            for item in change_scope_before["violations"]
+        )
+        raise ValidationError(f"change-scope gate blocked Run:\n{details}")
     gpu_hours = require_nonnegative_finite("estimated GPU hours", estimated_gpu_hours)
     cpu_hours = require_nonnegative_finite("estimated CPU hours", estimated_cpu_hours)
+    actual_critical_paths = critical_actual_paths(change_scope_before, profile)
+    effective_changed_paths = list(
+        dict.fromkeys([*declared_changed_paths, *actual_critical_paths])
+    )
+    effective_scientific_critical = bool(scientific_critical or actual_critical_paths)
     formalization = check_formalization(
         paths,
         {
             "estimated_gpu_hours": gpu_hours,
             "estimated_cpu_hours": cpu_hours,
-            "changed_path": declared_changed_paths,
-            "scientific_critical": bool(scientific_critical),
+            "changed_path": effective_changed_paths,
+            "scientific_critical": effective_scientific_critical,
             "shared_across_runs": bool(shared_across_runs),
         },
     )
@@ -481,7 +887,8 @@ def execute_run(
 
     policy = load_policy(paths)
     protocol_path, protocol = _load_protocol(paths)
-    formal_artifacts = _formal_artifact_records(paths, policy)
+    captured_formal_artifacts = _capture_formal_artifacts(paths, policy)
+    formal_capture_digest = _formal_capture_digest(paths, captured_formal_artifacts)
     runtime_environment = _selected_runtime_environment()
     cohort, effective_hardware, effective_precision = _cohort_record(
         paths,
@@ -509,6 +916,17 @@ def execute_run(
     }
 
     run_id, run_directory = _allocate_run_directory(paths)
+    formal_artifacts = _snapshot_formal_artifacts(
+        root,
+        paths,
+        run_directory,
+        captured_formal_artifacts,
+    )
+    change_authorities = _snapshot_change_authorities(
+        root,
+        paths,
+        run_directory,
+    )
     stdout_path = run_directory / "stdout.log"
     stderr_path = run_directory / "stderr.log"
     command = list(argv)
@@ -525,7 +943,7 @@ def execute_run(
         try:
             process = subprocess.Popen(
                 command,
-                cwd=root,
+                cwd=configured_cwd,
                 stdout=stdout_log,
                 stderr=stderr_log,
                 shell=False,
@@ -565,8 +983,22 @@ def execute_run(
     ended_at = utc_now()
     duration_seconds = max(0.0, time.monotonic() - started_monotonic)
     code_state_after = git_tracked_state(root)
+    change_scope_after = evaluate_changes(paths)
     os.chmod(stdout_path, 0o444)
     os.chmod(stderr_path, 0o444)
+    outputs = _output_records(root, output_paths, output_policies)
+    _seal_output_paths(root, output_paths)
+    finalized_inputs = _finalize_input_records(inputs)
+    formal_artifacts_unchanged = _formal_artifacts_unchanged(
+        paths,
+        policy,
+        formal_capture_digest,
+    )
+    dependencies_evidence_eligible = (
+        all(record.get("changed_during_run") is False for record in finalized_inputs)
+        and all(record.get("present") is True for record in outputs)
+        and formal_artifacts_unchanged
+    )
     status = (
         "interrupted"
         if interrupted
@@ -575,14 +1007,15 @@ def execute_run(
         else "failed"
     )
     manifest: dict[str, Any] = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": _RUN_SCHEMA_VERSION,
         "study_id": paths.study_id,
         "run_id": run_id,
         "purpose": purpose,
         "status": status,
         "execution": {
             "argv": command,
-            "cwd": str(root),
+            "cwd": str(configured_cwd),
+            "cwd_relative": str(profile["run_cwd"]),
             "started_at": started_at,
             "ended_at": ended_at,
             "duration_seconds": duration_seconds,
@@ -595,12 +1028,29 @@ def execute_run(
             "after": code_state_after,
             "changed_during_run": code_state_before != code_state_after,
         },
+        "change_scope": {
+            "repository_profile": change_authorities["repository_profile"],
+            "changeset": change_authorities["changeset"],
+            "validation": change_authorities["validation"],
+            "before": change_scope_before,
+            "after": change_scope_after,
+            "evidence_eligible": (
+                change_state_evidence_eligible(change_scope_before)
+                and change_state_evidence_eligible(change_scope_after)
+                and dependencies_evidence_eligible
+            ),
+        },
         "brief": brief,
         "formal_artifacts": formal_artifacts,
         "formalization": {
-            "changed_paths": declared_changed_paths,
-            "scientific_critical": bool(scientific_critical),
+            "changed_paths": effective_changed_paths,
+            "declared_changed_paths": declared_changed_paths,
+            "actual_changed_paths": [
+                record["path"] for record in change_scope_before["changed_paths"]
+            ],
+            "scientific_critical": effective_scientific_critical,
             "shared_across_runs": bool(shared_across_runs),
+            "artifacts_unchanged_during_run": formal_artifacts_unchanged,
             "outcome": formalization.outcome,
             "requirements": formalization.requirements,
         },
@@ -610,8 +1060,8 @@ def execute_run(
             "estimated_gpu_hours": gpu_hours,
             "estimated_cpu_hours": cpu_hours,
         },
-        "inputs": _finalize_input_records(inputs),
-        "outputs": _output_records(root, output_paths, output_policies),
+        "inputs": finalized_inputs,
+        "outputs": outputs,
         "logs": {
             "stdout": file_record(stdout_path, root),
             "stderr": file_record(stderr_path, root),

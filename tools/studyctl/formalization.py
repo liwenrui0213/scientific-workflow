@@ -132,9 +132,13 @@ def check_formalization(paths: StudyPaths, options: dict[str, Any] | None = None
         )
 
     changed_paths = [str(item) for item in options.get("changed_path", [])]
+    from .workspace import load_repository_profile
+
+    profile = load_repository_profile(paths.root)
+    critical_patterns = profile.get("scientific_critical_patterns", [])
     critical = bool(options.get("scientific_critical")) or any(
         _path_is_scientific_critical(
-            path, policy.get("scientific_critical_path_patterns", []), paths.root
+            path, critical_patterns, paths.root
         )
         for path in changed_paths
     )

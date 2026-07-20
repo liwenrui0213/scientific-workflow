@@ -22,6 +22,7 @@ from tools.studyctl.hashing import (
     load_json,
     record_digest,
     sha256_file,
+    sha256_json,
 )
 from tools.studyctl.models import StudyPaths, ValidationError
 from tools.studyctl.rendering import render_status
@@ -58,12 +59,151 @@ class _CompactionPlanMixin:
             "representative_failures": representative_failures or [],
             "budget_state": compaction_state["budget_totals"],
         }
-        destination = self.root / name
+        destination = paths.work / name
         atomic_write_json(destination, plan)
         return destination
 
 
 class CompactionTests(_CompactionPlanMixin, WorkflowTestCase):
+    def test_prepare_rejects_blocked_host_change_scope(self) -> None:
+        paths = self.initialize_approved_with_claim()
+        rogue = self.root / "unclassified-host-change.txt"
+        rogue.write_text("not authorized by a CHANGESET\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(
+            ValidationError,
+            "host repository change scope is BLOCKED",
+        ):
+            prepare_compaction(paths)
+        self.assertFalse((paths.generated / "COMPACTION_INPUT.json").exists())
+
+    def test_prepare_records_profile_host_scope_and_active_work_bindings(self) -> None:
+        paths = self.initialize_approved_with_claim()
+        note = paths.active_work / "bound-note.md"
+        note.write_text("snapshot me\n", encoding="utf-8")
+
+        state = load_json(prepare_compaction(paths))
+
+        profile_path = self.root / "scientific-workflow" / "repository-profile.json"
+        self.assertEqual(
+            state["repository_profile"],
+            {
+                "path": "scientific-workflow/repository-profile.json",
+                "sha256": sha256_file(profile_path),
+            },
+        )
+        self.assertEqual(state["host_change_scope"]["outcome"], "PASS")
+        self.assertTrue(state["host_change_scope"]["git_available"])
+        self.assertEqual(state["host_change_scope"]["consequential_paths"], [])
+        self.assertEqual(
+            state["host_change_scope"]["fingerprint_sha256"],
+            sha256_json([]),
+        )
+        self.assertEqual(
+            state["active_work_inventory_sha256"],
+            sha256_json(state["active_work_inventory"]),
+        )
+        self.assertEqual(
+            [item["path"] for item in state["active_work_files"]],
+            [note.relative_to(paths.root).as_posix()],
+        )
+        self.assertEqual(
+            state["active_work_inventory"],
+            [
+                {
+                    "path": note.relative_to(paths.root).as_posix(),
+                    "kind": "file",
+                    "mode": note.stat().st_mode & 0o7777,
+                    "size": note.stat().st_size,
+                    "sha256": sha256_file(note),
+                }
+            ],
+        )
+
+    def test_finalize_rejects_repository_profile_change_after_prepare(self) -> None:
+        paths = self.initialize_approved_with_claim()
+        plan = self.write_compaction_plan(paths, [], name="profile-change-plan.json")
+        profile_path = self.root / "scientific-workflow" / "repository-profile.json"
+        profile = load_json(profile_path)
+        profile["vendor_patterns"].append("vendor-cache/**")
+        atomic_write_json(profile_path, profile)
+
+        with self.assertRaisesRegex(
+            ValidationError,
+            "repository profile changed after compact-prepare",
+        ):
+            finalize_compaction(paths, plan)
+        self.assertEqual(list(paths.checkpoints.glob("CHECKPOINT-*.json")), [])
+
+    def test_finalize_rejects_host_scope_change_after_prepare(self) -> None:
+        paths = self.initialize_approved_with_claim()
+        plan = self.write_compaction_plan(paths, [], name="host-change-plan.json")
+        (self.root / "late-host-change.txt").write_text(
+            "appeared after prepare\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValidationError, "change scope is BLOCKED"):
+            finalize_compaction(paths, plan)
+        self.assertEqual(list(paths.checkpoints.glob("CHECKPOINT-*.json")), [])
+
+    def test_finalize_rejects_active_work_inventory_change_after_prepare(self) -> None:
+        paths = self.initialize_approved_with_claim()
+        note = paths.active_work / "mutable-note.md"
+        note.write_text("prepared bytes\n", encoding="utf-8")
+        plan = self.write_compaction_plan(
+            paths,
+            [note.name],
+            name="active-work-change-plan.json",
+        )
+        note.write_text("changed after prepare\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(
+            ValidationError,
+            "work/active inventory changed after compact-prepare",
+        ):
+            finalize_compaction(paths, plan)
+        self.assertEqual(note.read_text(encoding="utf-8"), "changed after prepare\n")
+        self.assertEqual(list(paths.checkpoints.glob("CHECKPOINT-*.json")), [])
+
+    def test_finalize_rejects_empty_active_work_directory_added_after_prepare(self) -> None:
+        paths = self.initialize_approved_with_claim()
+        plan = self.write_compaction_plan(
+            paths,
+            [],
+            name="active-work-directory-change-plan.json",
+        )
+        (paths.active_work / "late-empty-directory").mkdir()
+
+        with self.assertRaisesRegex(
+            ValidationError,
+            "work/active inventory changed after compact-prepare",
+        ):
+            finalize_compaction(paths, plan)
+        self.assertEqual(list(paths.checkpoints.glob("CHECKPOINT-*.json")), [])
+
+    def test_generated_projection_change_does_not_drift_compaction_binding(self) -> None:
+        paths = self.initialize_approved_with_claim()
+        plan = self.write_compaction_plan(paths, [], name="generated-change-plan.json")
+        status = paths.generated / "STATUS.md"
+        status.write_text("non-authoritative generated projection\n", encoding="utf-8")
+
+        checkpoint = load_json(finalize_compaction(paths, plan))
+
+        state = load_json(paths.generated / "COMPACTION_INPUT.json")
+        self.assertEqual(
+            checkpoint["repository_profile"],
+            state["repository_profile"],
+        )
+        self.assertEqual(
+            checkpoint["host_change_scope"]["fingerprint_sha256"],
+            state["host_change_scope"]["fingerprint_sha256"],
+        )
+        self.assertEqual(
+            checkpoint["prepared_active_work_inventory_sha256"],
+            state["active_work_inventory_sha256"],
+        )
+
     def test_checkpoint_hash_pins_representative_failed_direction(self) -> None:
         paths = self.initialize_approved_with_claim()
         failure = paths.study / "failed-directions" / "unstable-method.md"
@@ -287,20 +427,15 @@ class CompactionTests(_CompactionPlanMixin, WorkflowTestCase):
 
         source.unlink()
         issues = validate_study(paths)
-        self.assertFalse(any(issue.level == "ERROR" for issue in issues))
         self.assertTrue(
             any(
-                issue.level == "WARNING" and "input is unavailable" in issue.message
+                issue.level == "ERROR" and "input is unavailable" in issue.message
                 for issue in issues
             )
         )
         status = render_status(paths).read_text(encoding="utf-8")
-        self.assertIn("PASS WITH WARNINGS", status)
+        self.assertIn("INVALID", status)
         self.assertIn("input is unavailable", status)
-        self.assertIn(
-            "Review deterministic validation warnings before claiming reproducibility.",
-            status,
-        )
 
     def test_checkpoint_chain_and_status_regeneration_are_deterministic(self) -> None:
         paths = self.initialize_approved_with_claim()
@@ -469,9 +604,9 @@ class ReviewTests(_CompactionPlanMixin, WorkflowTestCase):
             packet["latest_checkpoint"]["checkpoint_sha256"],
             load_json(checkpoint_path)["checkpoint_sha256"],
         )
-        self.assertFalse(packet["git_diff_metadata"]["available"])
-        self.assertEqual(packet["git_diff_metadata"]["deviation"], "repository is not a Git worktree")
-        self.assertIn("repository is not a Git worktree", packet["known_deviations"])
+        self.assertTrue(packet["git_diff_metadata"]["available"])
+        self.assertIsNone(packet["git_diff_metadata"]["deviation"])
+        self.assertNotIn("repository is not a Git worktree", packet["known_deviations"])
 
         conclusion_keys = {
             "conclusion",
@@ -639,7 +774,7 @@ class GarbageCollectionTests(WorkflowTestCase):
         with redirect_stderr(stderr):
             return_code = studyctl_main(["--root", str(self.root), "gc", paths.study_id])
         self.assertEqual(return_code, 2)
-        self.assertIn("V1 garbage collection is dry-run only; pass --dry-run", stderr.getvalue())
+        self.assertIn("garbage collection is dry-run only; pass --dry-run", stderr.getvalue())
 
         stdout = io.StringIO()
         with redirect_stdout(stdout):

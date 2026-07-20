@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Scientific workflow repository profile",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "workflow_version",
+    "study_root",
+    "object_root",
+    "run_cwd",
+    "source_roots",
+    "test_roots",
+    "experiment_roots",
+    "workflow_roots",
+    "scientific_critical_patterns",
+    "protected_patterns",
+    "generated_patterns",
+    "vendor_patterns",
+    "commands",
+    "git"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "workflow_version": {"type": "integer", "minimum": 1},
+    "study_root": {"type": "string", "minLength": 1},
+    "object_root": {"type": "string", "minLength": 1},
+    "run_cwd": {"type": "string", "minLength": 1},
+    "source_roots": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "test_roots": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "experiment_roots": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "workflow_roots": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "scientific_critical_patterns": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "protected_patterns": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "generated_patterns": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "vendor_patterns": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "commands": {"type": "object"},
+    "git": {
+      "type": "object",
+      "required": [
+        "base_ref",
+        "branch_template",
+        "require_study_branch",
+        "require_linked_worktree"
+      ],
+      "properties": {
+        "base_ref": {"type": "string", "minLength": 1},
+        "branch_template": {"type": "string", "minLength": 1},
+        "require_study_branch": {"type": "boolean"},
+        "require_linked_worktree": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

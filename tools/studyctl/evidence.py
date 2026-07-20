@@ -29,6 +29,8 @@ from .validation import (
     brief_content_issues,
     errors_only,
     object_schema_issues,
+    run_dependency_integrity_issues,
+    sealed_run_evidence_eligible,
 )
 
 
@@ -116,12 +118,36 @@ def _terminal_run(paths: StudyPaths, run_id: str) -> dict[str, Any]:
     expected_code_change = code_state.get("before") != code_state.get("after")
     if code_state.get("changed_during_run") != expected_code_change:
         raise ValidationError(f"Run tracked-code change flag is invalid: {run_id}")
+    if expected_code_change:
+        raise ValidationError(
+            f"Evidence cannot use a Run whose tracked code changed during execution: {run_id}"
+        )
     cohort = manifest.get("cohort")
     if not isinstance(cohort, dict) or not isinstance(cohort.get("fields"), dict):
         raise ValidationError(f"Run {run_id} has no valid Cohort fields")
     fingerprint = cohort.get("fingerprint_sha256")
     if fingerprint != sha256_json(cohort["fields"]):
         raise ValidationError(f"Run Cohort fingerprint is invalid: {run_id}")
+    dependency_issues = errors_only(
+        run_dependency_integrity_issues(paths, manifest, for_evidence=True)
+    )
+    if dependency_issues:
+        raise ValidationError(
+            _invalid_object_message(
+                f"Run dependency integrity for Evidence {run_id}",
+                dependency_issues,
+            )
+        )
+    expected_eligibility = sealed_run_evidence_eligible(manifest)
+    recorded_eligibility = manifest.get("change_scope", {}).get("evidence_eligible")
+    if recorded_eligibility is not expected_eligibility:
+        raise ValidationError(
+            f"Run sealed Evidence eligibility is internally inconsistent: {run_id}"
+        )
+    if not expected_eligibility:
+        raise ValidationError(
+            f"Evidence cannot use a Run with unverifiable or blocked change scope: {run_id}"
+        )
     return manifest
 
 
@@ -283,6 +309,10 @@ def _validate_run_references(
         if manifest.get("code_state", {}).get("changed_during_run"):
             raise ValidationError(
                 f"finalized Evidence cannot use a Run whose tracked code changed: {run_id}"
+            )
+        if not manifest.get("change_scope", {}).get("evidence_eligible", False):
+            raise ValidationError(
+                f"finalized Evidence cannot use a Run with unverifiable or blocked change scope: {run_id}"
             )
         manifests.append(manifest)
         fingerprints.add(str(manifest["cohort"]["fingerprint_sha256"]))
