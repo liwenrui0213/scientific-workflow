@@ -6,7 +6,9 @@ Define every nonstandard symbol before use. Explain formulas and principles with
 
 ## Claim-to-Evidence scientific workflow
 
-- Start from the approved Brief, active Claims, active formal artifacts, latest Checkpoint, and current Frontier.
+- When the user gives a new scientific idea without a Study ID, use `start-scientific-study`: draft the Study from the prompt instead of asking the user to fill workflow files. Stop at the human Brief-approval gate.
+- Align just in time: inspect and draft before asking; ask only when a material ambiguity has no safe reversible default. At one decision boundary, ask one batch of at most three questions and never repeat the same unresolved question.
+- Begin research or execution only from an approved Brief, active Claims, active formal artifacts, latest Checkpoint, and current Frontier.
 - Use `work/` for informal exploration. Final Claims must not depend only on `work/` material.
 - Before expensive, shared, scientifically consequential, or difficult-to-reverse work, run `python -m tools.studyctl check-formalization STUDY_ID` with the applicable flags. Create only the smallest required formal artifact.
 - Treat completed Runs as immutable. Claims reference finalized Evidence; Evidence references reproducible Runs.

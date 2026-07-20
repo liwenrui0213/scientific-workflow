@@ -1,0 +1,4 @@
+interface:
+  display_name: "Start Scientific Study"
+  short_description: "Turn a research idea into a Study draft"
+  default_prompt: "Use $start-scientific-study to turn my scientific-computing idea into a reviewable Study draft."
