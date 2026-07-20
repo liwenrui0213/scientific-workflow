@@ -10,6 +10,22 @@ Brief version: 1
 
 [REPLACE: List the claims the study is intended to test, including scope.]
 
+## Non-Goals
+
+[REPLACE: State what this Study intentionally will not establish, optimize, or change.]
+
+## Human-Supplied Assumptions
+
+[REPLACE: Record only assumptions explicitly supplied by the human. Write "None stated" if none were supplied.]
+
+## Agent-Inferred Assumptions Requiring Confirmation
+
+[REPLACE: Record material assumptions inferred by the Agent and label them unconfirmed. Write "None" if no confirmation is needed.]
+
+## Open Questions at Authorization
+
+[REPLACE: List unresolved questions and distinguish decisions required before approval from non-blocking scientific uncertainty. Write "None" if there are no open questions.]
+
 ## Protected Conditions
 
 [REPLACE: State evaluator principles, dataset split, acceptance criteria, baselines, precision, and any conditions that must not change silently.]

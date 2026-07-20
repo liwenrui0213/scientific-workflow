@@ -64,6 +64,14 @@ class WorkflowTestCase(unittest.TestCase):
                 "Does the deterministic fixture produce the integer four?",
             "[REPLACE: List the claims the study is intended to test, including scope.]":
                 "CLAIM-0001 states that the fixture result equals four in this exact scope.",
+            "[REPLACE: State what this Study intentionally will not establish, optimize, or change.]":
+                "Do not generalize beyond the deterministic fixture or optimize its implementation.",
+            "[REPLACE: Record only assumptions explicitly supplied by the human. Write \"None stated\" if none were supplied.]":
+                "The human supplied exact integer arithmetic as the intended fixture semantics.",
+            "[REPLACE: Record material assumptions inferred by the Agent and label them unconfirmed. Write \"None\" if no confirmation is needed.]":
+                "None",
+            "[REPLACE: List unresolved questions and distinguish decisions required before approval from non-blocking scientific uncertainty. Write \"None\" if there are no open questions.]":
+                "None",
             "[REPLACE: State evaluator principles, dataset split, acceptance criteria, baselines, precision, and any conditions that must not change silently.]":
                 "Use exact integer equality, no dataset split, the recorded Python baseline, and fixed precision.",
             "[REPLACE: Specify required comparisons, uncertainty reporting, contradictory checks, and reproducibility expectations.]":

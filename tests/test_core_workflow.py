@@ -32,6 +32,7 @@ from tools.studyctl.models import (
     study_paths,
     utc_now,
 )
+from tools.studyctl.rendering import render_status
 from tools.studyctl.run_registry import execute_run
 from tools.studyctl.validation import (
     brief_approval_issues,
@@ -120,10 +121,16 @@ class CoreWorkflowTests(WorkflowTestCase):
         ):
             with self.subTest(directory=directory):
                 self.assertTrue(directory.is_dir(), f"missing initialized directory: {directory}")
-        self.assertIn(
-            "# Scientific Brief: SC-1200 — Core workflow fixture",
-            paths.brief.read_text(encoding="utf-8"),
-        )
+        brief = paths.brief.read_text(encoding="utf-8")
+        self.assertIn("# Scientific Brief: SC-1200 — Core workflow fixture", brief)
+        for heading in (
+            "## Non-Goals",
+            "## Human-Supplied Assumptions",
+            "## Agent-Inferred Assumptions Requiring Confirmation",
+            "## Open Questions at Authorization",
+        ):
+            with self.subTest(heading=heading):
+                self.assertIn(heading, brief)
         claims = load_json(paths.claims)
         self.assertEqual(claims["study_id"], study_id)
         self.assertEqual(claims["revision"], 1)
@@ -133,6 +140,30 @@ class CoreWorkflowTests(WorkflowTestCase):
         status = (paths.generated / "STATUS.md").read_text(encoding="utf-8")
         self.assertIn("Approval: **missing or stale**", status)
         self.assertNotIn("Approval: **current**", status)
+
+    def test_completed_intake_draft_is_distinguished_from_invalid_state(self) -> None:
+        paths = self.initialize()
+        self.fill_brief(paths)
+        self.add_proposed_claim(paths)
+
+        status = render_status(paths).read_text(encoding="utf-8")
+
+        self.assertIn("DRAFT — structurally valid, awaiting human Brief approval", status)
+        self.assertNotIn("INVALID —", status)
+        self.assertIn("Approve or restore the active Brief.", status)
+
+    def test_unresolved_intake_placeholder_blocks_brief_approval(self) -> None:
+        paths = self.initialize()
+        brief_hash = sha256_file(paths.brief)
+
+        with self.assertRaisesRegex(ValidationError, "replacement placeholders"):
+            approve_brief(
+                paths,
+                stdin=TTYBuffer(f"APPROVE {paths.study_id} {brief_hash}\n"),
+                stdout=TTYBuffer(),
+            )
+
+        self.assertFalse(paths.brief_approval.exists())
 
     def test_init_rejects_invalid_id_and_blank_title_without_partial_study(self) -> None:
         with self.assertRaisesRegex(ValidationError, "invalid study ID"):

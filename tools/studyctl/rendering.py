@@ -155,6 +155,12 @@ def render_status(paths: StudyPaths) -> Path:
         run_load_error = str(exc)
     approval_problems = brief_approval_issues(paths)
     approval_valid = not any(issue.level == "ERROR" for issue in approval_problems)
+    awaiting_initial_approval = (
+        not paths.brief_approval.exists()
+        and len(authority_errors) == 1
+        and authority_errors[0].path == str(paths.brief_approval)
+        and authority_errors[0].message == "Brief has not been approved"
+    )
     brief_hash = sha256_file(paths.brief) if paths.brief.is_file() else None
 
     supporting_keys: list[tuple[str, int]] = []
@@ -191,7 +197,14 @@ def render_status(paths: StudyPaths) -> Path:
             lines.append(f"- {issue.message}")
 
     lines.extend(["", "## Authority Validation", ""])
-    if authority_errors or evidence_load_error or run_load_error:
+    if awaiting_initial_approval and evidence_load_error is None and run_load_error is None:
+        lines.append(
+            "**DRAFT — structurally valid, awaiting human Brief approval. "
+            "Scientific research and execution are not yet authorized.**"
+        )
+        for issue in authority_warnings:
+            lines.append(f"- {issue.render()}")
+    elif authority_errors or evidence_load_error or run_load_error:
         lines.append("**INVALID — scientific Evidence/Claim summaries below are not trusted where their source chain failed.**")
         for issue in authority_errors:
             lines.append(f"- {issue.render()}")
@@ -279,7 +292,7 @@ def render_status(paths: StudyPaths) -> Path:
         attention.append("Review preserved contradictory Evidence before interpreting Claims.")
     if any(item.get("level") in {"blocking_now", "required_before_review"} for item in debt):
         attention.append("Resolve blocking formalization debt before review.")
-    if authority_errors or evidence_load_error or run_load_error:
+    if (authority_errors and not awaiting_initial_approval) or evidence_load_error or run_load_error:
         attention.append("Repair deterministic validation errors before relying on Claims or Evidence summaries.")
     if authority_warnings:
         attention.append("Review deterministic validation warnings before claiming reproducibility.")
