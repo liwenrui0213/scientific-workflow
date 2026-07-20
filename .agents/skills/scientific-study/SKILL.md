@@ -5,6 +5,22 @@ description: Resume and execute an existing repository-native Claim-to-Evidence 
 
 # Scientific Study
 
+## Authoritative inputs
+
+1. Confirm that the named Study exists and its active Brief has a fresh human
+   approval. Route a new idea or unapproved intake draft to
+   `start-scientific-study`.
+2. Validate `scientific-workflow/repository-profile.json`; never infer host
+   paths from a generic layout. If workflow infrastructure is missing, invoke
+   `bootstrap-scientific-workflow` only after the user authorizes installation
+   or migration.
+3. Read only the bounded active context: approved Brief and approval,
+   `CLAIMS.json`, active `formal/` artifacts, latest Checkpoint, and current
+   Frontier. Do not load all historical Runs or notes by default.
+4. Treat repository source, tests, actual Git state, sealed Runs, finalized
+   Evidence, and hash-pinned records as authoritative for what happened. Treat
+   generated projections and Agent explanations only as indexes or hypotheses.
+
 ## Align only at material boundaries
 
 Do not ask the human to resolve every uncertainty. First inspect the approved active context and repository evidence, then classify the ambiguity:
@@ -15,12 +31,52 @@ Do not ask the human to resolve every uncertainty. First inspect the approved ac
 
 At one boundary, ask one compact batch of at most three independent questions. State the current interpretation and why each answer is required. Use at most one follow-up batch, only if the answer exposes a genuinely new material branch; never repeat or rephrase the same unresolved question. If alignment remains unresolved, pause only the blocked action and continue safe independent read-only or low-cost reversible work when useful.
 
-1. Confirm that the named Study exists and its active Brief has a fresh human approval. If it is a new idea or an unapproved intake draft, use `start-scientific-study` instead. Validate and read `scientific-workflow/repository-profile.json`; never infer host paths from a generic layout. Then read only the bounded active context: `BRIEF.md`, its current approval, `CLAIMS.json`, active files under `formal/`, the latest Checkpoint, and the Frontier in `CLAIMS.json`. Do not load all historical Runs or notes by default.
-2. Put provisional derivations, ideas, scripts, failures, and plans under the Study's `work/active/`. Prototype there while the idea is disposable. Once a result is adopted as repository behavior, place production code, experiment configurations, and tests in the profile's native `source_roots`, `experiment_roots`, and `test_roots`; never make `work/` an alternative production tree or cite it alone as final Claim support.
-3. Before changing any host path, ensure the approved Study intake records are committed, then enter the required Study branch and, when configured, a linked worktree created from that intake commit. Create the minimum write contract with `python -m tools.studyctl changeset-new STUDY_ID --allow 'PATH_OR_PATTERN' ...`; do not use an allowlist to override workflow enforcement, protected, generated, vendor, output-object, unclassified, or another Study's paths. Keep each Evidence-producing Study isolated: any other-Study diff makes the Run ineligible. After an explicit rebase or base synchronization, use `changeset-renew`; never hand-edit the fixed base anchor.
-4. Apply the boundary-alignment policy above before escalating. Before expensive, shared, scientifically critical, parallel, or hard-to-reverse work, run `python -m tools.studyctl check-formalization STUDY_ID` with explicit estimates and semantic change flags. Create only the smallest artifact it requires. A `--changed-path` declaration supplies formalization context only; it is not write authorization and cannot replace the actual Git diff.
-5. After source, test, or experiment edits, run focused checks, commit the allowlisted change, then run `python -m tools.studyctl validate-changes STUDY_ID` and `python -m tools.studyctl check-changes STUDY_ID`. Treat Git's committed, staged, unstaged, and untracked paths as authoritative. Non-Git scope, dirty host changes, failed native validation, or a stale validation proof makes that Run ineligible for Evidence.
-6. Execute consequential calculations with `python -m tools.studyctl run STUDY_ID --purpose "..." [options] -- COMMAND ARG...`. Declare every mutable or external dependency with repeated `--input`, including dynamically imported or ignored modules that static argv inspection cannot discover. Declare each output as a new repository-relative regular file below the Git-ignored profile `object_root`, not in source, test, experiment, Study-state, or generated roots; package directories or emit a hashed external-store pointer manifest. Missing outputs are ineligible. Use `--scientific-critical` or `--shared-across-runs` when applicable. Preserve the exact Run ID and never edit its manifest, governance snapshots, or formal-artifact snapshots.
-7. Use `evidence-new` to scaffold a draft only from terminal V2 Runs whose change scope is eligible. Re-check input, output, log, governance-snapshot, and formal-artifact-snapshot hashes; legacy V1 Runs remain historical and Evidence-ineligible. State the analysis, result, scope, uncertainty, limitations, assessment, and any Cohort compatibility justification yourself; then seal it with `evidence-finalize`.
-8. Update Claims only with finalized `{evidence_id, version, sha256}` references. Preserve contradictory Evidence and representative failed directions.
-9. If work would change the Brief, evaluator principles, data split, acceptance criteria, hard budget, or authorized Claim scope, stop that action. Use `brief-new-version` where appropriate and request the bounded human alignment needed for a new approval; never infer permission. Continue unaffected safe work when useful.
+Read [research strategy](references/research-strategy.md) when choosing among
+competing hypotheses or experiments, deciding whether Evidence is discriminating,
+or deciding whether to continue, compact, review, or escalate. Do not load it
+for a purely mechanical resume, validation, or rendering operation.
+
+## Workflow
+
+1. Keep provisional derivations, ideas, scripts, failures, and plans under
+   `work/active/`. Promote adopted production code, experiment configurations,
+   and tests to the profile's native roots; never use `work/` as an alternative
+   production tree or sole Claim support.
+2. Before host edits, commit the approved intake, enter the required Study
+   branch and linked worktree policy, and create the narrowest
+   `formal/CHANGESET.json` with `studyctl changeset-new`. After explicit base
+   synchronization, use `changeset-renew`; never hand-edit the anchor.
+3. Before consequential work, run `studyctl check-formalization` with honest
+   cost and semantic flags. Create only the smallest required artifact.
+4. After source, test, or experiment edits, run focused checks, commit the
+   allowlisted changes, then run `studyctl validate-changes` and
+   `studyctl check-changes`.
+5. Execute consequential calculations through `studyctl run`. Declare all
+   mutable or external inputs and every new output below the configured
+   `object_root`; preserve the Run and its sealed snapshots.
+6. Create Evidence only from eligible terminal V2 Runs. Fill analysis, result,
+   scope, uncertainty, limitations, assessment, Run roles, and any Cohort
+   compatibility justification; seal with `evidence-finalize`.
+7. Update Claims only with finalized `{evidence_id, version, sha256}` references.
+   Preserve contradictory Evidence and representative failed directions.
+
+## Hard gates
+
+- An allowlist or `--changed-path` declaration never overrides the actual Git
+  diff, protected paths, another Study, or repository enforcement.
+- Dirty or non-Git host scope, stale or failed native validation, undeclared
+  mutable dependencies, missing or altered outputs, incompatible Cohorts, or
+  changed sealed snapshots make a Run ineligible for Evidence.
+- Never silently change the Brief, evaluator principles, data split, acceptance
+  criteria, hard budget, or authorized Claim scope. Open a new Brief version
+  where appropriate and align with the human at that boundary.
+- Numerical success is not proof, and implementation acceptance is not
+  scientific acceptance. Do not upgrade a Claim beyond its finalized Evidence.
+
+## Output and handoff
+
+Leave the Study with valid active records, explicit open questions, and a small
+next-action Frontier. Invoke `research-compaction` when history obscures current
+state, and `scientific-review` only after a review packet is prepared for a
+fresh read-only reviewer. Stop for human action only at a protected boundary,
+hard-budget decision, unresolved material ambiguity, or final Verdict.

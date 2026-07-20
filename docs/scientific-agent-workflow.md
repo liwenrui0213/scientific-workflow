@@ -20,6 +20,116 @@ Work -> Run -> Evidence -> Claim -> human Verdict
 
 `work/active/` is a mutable scratch space. A Run records what actually executed under fixed code, inputs, configuration, environment and Cohort fields. Evidence states an explicit analysis of one or more Runs, including scope, uncertainty, limitations and contradictions. A Claim may reference only a finalized, hash-pinned Evidence version. A Verdict separately judges implementation and scientific Claims.
 
+## Thin Skills, thick protocol
+
+The five repository Skills are intentionally small. Each Skill is a **routing
+contract**: it states when the capability applies, the authoritative inputs for
+that phase, the expected workflow posture, the hard gates that must be invoked,
+and the output or handoff. A Skill does not restate the complete scientific
+workflow and is not itself an enforcement boundary. Its metadata routes the
+task; its body is loaded only for the selected phase.
+
+The durable behavior lives in **protocol sources**:
+
+| Layer | Responsibility |
+|---|---|
+| `AGENTS.md` | Small, always-applicable repository invariants and authority boundaries |
+| Repository profile, policy, schemas, and templates | Repository adaptation, formalization thresholds, valid record shapes, and human-facing starting points |
+| `studyctl`, Git state, hashes, and immutable snapshots | Deterministic state transitions, actual-diff scope, provenance, integrity, and eligibility checks |
+| Human approval and independent review | Scientific intent, protected-condition changes, implementation acceptance, and final interpretation |
+
+This separation keeps routine prompts and research context small while making
+important constraints testable. Increasing a Skill's length does not strengthen
+a gate: Brief approval freshness, Run immutability, Evidence eligibility,
+Cohort-field compatibility and declared justification, compaction bindings, and
+Verdict ownership are enforced by deterministic records and commands. The
+project hook rejects several obvious Agent attempts earlier, but it remains a
+guardrail rather than a security boundary.
+
+### Selective references
+
+A routing contract should load only the protocol material needed at the current
+boundary. Its stable headings are `Authoritative inputs`, `Workflow`, `Hard
+gates`, and `Output and handoff`. One level of conditional references may add
+judgment guidance for:
+
+- just-in-time alignment when intent is materially ambiguous;
+- research strategy when choosing the next informative investigation;
+- semantic compaction when deciding what belongs in the active Frontier; or
+- adversarial review when attempting to falsify implementation or Claims.
+
+The current selective references are:
+
+| Skill | Conditional reference | Load when |
+|---|---|---|
+| `start-scientific-study` | `references/alignment-cases.md` | An ambiguity fits more than one alignment class, or a Claim is hard to make falsifiable without changing intent |
+| `scientific-study` | `references/research-strategy.md` | Comparing hypotheses or experiments, judging discrimination, or deciding whether to continue, compact, review, or escalate |
+| `research-compaction` | `references/semantic-compaction.md` | Selecting decisive or contradictory Evidence, representative failures, Claim revisions, or the Frontier |
+| `scientific-review` | `references/adversarial-review-rubric.md` | Assigning severity, judging Claim scope, selecting independent checks, or preparing human questions |
+
+The bootstrap Skill has no separate judgment reference: repository adaptation
+details remain authoritative here and in the profile, schemas, and validators.
+
+Do not load all four references, every historical Run, or this entire guide by
+default. Do not build deep reference chains. Open a conditional reference only
+when its named decision is active, then inspect the authoritative Study and code
+artifacts needed to apply it. Reference prose may guide scientific judgment, but
+it cannot override the approved Brief, repository profile, policy, schemas,
+actual Git state, or `studyctl` results.
+
+### Deterministic gates and semantic judgment
+
+Put a rule in the lowest layer that can check it reliably:
+
+- use schemas and validators for IDs, fields, references, hashes, and allowed
+  state transitions;
+- use Git and CHANGESET/VALIDATION records for host-code scope and native test
+  proof;
+- use `studyctl` for formalization, Run sealing, Evidence finalization,
+  compaction, and human-only state transitions;
+- use the hook only for early denial of obvious Agent-side gate violations;
+- use independent review and human judgment for mathematical fidelity,
+  experimental fairness, information value, uncertainty, and Claim scope.
+
+If a semantic decision cannot be reduced to a sound deterministic check, do not
+encode a misleading proxy merely to automate it. Record the decision and its
+evidence, expose it to falsification, and escalate only at the material boundary.
+
+### Behavioral forward testing
+
+Deterministic tests verify the protocol machinery. Skills additionally need
+**forward scenarios**: representative prompts run from a fresh context to see
+whether the Agent actually follows the routing contract. Scenarios should test
+observable behavior, for example whether the Agent:
+
+- drafts before asking and aligns only when no safe reversible default exists;
+- stops at a protected or human-only boundary instead of rationalizing a bypass;
+- preserves contradictory Evidence and representative failures during
+  compaction; and
+- follows source artifacts during review instead of trusting generated views.
+
+The checked-in catalog at
+`tests/fixtures/skill_contracts/pressure-scenarios.json` records these prompts,
+expected actions, forbidden actions, and the invariant under pressure. Its
+schema and Skill routing contracts are checked with:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m unittest tests.test_skill_contracts
+```
+
+This deterministic test proves that the catalog is well formed and that the
+Skills keep their required routing structure and direct references. It does not
+execute a model or prove that an Agent passed the scenarios. A behavioral
+forward test still requires running the relevant catalog cases in fresh
+sessions and inspecting the observed actions.
+
+Treat a failed forward scenario as evidence for the smallest targeted Skill or
+reference change, followed by a deterministic regression test whenever the
+failure can be made machine-checkable. Do not expand every Skill pre-emptively
+with generic warnings. Forward scenarios are model-behavior checks, not formal
+proofs or security tests; rerun the relevant scenarios after material changes to
+a Skill, its references, the workflow protocol, or the model used to execute it.
+
 ## Adapt the workflow to the host repository
 
 The workflow is installed *into* a scientific software repository; it must not impose a parallel source tree or assume that every project uses the same commands. `scientific-workflow/repository-profile.json` is the adaptation contract. It declares:

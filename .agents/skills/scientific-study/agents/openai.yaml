@@ -1,0 +1,4 @@
+interface:
+  display_name: "Scientific Study"
+  short_description: "Resume an approved Claim-to-Evidence Study"
+  default_prompt: "Use $scientific-study to resume and execute an approved repository-native scientific Study."

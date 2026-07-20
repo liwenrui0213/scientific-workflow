@@ -1,9 +1,24 @@
 ---
 name: start-scientific-study
-description: Turn a human's natural-language computational-science idea into a new repository-native Study draft. Use when the user asks to investigate, test, compare, optimize, or begin a new scientific idea without naming an existing Study. Inspect the repository, initialize the next Study, draft the Brief and proposed Claims, align just in time only when a material ambiguity has no safe reversible default, and stop before approval or implementation. Do not use to resume an existing Study; use scientific-study instead.
+description: Turn a human's natural-language computational-science idea into a new persistent repository-native Study draft. Use when the user asks to begin or sustain a new scientific investigation, comparison, or optimization without naming an existing Study. Inspect the repository, initialize the next Study, draft the Brief and proposed Claims, align just in time only when a material ambiguity has no safe reversible default, and stop before approval or implementation. Do not use for a one-off explanation, ordinary code change, or existing Study; use scientific-study to resume an approved Study.
 ---
 
 # Start Scientific Study
+
+## Authoritative inputs
+
+1. Read `AGENTS.md`, `scientific-workflow/repository-profile.json`,
+   `scientific-workflow/policy.json`, and the Brief and Claims templates.
+2. From `docs/scientific-agent-workflow.md`, read the sections **Start directly
+   from a scientific idea**, **Just-in-time alignment**, and **Manual
+   initialization fallback**. Read other sections only when the current intake
+   decision depends on them.
+3. Validate the profile with `PYTHON -m tools.studyctl profile-validate`. Let
+   `PYTHON` denote one repository-supported Python 3.11-or-newer command that
+   can run `-m tools.studyctl`; use it consistently.
+4. Inspect only the host code, tests, documentation, manifests, and prior Study
+   state needed to interpret the idea. Repository evidence outranks an Agent
+   guess, but only the human can authorize protected scientific intent.
 
 ## Just-in-time alignment
 
@@ -17,16 +32,56 @@ At each decision boundary, inspect available sources and draft the best current 
 
 Use at most one follow-up batch, and only when the human's answer creates a genuinely new material branch. Never repeat or merely rephrase an unresolved question. If a blocker remains, keep the Study in `DRAFT`, pause only the blocked action, and continue safe read-only or low-cost reversible work when useful; otherwise wait. Re-align later only when new Evidence creates a new blocker or the Study reaches a new protected, expensive, or hard-to-reverse boundary.
 
-1. Read `AGENTS.md`, `docs/scientific-agent-workflow.md`, `scientific-workflow/repository-profile.json`, `scientific-workflow/policy.json`, and the Brief and Claims templates. Validate the profile with `PYTHON -m tools.studyctl profile-validate`; it defines the Study, Git-ignored output, source, test, experiment, run-working-directory, and validation-command locations. Do not begin a real Study with unresolved missing-root or object-ignore adaptation warnings. Let `PYTHON` denote a repository-supported Python 3.11-or-newer command, confirm that it can run `-m tools.studyctl`, and use that interpreter consistently below and in the returned approval command.
-2. Inspect only the code, tests, and documentation needed to interpret the idea. Do not implement the idea yet.
-3. Translate the prompt into a precise scientific question, proposed testable Claims and scopes, non-goals, human-supplied assumptions, agent-inferred assumptions requiring confirmation, protected conditions, required Evidence, resource limits, escalation conditions, and open questions. Define every nonstandard mathematical symbol.
-4. Apply the alignment policy above. Draft first; do not ask the human to fill workflow files or conduct a general requirements interview. Keep the authorization draft proportional and reviewable. Treat method selection, benchmark design, baseline implementation, evaluator details, and hardware as non-blocking or consequential-later questions whenever they can be investigated safely and progressively formalized.
-5. Never invent a hard budget, numerical acceptance threshold, dataset split, evaluator principle, baseline change, or permission. Record missing information as `None stated`. Default to read-only research and low-cost reversible exploration; do not interpret an omitted budget as permission for expensive compute.
-6. Allocate the next unused `SC-NNNN` identifier by scanning `SC-*` below the profile's `study_root`, then run `PYTHON -m tools.studyctl init STUDY_ID --title "TITLE"`. Never overwrite or merge into an existing Study. If another process takes the ID, rescan and retry once with the next ID. If initialization leaves a partial directory, preserve it and report the failure instead of deleting or reusing it.
-7. Replace every Brief placeholder while preserving its metadata block. In `CLAIMS.json`, add only `proposed` Claims with empty Evidence arrays, explicit scope, uncertainty, and limitations. Increment its revision and update its timestamp. Copy unresolved scientific questions to `frontier.open_questions`; add to `frontier.human_decisions_required` only decisions that truly block Brief approval or the immediate next action. Defer other consequential choices to progressive formalization.
-8. Run `PYTHON -m tools.studyctl status STUDY_ID` and `PYTHON -m tools.studyctl validate STUDY_ID`. Repair every deterministic validation error except the expected missing-approval error; report that draft state accurately rather than calling it a full pass.
-9. Stop before invoking `approve-brief`, editing scientific source code, creating formal artifacts, executing Runs, spending compute, or claiming Evidence or scientific support.
-10. Return the Study ID and paths, a concise interpretation, human-supplied versus inferred assumptions, only decisions that block authorization, and the exact interactive approval command. If no decision blocks approval, say so directly and do not manufacture a question. If alignment is required, present the single bounded question batch instead of the approval command. After the human answers, revise the same unapproved draft, rerun the checks, and either request approval or apply the one permitted follow-up batch.
-11. After a fresh human approval exists, hand the Study to `scientific-study` for research and execution.
+Except when profile or tooling ambiguity makes the Study root itself unsafe, do
+not ask before creating and validating the best reversible `DRAFT`. Put the
+blocker and current interpretation in that draft, then ask the bounded alignment
+batch. This Skill is not a pre-draft requirements interview.
 
-If the user names an existing Study or asks to continue or resume one, do not initialize another Study; use `scientific-study`. If the workflow tooling, profile, or templates are missing, do not guess host paths. Use `bootstrap-scientific-workflow` only when the user has authorized installing or migrating the workflow; otherwise stop and request that authorization.
+Read [alignment cases](references/alignment-cases.md) only when an ambiguity
+could reasonably fit more than one class, or when a proposed Claim is difficult
+to make falsifiable without changing the human's intent.
+
+## Workflow
+
+1. Translate the prompt provisionally into a precise scientific question, proposed testable
+   Claims and scopes, non-goals, human-supplied assumptions, Agent-inferred
+   assumptions, protected conditions, required Evidence, resource limits,
+   escalation conditions, and open questions. Define every nonstandard
+   mathematical symbol.
+2. Allocate the next unused `SC-NNNN` below the configured `study_root`, then
+   run `PYTHON -m tools.studyctl init STUDY_ID --title "TITLE"`. On a concurrent
+   ID collision, rescan and retry once. Preserve and report a partial directory
+   instead of deleting or reusing it.
+3. Replace every Brief placeholder while preserving metadata. Add only
+   `proposed` Claims with empty Evidence arrays, explicit scope, uncertainty,
+   and limitations. Increment the Claims revision and timestamp. Put unresolved
+   scientific questions in the Frontier; reserve `human_decisions_required`
+   for decisions that block approval or the immediate next action.
+4. Apply the alignment policy to the written draft. Do not make the human fill
+   workflow files or conduct a general requirements interview. Treat safely
+   researchable method, benchmark, baseline-implementation, evaluator-detail,
+   and hardware choices as deferred questions rather than intake blockers.
+5. Run `PYTHON -m tools.studyctl status STUDY_ID` and
+   `PYTHON -m tools.studyctl validate STUDY_ID`. Repair deterministic errors
+   except the expected missing-approval result.
+
+## Hard gates
+
+- Do not begin a Study with unresolved profile root or object-ignore warnings.
+- Do not invent a hard budget, acceptance threshold, dataset split, evaluator
+  principle, baseline change, or permission. Record absent values as `None
+  stated`; an omitted budget never authorizes expensive compute.
+- Stop before `approve-brief`, scientific source edits, formal artifacts, Runs,
+  compute spending, Evidence, or claims of scientific support.
+- If the user names an existing Study, route to `scientific-study`. If workflow
+  infrastructure is missing, use `bootstrap-scientific-workflow` only after the
+  user authorizes installation or migration.
+
+## Output and handoff
+
+Return the Study ID and paths, concise interpretation, human-supplied versus
+Agent-inferred assumptions, and only decisions that block authorization. If no
+decision blocks approval, provide the exact interactive approval command and do
+not manufacture a question. If alignment is required, provide the single
+bounded question batch instead; revise the same draft after the answer. Hand a
+freshly approved Study to `scientific-study`.

@@ -1,0 +1,6 @@
+interface:
+  display_name: "Scientific Review"
+  short_description: "Falsify a Study from sealed evidence"
+  default_prompt: "Use $scientific-review to independently review and try to falsify a prepared Claim-to-Evidence Study."
+policy:
+  allow_implicit_invocation: false

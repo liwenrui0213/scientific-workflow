@@ -1,0 +1,4 @@
+interface:
+  display_name: "Research Compaction"
+  short_description: "Compress Study context without deleting history"
+  default_prompt: "Use $research-compaction to compact a long-running Study while preserving decisive and contradictory evidence."
