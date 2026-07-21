@@ -11,7 +11,7 @@ from unittest.mock import patch
 from tests.helpers import WorkflowTestCase
 from tools.studyctl.approval import begin_brief_revision
 from tools.studyctl.compaction import (
-    current_evidence_hashes,
+    current_evidence_inventory_binding,
     finalize_compaction,
     prepare_compaction,
 )
@@ -23,6 +23,7 @@ from tools.studyctl.hashing import (
     nested_record_digest,
     record_digest,
     sha256_file,
+    sha256_json,
 )
 from tools.studyctl.models import ValidationError
 from tools.studyctl.rendering import render_status
@@ -74,7 +75,7 @@ class BudgetAuthorityViewTests(WorkflowTestCase):
                 "study_id": paths.study_id,
                 "compaction_input_sha256": sha256_file(prepared_path),
                 "claims_sha256": sha256_file(paths.claims),
-                "evidence_sha256": current_evidence_hashes(paths),
+                "evidence_inventory": current_evidence_inventory_binding(paths),
                 "archive_work_files": [],
                 "decisive_evidence": [],
                 "contradictory_evidence": [],
@@ -331,15 +332,26 @@ class BudgetAuthorityViewTests(WorkflowTestCase):
 
         prepared_path = prepare_compaction(paths)
         prepared = load_json(prepared_path)
+        self.assertEqual(prepared["budget_authority"]["kind"], "legacy_manifest_fallback")
         self.assertEqual(
-            prepared["budget_authority"],
+            prepared["budget_authority"]["assurance"],
+            "legacy_unindexed_lower_assurance",
+        )
+        expected_manifest_inventory = [
             {
-                "kind": "legacy_manifest_fallback",
-                "assurance": "legacy_unindexed_lower_assurance",
-                "manifest_sha256": {
-                    "RUN-000001": sha256_file(manifest_path),
-                },
-            },
+                "run_id": "RUN-000001",
+                "path": manifest_path.relative_to(paths.root).as_posix(),
+                "sha256": sha256_file(manifest_path),
+            }
+        ]
+        manifest_index = prepared["budget_authority"]["manifest_inventory"]
+        self.assertEqual(manifest_index["items"], expected_manifest_inventory)
+        self.assertEqual(manifest_index["total_count"], 1)
+        self.assertEqual(manifest_index["selected_count"], 1)
+        self.assertFalse(manifest_index["truncated"])
+        self.assertEqual(
+            manifest_index["inventory_sha256"],
+            sha256_json(expected_manifest_inventory),
         )
         self.assertEqual(
             prepared["budget_totals"]["authority"],

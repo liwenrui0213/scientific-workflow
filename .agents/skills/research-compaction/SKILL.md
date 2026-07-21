@@ -7,11 +7,18 @@ description: Compact a long-running scientific Study into finite active context 
 
 ## Authoritative inputs
 
-Validate the repository profile, then run `studyctl check-changes` and
-`studyctl compact-prepare`. Treat `COMPACTION_INPUT.json`, STATUS, and CHANGES as
-indexes. Inspect sealed Runs, finalized Evidence, Claims, failed directions,
-formal artifacts, Checkpoints, and actual `work/active/` files before making a
-semantic judgment.
+Validate the repository profile, then run `studyctl check-changes`, `status`,
+and `compact-prepare`. Invoke this Skill whenever status reports soft or hard
+compaction pressure, as well as at an explicit scientific checkpoint. Treat
+`COMPACTION_INPUT.json`, STATUS, and CHANGES as indexes. Inspect only the source
+Runs, finalized Evidence, Claims, failed directions, formal artifacts, latest
+Checkpoint, and `work/active/` files selected by the current question before
+making a semantic judgment. Historical collections in `COMPACTION_INPUT.json`
+are bounded indexes: `items` is only a deterministic navigation batch, while
+`total_count`, `selected_count`, `truncated`, and `inventory_sha256` describe
+and bind the complete inventory. Never interpret an unlisted item as absent.
+Current Claims are compact ID/state/preview/hash locators and the Frontier is a
+bounded selector; read the authoritative `CLAIMS.json` source by Claim ID.
 
 Read [semantic compaction](references/semantic-compaction.md) before selecting
 decisive Evidence, representative failures, Claim revisions, or the new
@@ -21,16 +28,34 @@ Frontier.
 
 1. Update draft or new-version Evidence and Claims without inventing results.
    Preserve decisive support, all contradictions, unique anomalies, and
-   representative failed Runs or failed-direction records.
-2. Keep the Frontier limited to Claims under active test, unresolved questions,
+   representative failed Runs or failed-direction records. Mark no-longer-current
+   Claims `retired`, or mark them `superseded` with a new active Claim ID. The
+   new Checkpoint seals these lifecycle decisions; never reactivate them after
+   that boundary.
+2. When total or terminal Claim pressure remains high, seal explicit
+   `retired`/`superseded` lifecycles first. Only after that Checkpoint succeeds
+   may a later compaction remove those terminal records from current
+   `CLAIMS.json`; first verify that finalization created the immutable full
+   Claim record referenced by the Checkpoint under `checkpoints/claim-records/`.
+   A sealed terminal Claim is immutable in full, not only in lifecycle. Never
+   rewrite it under the same ID, break a historical supersession chain, drop an
+   active Claim, remove a referenced record, or auto-select a lifecycle.
+3. Keep the Frontier limited to Claims under active test, unresolved questions,
    immediate next actions, and genuinely blocking human decisions. Move
    resolved history into Evidence, failed directions, or Checkpoints.
-3. Write a schema-valid compaction plan outside `work/active/`. Bind it to the
-   preparation input, Claims, and Evidence hashes, and name every scratch file
-   proposed for archival explicitly.
-4. Keep `work/active/` unchanged, then run `studyctl compact-finalize`. If the
+4. After all Evidence and Claim edits, rerun `compact-prepare`, then write a
+   schema-valid compaction plan outside `work/active/`. Bind it to that final
+   preparation input, Claims hash, and constant-size Evidence inventory binding
+   (`total_count` plus full `inventory_sha256`), and name every scratch file
+   proposed for archival explicitly. Never copy the full Evidence path/hash map
+   into the plan.
+5. Keep `work/active/` unchanged, then run `studyctl compact-finalize`. If the
    profile, host fingerprint, inventory, binding, hash, or reference changed,
    prepare again.
+6. When an index is truncated, inspect and compact one relevant batch, finalize
+   without deleting history, then rerun `compact-prepare` for the next batch.
+   Finalization recomputes the full inventory hash, including entries omitted
+   from the bounded projection.
 
 ## Hard gates
 
@@ -47,9 +72,10 @@ Frontier.
 
 ## Output and handoff
 
-Produce one immutable Checkpoint with hash-bound active Claims, decisive and
+Produce one immutable Checkpoint with only the Frontier-selected active Claim
+snapshots, compact hash references for non-Frontier Claims, decisive and
 contradictory Evidence, a small diverse Frontier, open questions, next actions,
-budget state, and the previous Checkpoint link. Regenerate status through
+pressure watermarks, budget state, and the previous Checkpoint link. Regenerate status through
 `studyctl`; return the archived scratch list and any human decision required.
 Hand the compacted state back to `scientific-study`, or prepare the explicit
 fresh-session `scientific-review` handoff when the review boundary is ready. Do

@@ -9,7 +9,7 @@ import sys
 from tests.helpers import TTYBuffer, WorkflowTestCase
 from tools.studyctl.approval import record_verdict
 from tools.studyctl.compaction import (
-    current_evidence_hashes,
+    current_evidence_inventory_binding,
     finalize_compaction,
     prepare_compaction,
 )
@@ -48,7 +48,7 @@ class DemonstrationLifecycleTests(WorkflowTestCase):
                 "study_id": paths.study_id,
                 "compaction_input_sha256": sha256_file(compaction_input),
                 "claims_sha256": sha256_file(paths.claims),
-                "evidence_sha256": current_evidence_hashes(paths),
+                "evidence_inventory": current_evidence_inventory_binding(paths),
                 "archive_work_files": ["initial-idea.md"],
                 "decisive_evidence": [evidence_ref],
                 "contradictory_evidence": [],

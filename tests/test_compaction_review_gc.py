@@ -11,7 +11,7 @@ import unittest
 from tests.helpers import WorkflowTestCase
 from tools.studyctl.cli import main as studyctl_main
 from tools.studyctl.compaction import (
-    current_evidence_hashes,
+    current_evidence_inventory_binding,
     finalize_compaction,
     prepare_compaction,
 )
@@ -24,7 +24,7 @@ from tools.studyctl.hashing import (
     sha256_file,
     sha256_json,
 )
-from tools.studyctl.models import StudyPaths, ValidationError
+from tools.studyctl.models import StudyPaths, ValidationError, utc_now
 from tools.studyctl.rendering import render_status
 from tools.studyctl.review import create_review_packet, import_and_render_review
 from tools.studyctl.run_registry import execute_run
@@ -49,7 +49,7 @@ class _CompactionPlanMixin:
             "study_id": paths.study_id,
             "compaction_input_sha256": sha256_file(compaction_input),
             "claims_sha256": sha256_file(paths.claims),
-            "evidence_sha256": current_evidence_hashes(paths),
+            "evidence_inventory": current_evidence_inventory_binding(paths),
             "archive_work_files": archive_work_files,
             "decisive_evidence": decisive_evidence or [],
             "contradictory_evidence": [],
@@ -94,31 +94,262 @@ class CompactionTests(_CompactionPlanMixin, WorkflowTestCase):
         )
         self.assertEqual(state["host_change_scope"]["outcome"], "PASS")
         self.assertTrue(state["host_change_scope"]["git_available"])
-        self.assertEqual(state["host_change_scope"]["consequential_paths"], [])
+        self.assertEqual(
+            state["host_change_scope"]["consequential_paths"],
+            {
+                "items": [],
+                "total_count": 0,
+                "selected_count": 0,
+                "truncated": False,
+                "inventory_sha256": sha256_json([]),
+                "selected_bytes": 2,
+            },
+        )
         self.assertEqual(
             state["host_change_scope"]["fingerprint_sha256"],
             sha256_json([]),
         )
         self.assertEqual(
             state["active_work_inventory_sha256"],
-            sha256_json(state["active_work_inventory"]),
+            state["active_work_inventory"]["inventory_sha256"],
+        )
+        expected_file_record = {
+            "path": note.relative_to(paths.root).as_posix(),
+            "size": note.stat().st_size,
+            "sha256": sha256_file(note),
+        }
+        self.assertEqual(
+            state["active_work_files"],
+            {
+                "items": [expected_file_record],
+                "total_count": 1,
+                "selected_count": 1,
+                "truncated": False,
+                "inventory_sha256": sha256_json([expected_file_record]),
+                "selected_bytes": len(
+                    json.dumps(
+                        [expected_file_record],
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ),
+            },
+        )
+        expected_inventory = [
+            {
+                "path": note.relative_to(paths.root).as_posix(),
+                "kind": "file",
+                "mode": note.stat().st_mode & 0o7777,
+                "size": note.stat().st_size,
+                "sha256": sha256_file(note),
+            }
+        ]
+        self.assertEqual(
+            state["active_work_inventory"]["items"],
+            expected_inventory,
         )
         self.assertEqual(
-            [item["path"] for item in state["active_work_files"]],
-            [note.relative_to(paths.root).as_posix()],
+            state["active_work_inventory"]["inventory_sha256"],
+            sha256_json(expected_inventory),
         )
+        self.assertEqual(state["candidate_archive_items"]["items"], [note.name])
+
+    def test_prepare_bounds_large_work_indexes_and_commits_full_inventory(self) -> None:
+        paths = self.initialize_approved_with_claim()
+        file_count = 1_500
+        for index in range(file_count):
+            (paths.active_work / f"note-{index:04d}.txt").write_text(
+                f"scratch {index}\n",
+                encoding="utf-8",
+            )
+
+        output = prepare_compaction(paths)
+        state = load_json(output)
+        work_files = [
+            {
+                "path": path.relative_to(paths.root).as_posix(),
+                "size": path.stat().st_size,
+                "sha256": sha256_file(path),
+            }
+            for path in sorted(paths.active_work.glob("*.txt"))
+        ]
+        work_inventory = [
+            {
+                "path": record["path"],
+                "kind": "file",
+                "mode": (paths.root / record["path"]).stat().st_mode & 0o7777,
+                "size": record["size"],
+                "sha256": record["sha256"],
+            }
+            for record in work_files
+        ]
+
+        for key, expected_hash in (
+            ("active_work_files", sha256_json(work_files)),
+            ("active_work_inventory", sha256_json(work_inventory)),
+            (
+                "candidate_archive_items",
+                sha256_json([f"note-{index:04d}.txt" for index in range(file_count)]),
+            ),
+        ):
+            with self.subTest(index=key):
+                index_record = state[key]
+                self.assertEqual(index_record["total_count"], file_count)
+                self.assertEqual(index_record["selected_count"], len(index_record["items"]))
+                self.assertGreater(index_record["selected_count"], 0)
+                self.assertLessEqual(index_record["selected_count"], 64)
+                self.assertLessEqual(index_record["selected_bytes"], 8 * 1024)
+                self.assertTrue(index_record["truncated"])
+                self.assertEqual(index_record["inventory_sha256"], expected_hash)
         self.assertEqual(
-            state["active_work_inventory"],
-            [
-                {
-                    "path": note.relative_to(paths.root).as_posix(),
-                    "kind": "file",
-                    "mode": note.stat().st_mode & 0o7777,
-                    "size": note.stat().st_size,
-                    "sha256": sha256_file(note),
-                }
-            ],
+            state["active_work_inventory_sha256"],
+            sha256_json(work_inventory),
         )
+        self.assertLess(output.stat().st_size, 256 * 1024)
+
+    def test_finalize_rejects_change_to_unselected_work_after_bounded_prepare(self) -> None:
+        paths = self.initialize_approved_with_claim()
+        files: list[Path] = []
+        for index in range(160):
+            path = paths.active_work / f"note-{index:04d}.txt"
+            path.write_text(f"prepared {index}\n", encoding="utf-8")
+            files.append(path)
+        plan = self.write_compaction_plan(
+            paths,
+            [],
+            name="bounded-active-work-change-plan.json",
+        )
+        state = load_json(paths.generated / "COMPACTION_INPUT.json")
+        selected_paths = {
+            item["path"] for item in state["active_work_inventory"]["items"]
+        }
+        unselected = files[-1]
+        self.assertTrue(state["active_work_inventory"]["truncated"])
+        self.assertNotIn(unselected.relative_to(paths.root).as_posix(), selected_paths)
+
+        unselected.write_text("changed outside bounded projection\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(
+            ValidationError,
+            "work/active inventory changed after compact-prepare",
+        ):
+            finalize_compaction(paths, plan)
+        self.assertEqual(list(paths.checkpoints.glob("CHECKPOINT-*.json")), [])
+
+    def test_prepare_projects_schema_max_claim_payload_as_bounded_locators(self) -> None:
+        paths = self.initialize_approved_with_claim()
+        long_statement = "statement-marker-" + "s" * (4096 - len("statement-marker-"))
+        long_scope = "scope-marker-" + "c" * (4096 - len("scope-marker-"))
+        long_uncertainty = "uncertainty-marker-" + "u" * (
+            4096 - len("uncertainty-marker-")
+        )
+        claims = load_json(paths.claims)
+        claims["claims"] = [
+            {
+                "claim_id": f"CLAIM-{index:04d}",
+                "statement": long_statement,
+                "scope": long_scope,
+                "state": "under_test",
+                "lifecycle": "active",
+                "supporting_evidence": [],
+                "contradictory_evidence": [],
+                "other_evidence": [],
+                "uncertainty": long_uncertainty,
+                "limitations": ["l" * 1024 for _ in range(32)],
+                "updated_at": utc_now(),
+            }
+            for index in range(1, 33)
+        ]
+        claims["frontier"] = {
+            "summary": "f" * 4096,
+            "claim_ids": [f"CLAIM-{index:04d}" for index in range(1, 33)],
+            "open_questions": ["q" * 1024 for _ in range(64)],
+            "next_actions": ["a" * 1024 for _ in range(64)],
+            "human_decisions_required": ["d" * 1024 for _ in range(32)],
+        }
+        claims["revision"] += 1
+        claims["updated_at"] = utc_now()
+        atomic_write_json(paths.claims, claims)
+
+        output = prepare_compaction(paths)
+        state = load_json(output)
+
+        self.assertGreater(paths.claims.stat().st_size, 1_000_000)
+        self.assertLess(output.stat().st_size, 256 * 1024)
+        self.assertEqual(state["claims_source"]["path"], paths.claims.relative_to(paths.root).as_posix())
+        self.assertEqual(state["claims_source"]["size"], paths.claims.stat().st_size)
+        self.assertEqual(state["claims_source"]["sha256"], sha256_file(paths.claims))
+        self.assertEqual(state["claims_source"]["revision"], claims["revision"])
+        self.assertEqual(
+            state["claims_source"]["claim_inventory_sha256"],
+            sha256_json(claims["claims"]),
+        )
+        claim_index = state["current_claims"]
+        self.assertEqual(claim_index["total_count"], 32)
+        self.assertEqual(claim_index["selected_count"], len(claim_index["items"]))
+        self.assertTrue(claim_index["truncated"])
+        self.assertLessEqual(claim_index["selected_bytes"], 8 * 1024)
+        first_locator = claim_index["items"][0]
+        self.assertEqual(first_locator["claim_id"], "CLAIM-0001")
+        self.assertEqual(first_locator["state"], "under_test")
+        self.assertEqual(first_locator["sha256"], sha256_json(claims["claims"][0]))
+        self.assertTrue(first_locator["statement"]["truncated"])
+        serialized = output.read_text(encoding="utf-8")
+        self.assertNotIn(long_statement, serialized)
+        self.assertNotIn(long_scope, serialized)
+        self.assertNotIn(long_uncertainty, serialized)
+        self.assertEqual(state["current_frontier"]["open_questions"]["total_count"], 64)
+        self.assertTrue(state["current_frontier"]["open_questions"]["truncated"])
+
+    def test_evidence_inventory_binding_stays_constant_size(self) -> None:
+        paths = self.initialize_approved_with_claim()
+        evidence_count = 500
+        evidence_paths: list[Path] = []
+        for index in range(1, evidence_count + 1):
+            path = paths.evidence / f"EVID-{index:04d}.v0001.json"
+            atomic_write_json(path, {"fixture": index})
+            evidence_paths.append(path)
+
+        binding = current_evidence_inventory_binding(paths)
+        expected_inventory = [
+            {
+                "path": path.relative_to(paths.root).as_posix(),
+                "sha256": sha256_file(path),
+            }
+            for path in evidence_paths
+        ]
+
+        self.assertEqual(
+            binding,
+            {
+                "total_count": evidence_count,
+                "inventory_sha256": sha256_json(expected_inventory),
+            },
+        )
+        self.assertLess(len(json.dumps(binding).encode("utf-8")), 256)
+
+    def test_finalize_rejects_evidence_added_after_plan_binding(self) -> None:
+        paths = self.initialize_approved_with_claim()
+        manifest = self.successful_run(paths)
+        plan = self.write_compaction_plan(
+            paths,
+            [],
+            name="evidence-drift-plan.json",
+        )
+        create_evidence_draft(
+            paths,
+            "EVID-0001",
+            ["CLAIM-0001"],
+            [manifest["run_id"]],
+        )
+
+        with self.assertRaisesRegex(
+            ValidationError,
+            "Evidence set changed after compact-prepare",
+        ):
+            finalize_compaction(paths, plan)
+        self.assertEqual(list(paths.checkpoints.glob("CHECKPOINT-*.json")), [])
 
     def test_finalize_rejects_repository_profile_change_after_prepare(self) -> None:
         paths = self.initialize_approved_with_claim()
@@ -248,7 +479,10 @@ class CompactionTests(_CompactionPlanMixin, WorkflowTestCase):
         ]
 
         compaction_input = load_json(prepare_compaction(paths))
-        counts = compaction_input["run_counts_by_cohort_and_status"]
+        counts = {
+            item["cohort"]: item["status_counts"]
+            for item in compaction_input["run_counts_by_cohort_and_status"]["items"]
+        }
         expected_keys = {
             f"FINGERPRINT-{manifest['cohort']['fingerprint_sha256']}"
             for manifest in manifests
@@ -284,10 +518,12 @@ class CompactionTests(_CompactionPlanMixin, WorkflowTestCase):
 
         compaction_input = load_json(prepare_compaction(paths))
         active_paths = {
-            item["path"] for item in compaction_input["active_formal_artifacts"]
+            item["path"]
+            for item in compaction_input["active_formal_artifacts"]["items"]
         }
         stale_paths = {
-            item["path"] for item in compaction_input["stale_formal_artifacts"]
+            item["path"]
+            for item in compaction_input["stale_formal_artifacts"]["items"]
         }
         self.assertIn(model.relative_to(paths.root).as_posix(), active_paths)
         self.assertIn(dataset_split.relative_to(paths.root).as_posix(), active_paths)
@@ -336,7 +572,10 @@ class CompactionTests(_CompactionPlanMixin, WorkflowTestCase):
             name="referenced-plan.json",
         )
         compaction_input = load_json(paths.generated / "COMPACTION_INPUT.json")
-        self.assertNotIn("referenced.txt", compaction_input["candidate_archive_items"])
+        self.assertNotIn(
+            "referenced.txt",
+            compaction_input["candidate_archive_items"]["items"],
+        )
 
         with self.assertRaisesRegex(
             ValidationError,
@@ -411,7 +650,10 @@ class CompactionTests(_CompactionPlanMixin, WorkflowTestCase):
         evidence_ref = load_json(paths.claims)["claims"][0]["supporting_evidence"][0]
 
         compaction_input = load_json(prepare_compaction(paths))
-        self.assertNotIn(source.name, compaction_input["candidate_archive_items"])
+        self.assertNotIn(
+            source.name,
+            compaction_input["candidate_archive_items"]["items"],
+        )
         plan = self.write_compaction_plan(
             paths,
             [source.name],
@@ -588,8 +830,23 @@ class ReviewTests(_CompactionPlanMixin, WorkflowTestCase):
         self.assertEqual(packet["contradictory_evidence"], [])
         self.assertEqual(packet["evidence"][0]["object"]["record_sha256"], evidence["record_sha256"])
         self.assertEqual(packet["decisive_run_manifests"][0]["run_id"], manifest["run_id"])
-        self.assertEqual(packet["cohort_fingerprints"][manifest["run_id"]], manifest["cohort"])
-        self.assertEqual(packet["reproducibility_commands"][0]["argv"], manifest["execution"]["argv"])
+        self.assertEqual(
+            packet["cohort_fingerprints"][manifest["run_id"]],
+            manifest["cohort"]["fingerprint_sha256"],
+        )
+        run_source = packet["decisive_run_manifests"][0]
+        self.assertEqual(
+            run_source["path"],
+            (paths.runs / manifest["run_id"] / "manifest.json")
+            .relative_to(paths.root)
+            .as_posix(),
+        )
+        self.assertNotIn("execution", run_source)
+        self.assertEqual(
+            packet["reproducibility_commands"][0]["manifest_path"],
+            run_source["path"],
+        )
+        self.assertNotIn("argv", packet["reproducibility_commands"][0])
         self.assertTrue(
             packet["protected_condition_hash_checks"]["critical_run_checks"][0][
                 "brief_hash_matches_active"

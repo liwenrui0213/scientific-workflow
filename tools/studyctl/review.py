@@ -3,11 +3,25 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from .active_context import (
+    active_claims,
+    build_active_selector,
+    require_growth_allowed,
+    write_active_selector,
+    write_compaction_due,
+)
 from .formalization import check_formalization, collect_formalization_debt
 from .git_state import git_diff_metadata, git_state
-from .hashing import atomic_write_bytes, atomic_write_json, load_json, record_digest, sha256_file
+from .hashing import (
+    atomic_write_bytes,
+    atomic_write_json,
+    load_json,
+    record_digest,
+    sha256_file,
+    sha256_json,
+)
 from .models import SCHEMA_VERSION, StudyPaths, ValidationError
-from .rendering import active_formal_artifacts, render_review_markdown
+from .rendering import render_review_markdown
 from .validation import (
     brief_approval_issues,
     checkpoint_paths,
@@ -36,6 +50,17 @@ def _claim_refs(claims: dict[str, Any], field: str) -> list[dict[str, Any]]:
     return refs
 
 
+MAX_REVIEW_EVIDENCE_PER_ROLE = 128
+MAX_REVIEW_RUN_SOURCES = 512
+
+
+def _bounded_refs(
+    claims: dict[str, Any], field: str
+) -> tuple[list[dict[str, Any]], int]:
+    refs = _claim_refs(claims, field)
+    return refs[:MAX_REVIEW_EVIDENCE_PER_ROLE], len(refs)
+
+
 def _manifests_for_evidence(
     refs: list[dict[str, Any]],
     evidence: dict[tuple[str, int], tuple[Path, dict[str, Any]]],
@@ -61,7 +86,137 @@ def _latest_checkpoint(paths: StudyPaths) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+def _latest_checkpoint_source(paths: StudyPaths) -> dict[str, Any] | None:
+    files = checkpoint_paths(paths)
+    if not files:
+        return None
+    path = files[-1]
+    value = load_json(path)
+    if not isinstance(value, dict):
+        return None
+    return {
+        "checkpoint_id": value.get("checkpoint_id"),
+        "checkpoint_sha256": value.get("checkpoint_sha256"),
+        "path": path.relative_to(paths.root).as_posix(),
+        "sha256": sha256_file(path),
+        "created_at": value.get("created_at"),
+        "active_claim_count": len(value.get("claims_snapshot", [])),
+        "decisive_evidence_count": len(value.get("decisive_evidence", [])),
+        "contradictory_evidence_count": len(
+            value.get("contradictory_evidence", [])
+        ),
+    }
+
+
+def _evidence_source_index(
+    refs_by_role: list[tuple[str, list[dict[str, Any]]]],
+    evidence: dict[tuple[str, int], tuple[Path, dict[str, Any]]],
+    paths: StudyPaths,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    seen: set[tuple[str, int, str]] = set()
+    for role, refs in refs_by_role:
+        for ref in refs:
+            key = _evidence_key(ref)
+            role_key = (*key, role)
+            if role_key in seen:
+                continue
+            seen.add(role_key)
+            source = evidence.get(key)
+            if source is None:
+                continue
+            path, item = source
+            summary = {
+                "evidence_id": key[0],
+                "version": key[1],
+                "status": item.get("status"),
+                "assessment": item.get("assessment"),
+                "record_sha256": item.get("record_sha256"),
+                "addressed_claim_ids": item.get("addresses", {}).get(
+                    "claim_ids", []
+                ),
+                "run_count": len(item.get("runs", [])),
+            }
+            records.append(
+                {
+                    "path": path.relative_to(paths.root).as_posix(),
+                    "sha256": sha256_file(path),
+                    "evidence_id": key[0],
+                    "version": key[1],
+                    "role": role,
+                    "status": item.get("status"),
+                    "assessment": item.get("assessment"),
+                    # Compatibility key: this is deliberately a bounded source
+                    # summary, never the authoritative Evidence object.
+                    "object": summary,
+                }
+            )
+    return records
+
+
+def _run_source_index(
+    evidence_sources: list[dict[str, Any]],
+    evidence: dict[tuple[str, int], tuple[Path, dict[str, Any]]],
+    runs: dict[str, tuple[Path, dict[str, Any]]],
+    paths: StudyPaths,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    by_run: dict[str, dict[str, Any]] = {}
+    all_index_records: list[dict[str, Any]] = []
+    for source in evidence_sources:
+        key = (str(source["evidence_id"]), int(source["version"]))
+        evidence_record = evidence.get(key)
+        if evidence_record is None:
+            continue
+        for run_ref in evidence_record[1].get("runs", []):
+            run_id = str(run_ref.get("run_id"))
+            run_source = runs.get(run_id)
+            if run_source is None:
+                continue
+            path, manifest = run_source
+            inventory_record = {
+                "run_id": run_id,
+                "path": path.relative_to(paths.root).as_posix(),
+                "sha256": sha256_file(path),
+                "status": manifest.get("status"),
+                "manifest_sha256": manifest.get("integrity", {}).get(
+                    "manifest_sha256"
+                ),
+            }
+            all_index_records.append(inventory_record)
+            current = by_run.get(run_id)
+            if current is None:
+                current = {
+                    **inventory_record,
+                    "roles": [],
+                    "assessments": [],
+                    "evidence_ids": [],
+                    "cohort_fingerprint_sha256": manifest.get("cohort", {}).get(
+                        "fingerprint_sha256"
+                    ),
+                }
+                by_run[run_id] = current
+            for field, value in (
+                ("roles", source["role"]),
+                ("assessments", source.get("assessment")),
+                ("evidence_ids", source["evidence_id"]),
+            ):
+                if value not in current[field]:
+                    current[field].append(value)
+    ordered = [by_run[key] for key in sorted(by_run)]
+    selected = ordered[:MAX_REVIEW_RUN_SOURCES]
+    inventory = {
+        "total_record_count": len(ordered),
+        "selected_record_count": len(selected),
+        "truncated": len(selected) != len(ordered),
+        "inventory_sha256": sha256_json(
+            sorted(all_index_records, key=lambda item: (item["run_id"], item["path"]))
+        ),
+    }
+    return selected, inventory
+
+
 def create_review_packet(paths: StudyPaths, base_ref: str | None = None) -> Path:
+    pressure = require_growth_allowed(paths, "scientific review")
     effective_base_ref = base_ref or str(
         load_repository_profile(paths.root)["git"]["base_ref"]
     )
@@ -71,14 +226,47 @@ def create_review_packet(paths: StudyPaths, base_ref: str | None = None) -> Path
     claims = load_json(paths.claims)
     if not isinstance(claims, dict):
         raise ValidationError("CLAIMS.json must be an object")
+    active_claims_data = dict(claims)
+    active_claims_data["claims"] = active_claims(claims)
     evidence = evidence_index(paths)
     runs = run_index(paths)
     if validation_errors:
         decisive_refs = []
         contradictory_refs = []
+        other_refs = []
+        decisive_total = 0
+        contradictory_total = 0
+        other_total = 0
     else:
-        decisive_refs = _claim_refs(claims, "supporting_evidence")
-        contradictory_refs = _claim_refs(claims, "contradictory_evidence")
+        decisive_refs, decisive_total = _bounded_refs(
+            active_claims_data, "supporting_evidence"
+        )
+        contradictory_refs, contradictory_total = _bounded_refs(
+            active_claims_data, "contradictory_evidence"
+        )
+        other_refs, other_total = _bounded_refs(
+            active_claims_data, "other_evidence"
+        )
+    evidence_sources = _evidence_source_index(
+        [
+            ("decisive", decisive_refs),
+            ("contradictory", contradictory_refs),
+            ("other", other_refs),
+        ],
+        evidence,
+        paths,
+    )
+    evidence_inventory_records = [
+        {
+            "path": path.relative_to(paths.root).as_posix(),
+            "sha256": sha256_file(path),
+            "evidence_id": key[0],
+            "version": key[1],
+            "status": item.get("status"),
+            "assessment": item.get("assessment"),
+        }
+        for key, (path, item) in sorted(evidence.items())
+    ]
     decisive_manifests = _manifests_for_evidence(decisive_refs, evidence, runs)
     contradictory_manifests = _manifests_for_evidence(contradictory_refs, evidence, runs)
     all_critical_manifests: list[dict[str, Any]] = []
@@ -87,6 +275,12 @@ def create_review_packet(paths: StudyPaths, base_ref: str | None = None) -> Path
         if manifest["run_id"] not in seen_runs:
             all_critical_manifests.append(manifest)
             seen_runs.add(manifest["run_id"])
+    run_sources, run_inventory = _run_source_index(
+        evidence_sources,
+        evidence,
+        runs,
+        paths,
+    )
 
     approval_issues = brief_approval_issues(paths)
     current_brief_hash = sha256_file(paths.brief)
@@ -112,7 +306,8 @@ def create_review_packet(paths: StudyPaths, base_ref: str | None = None) -> Path
         ],
     }
     cohort_fingerprints = {
-        manifest["run_id"]: manifest.get("cohort", {}) for manifest in all_critical_manifests
+        item["run_id"]: item.get("cohort_fingerprint_sha256")
+        for item in run_sources
     }
     git = git_diff_metadata(paths.root, effective_base_ref)
     repository_profile = profile_summary(paths.root)
@@ -152,6 +347,15 @@ def create_review_packet(paths: StudyPaths, base_ref: str | None = None) -> Path
     formalization = check_formalization(paths, {"for_review": True})
     if formalization.blocked:
         deviations.append("progressive-formalization review gate is BLOCKED")
+    selector = build_active_selector(paths, claims_data=claims)
+    selector_path = write_active_selector(paths, claims_data=claims)
+    write_compaction_due(paths, pressure)
+    decisive_run_sources = [
+        item for item in run_sources if "decisive" in item["roles"]
+    ]
+    contradictory_run_sources = [
+        item for item in run_sources if "contradictory" in item["roles"]
+    ]
     packet = {
         "schema_version": SCHEMA_VERSION,
         "study_id": paths.study_id,
@@ -160,16 +364,57 @@ def create_review_packet(paths: StudyPaths, base_ref: str | None = None) -> Path
             "sha256": current_brief_hash,
             "approval": approval,
         },
-        "active_formal_artifacts": [item for item in active_formal_artifacts(paths) if item["active"]],
-        "claims": claims,
-        "evidence": [
-            {"path": path.relative_to(paths.root).as_posix(), "object": item}
-            for _, (path, item) in sorted(evidence.items())
+        "active_context": {
+            "path": selector_path.relative_to(paths.root).as_posix(),
+            "size": selector_path.stat().st_size,
+            "sha256": sha256_file(selector_path),
+            "selector_sha256": selector["selector_sha256"],
+        },
+        "active_formal_artifacts": selector["active_formal_artifacts"][
+            "sources"
         ],
+        "claims": active_claims_data,
+        "evidence": evidence_sources,
+        "evidence_inventory": {
+            "total_record_count": len(evidence),
+            "active_referenced_record_count": len(
+                {
+                    (item["evidence_id"], item["version"])
+                    for item in evidence_sources
+                }
+            ),
+            "selected_source_count": len(evidence_sources),
+            "selected_by_role": {
+                "decisive": len(decisive_refs),
+                "contradictory": len(contradictory_refs),
+                "other": len(other_refs),
+            },
+            "total_by_role": {
+                "decisive": decisive_total,
+                "contradictory": contradictory_total,
+                "other": other_total,
+            },
+            "truncated": any(
+                selected < total
+                for selected, total in (
+                    (len(decisive_refs), decisive_total),
+                    (len(contradictory_refs), contradictory_total),
+                    (len(other_refs), other_total),
+                )
+            ),
+            "inventory_sha256": sha256_json(evidence_inventory_records),
+        },
         "decisive_evidence": decisive_refs,
         "contradictory_evidence": contradictory_refs,
-        "decisive_run_manifests": decisive_manifests,
-        "contradictory_run_manifests": contradictory_manifests,
+        "other_evidence": other_refs,
+        # Compatibility names now contain bounded source indexes, not full
+        # authoritative Run manifests.
+        "decisive_run_manifests": decisive_run_sources,
+        "contradictory_run_manifests": contradictory_run_sources,
+        "other_run_sources": [
+            item for item in run_sources if "other" in item["roles"]
+        ],
+        "run_inventory": run_inventory,
         "cohort_fingerprints": cohort_fingerprints,
         "protected_condition_hash_checks": protected_checks,
         "git_diff_metadata": git,
@@ -182,13 +427,12 @@ def create_review_packet(paths: StudyPaths, base_ref: str | None = None) -> Path
         },
         "reproducibility_commands": [
             {
-                "run_id": manifest["run_id"],
-                "cwd": manifest.get("execution", {}).get("cwd"),
-                "argv": manifest.get("execution", {}).get("argv"),
-                "inputs": manifest.get("inputs", []),
-                "expected_outputs": manifest.get("outputs", []),
+                "run_id": item["run_id"],
+                "manifest_path": item["path"],
+                "manifest_sha256": item.get("manifest_sha256"),
+                "instruction": "Read the immutable Run manifest at manifest_path.",
             }
-            for manifest in all_critical_manifests
+            for item in run_sources
         ],
         "known_deviations": sorted(set(deviations)),
         "authority_validation": {
@@ -196,7 +440,8 @@ def create_review_packet(paths: StudyPaths, base_ref: str | None = None) -> Path
             "errors": [item.render() for item in validation_errors],
             "warnings": [item.render() for item in validation_issues if item.level == "WARNING"],
         },
-        "latest_checkpoint": _latest_checkpoint(paths),
+        "latest_checkpoint": _latest_checkpoint_source(paths),
+        "compaction_pressure": pressure,
         "packet_sha256": "",
     }
     packet["packet_sha256"] = record_digest(packet, "packet_sha256")

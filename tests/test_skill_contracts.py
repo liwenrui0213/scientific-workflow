@@ -12,6 +12,7 @@ from tools.studyctl.validation import validate_schema_instance
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+AGENT_INSTRUCTIONS = REPOSITORY_ROOT / "AGENTS.md"
 SKILLS_ROOT = REPOSITORY_ROOT / ".agents" / "skills"
 WORKFLOW_GUIDE = REPOSITORY_ROOT / "docs" / "scientific-agent-workflow.md"
 FIXTURES_ROOT = Path(__file__).resolve().parent / "fixtures" / "skill_contracts"
@@ -203,6 +204,81 @@ class SkillContractTests(unittest.TestCase):
                     f"{skill_name} copies a long contiguous block from the workflow guide",
                 )
 
+    def test_study_routing_contract_never_turns_ambiguous_continuation_into_init(self) -> None:
+        normalize = lambda text: " ".join(text.casefold().split())
+        root_contract = normalize(AGENT_INSTRUCTIONS.read_text(encoding="utf-8"))
+        guide = normalize(WORKFLOW_GUIDE.read_text(encoding="utf-8"))
+        _, start_body = parse_skill(SKILLS_ROOT / "start-scientific-study" / "SKILL.md")
+        _, study_body = parse_skill(SKILLS_ROOT / "scientific-study" / "SKILL.md")
+        combined_skill_contract = normalize(start_body + "\n" + study_body)
+
+        for phrase in (
+            "one-off scientific discussion, explanation, or brainstorming",
+            "explicit request to start, create, or persistently investigate",
+            "named existing study id",
+            "id-less request to continue or resume",
+            "resolve-study",
+            "ask once and never initialize a new study",
+        ):
+            with self.subTest(root_phrase=phrase):
+                self.assertIn(phrase, root_contract)
+
+        for phrase in (
+            "route before intake",
+            "scientific content alone is not consent",
+            "zero or multiple candidates",
+            "a human verdict is an interpretation record",
+            "must not convert an unresolved continuation into a new study",
+        ):
+            with self.subTest(guide_phrase=phrase):
+                self.assertIn(phrase, guide)
+
+        for phrase in (
+            "resolve-study",
+            "unique draft",
+            "unique approved",
+            "never run `init`",
+            "a verdict does not close the study",
+        ):
+            with self.subTest(skill_phrase=phrase):
+                self.assertIn(phrase, combined_skill_contract)
+
+    def test_active_context_contract_uses_pressure_and_terminal_claim_lifecycles(self) -> None:
+        normalize = lambda text: " ".join(text.casefold().split())
+        root_contract = normalize(AGENT_INSTRUCTIONS.read_text(encoding="utf-8"))
+        guide = normalize(WORKFLOW_GUIDE.read_text(encoding="utf-8"))
+        _, study_body = parse_skill(SKILLS_ROOT / "scientific-study" / "SKILL.md")
+        _, compaction_body = parse_skill(
+            SKILLS_ROOT / "research-compaction" / "SKILL.md"
+        )
+        combined = normalize(study_body + "\n" + compaction_body)
+
+        for phrase in (
+            "bounded claim and frontier locators",
+            "compact at soft pressure",
+            "at hard pressure",
+        ):
+            with self.subTest(root_phrase=phrase):
+                self.assertIn(phrase, root_contract)
+        for phrase in (
+            "bounded active context and automatic compaction pressure",
+            "active`, `retired`, or `superseded",
+            "cannot self-lock",
+            "only frontier-selected active claim snapshots",
+        ):
+            with self.subTest(guide_phrase=phrase):
+                self.assertIn(phrase, guide)
+        for phrase in (
+            "generated/active_context.json",
+            "selected active claims",
+            "retired",
+            "superseded",
+            "soft compaction pressure",
+            "hard pressure",
+        ):
+            with self.subTest(skill_phrase=phrase):
+                self.assertIn(phrase, combined)
+
 
 class SkillPressureScenarioFixtureTests(unittest.TestCase):
     @classmethod
@@ -235,7 +311,7 @@ class SkillPressureScenarioFixtureTests(unittest.TestCase):
             self.assertEqual(set(scenario), expected_fields)
             self.assertRegex(scenario["id"], r"^[a-z0-9-]+-[0-9]{2}$")
             ids.append(scenario["id"])
-            self.assertIn(scenario["skill"], SKILL_NAMES)
+            self.assertIn(scenario["skill"], (*SKILL_NAMES, None))
             for list_field in ("pressure_sources", "expected_actions", "forbidden_actions"):
                 self.assertIsInstance(scenario[list_field], list)
                 self.assertGreaterEqual(len(scenario[list_field]), 1)
@@ -256,7 +332,10 @@ class SkillPressureScenarioFixtureTests(unittest.TestCase):
         self.assertFalse(self.schema["additionalProperties"])
         scenario_schema = self.schema["properties"]["scenarios"]["items"]
         self.assertFalse(scenario_schema["additionalProperties"])
-        self.assertEqual(set(scenario_schema["properties"]["skill"]["enum"]), set(SKILL_NAMES))
+        self.assertEqual(
+            set(scenario_schema["properties"]["skill"]["enum"]),
+            {*SKILL_NAMES, None},
+        )
         self.assertEqual(
             set(scenario_schema["required"]),
             {
@@ -273,9 +352,28 @@ class SkillPressureScenarioFixtureTests(unittest.TestCase):
     def test_pressure_catalog_is_well_formed_and_covers_every_skill(self) -> None:
         self.assertEqual(validate_schema_instance(self.catalog, self.schema), [])
         self.assert_valid_catalog(self.catalog)
-        coverage = Counter(item["skill"] for item in self.catalog["scenarios"])
+        coverage = Counter(
+            item["skill"]
+            for item in self.catalog["scenarios"]
+            if item["skill"] is not None
+        )
         self.assertEqual(set(coverage), set(SKILL_NAMES))
         self.assertTrue(all(count >= 2 for count in coverage.values()), coverage)
+        no_skill = [item for item in self.catalog["scenarios"] if item["skill"] is None]
+        self.assertGreaterEqual(len(no_skill), 1)
+        self.assertTrue(
+            any("one-off" in item["prompt"].casefold() for item in no_skill),
+            no_skill,
+        )
+        ambiguous = next(
+            item
+            for item in self.catalog["scenarios"]
+            if item["id"] == "study-idless-ambiguity-pressure-03"
+        )
+        self.assertIsNone(
+            ambiguous["skill"],
+            "an ambiguous ID-less continuation must not preselect a Study Skill",
+        )
 
     def test_fixture_schema_rejects_empty_and_malformed_scenarios(self) -> None:
         empty = {"schema_version": 1, "scenarios": []}

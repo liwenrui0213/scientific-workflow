@@ -7,6 +7,8 @@ import shutil
 import sys
 from typing import Any, Sequence
 
+from .checkpoint_sequence import empty_checkpoint_sequence, write_checkpoint_sequence
+from .evidence_sequence import empty_evidence_sequence, write_evidence_sequence
 from .hashing import atomic_write_bytes, atomic_write_json, load_json
 from .models import (
     HumanGateError,
@@ -46,6 +48,10 @@ def initialize_study(root: Path, study_id: str, title: str) -> Path:
     for directory in directories:
         directory.mkdir(parents=True, exist_ok=False if directory == paths.formal else True)
     write_ledger(paths, empty_ledger(paths))
+    write_evidence_sequence(paths, empty_evidence_sequence(paths), overwrite=False)
+    write_checkpoint_sequence(
+        paths, empty_checkpoint_sequence(paths), overwrite=False
+    )
     template_root = root / "scientific-workflow" / "templates"
     brief_template = (template_root / "BRIEF.md").read_text(encoding="utf-8")
     brief_text = brief_template.replace("{{STUDY_ID}}", study_id).replace("{{TITLE}}", title.strip())
@@ -86,6 +92,12 @@ def build_parser() -> argparse.ArgumentParser:
         "profile-validate", help="validate the repository adaptation profile"
     )
 
+    resolve = subparsers.add_parser(
+        "resolve-study",
+        help="resolve a continuation without creating a Study",
+    )
+    resolve.add_argument("study_id", nargs="?")
+
     init = subparsers.add_parser("init", help="initialize a Study")
     init.add_argument("study_id")
     init.add_argument("--title", required=True)
@@ -102,11 +114,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ledger_migrate.add_argument("study_id")
 
+    evidence_sequence_migrate = subparsers.add_parser(
+        "migrate-evidence-sequence",
+        help=(
+            "initialize the counter for intact legacy Evidence; records that "
+            "pre-migration deletion cannot be proven absent"
+        ),
+    )
+    evidence_sequence_migrate.add_argument("study_id")
+
+    checkpoint_sequence_migrate = subparsers.add_parser(
+        "migrate-checkpoint-sequence",
+        help=(
+            "bind an intact contiguous legacy Checkpoint chain; records that "
+            "pre-migration deletion cannot be proven absent"
+        ),
+    )
+    checkpoint_sequence_migrate.add_argument("study_id")
+
     validate = subparsers.add_parser("validate", help="validate authoritative records and references")
     validate.add_argument("study_id")
 
     status = subparsers.add_parser("status", help="regenerate deterministic STATUS.md")
     status.add_argument("study_id")
+
+    context = subparsers.add_parser(
+        "context",
+        help="regenerate the bounded ACTIVE_CONTEXT.json selector",
+    )
+    context.add_argument("study_id")
 
     formalization = subparsers.add_parser("check-formalization", help="evaluate progressive-formalization gates")
     formalization.add_argument("study_id")
@@ -221,6 +257,11 @@ def dispatch(args: argparse.Namespace) -> int:
         summary = profile_summary(root)
         _print_json({"validation": "PASS", **summary})
         return 0
+    if name == "resolve-study":
+        from .study_routing import resolve_study
+
+        _print_json(resolve_study(root, args.study_id).route_record())
+        return 0
     if name == "init":
         path = initialize_study(root, args.study_id, args.title)
         print(path)
@@ -261,10 +302,26 @@ def dispatch(args: argparse.Namespace) -> int:
 
         print(migrate_legacy_run_ledger(paths))
         return 0
+    if name == "migrate-evidence-sequence":
+        from .evidence import migrate_evidence_sequence
+
+        print(migrate_evidence_sequence(paths))
+        return 0
+    if name == "migrate-checkpoint-sequence":
+        from .compaction import migrate_checkpoint_sequence
+
+        print(migrate_checkpoint_sequence(paths))
+        return 0
     if name == "status":
         from .rendering import render_status
 
         print(render_status(paths))
+        return 0
+    if name == "context":
+        from .active_context import refresh_active_projection
+
+        selector, _ = refresh_active_projection(paths)
+        print(selector)
         return 0
     if name == "check-formalization":
         from .formalization import check_formalization

@@ -11,6 +11,8 @@ from typing import Any, Iterable
 
 
 SCHEMA_VERSION = 1
+CLAIMS_SCHEMA_VERSION = 2
+CHECKPOINT_SCHEMA_VERSION = 2
 
 ID_PATTERNS = {
     "study": re.compile(r"^SC-[0-9]{4,}$"),
@@ -160,6 +162,18 @@ class StudyPaths:
         return self._safe_study_path(Path("evidence"), label="evidence directory")
 
     @property
+    def evidence_sequence(self) -> Path:
+        return self._safe_study_path(
+            Path("EVIDENCE.sequence.json"), label="EVIDENCE.sequence.json"
+        )
+
+    @property
+    def checkpoint_sequence(self) -> Path:
+        return self._safe_study_path(
+            Path("CHECKPOINTS.sequence.json"), label="CHECKPOINTS.sequence.json"
+        )
+
+    @property
     def failed_directions(self) -> Path:
         return self._safe_study_path(
             Path("failed-directions"), label="failed-directions directory"
@@ -227,6 +241,8 @@ class StudyPaths:
             self.brief,
             self.brief_approval,
             self.claims,
+            self.evidence_sequence,
+            self.checkpoint_sequence,
             self.verdict,
         ):
             if artifact.exists() and not artifact.is_file():

@@ -64,6 +64,24 @@ class HookPolicyTests(WorkflowTestCase):
                     "Codex must not invoke the human-only approve-brief or verdict command.",
                 )
 
+    def test_checkpoint_and_sequence_authority_are_blocked_from_direct_edits(self) -> None:
+        paths = self.initialize()
+        expected = (
+            "Checkpoint, sequence, and archived Claim records are sealed "
+            "authority and must not be changed or removed directly."
+        )
+        for relative in (
+            f"studies/{paths.study_id}/CHECKPOINTS.sequence.json",
+            f"studies/{paths.study_id}/EVIDENCE.sequence.json",
+            f"studies/{paths.study_id}/checkpoints/CHECKPOINT-000001.json",
+            f"studies/{paths.study_id}/checkpoints/claim-records/CLAIM-0001.{'0' * 64}.json",
+        ):
+            with self.subTest(relative=relative):
+                self.assertEqual(
+                    HOOK_POLICY.decide(self.patch_event("Update", relative)),
+                    expected,
+                )
+
     def test_human_owned_and_sealed_records_are_blocked(self) -> None:
         paths = self.initialize_approved_with_claim()
         manifest = self.successful_run(paths)

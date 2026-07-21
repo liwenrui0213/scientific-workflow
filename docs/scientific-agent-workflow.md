@@ -2,7 +2,7 @@
 
 This repository uses Python 3.11 or newer and a local, deterministic workflow for long-running computational research. `studyctl` records and checks facts; it does not infer scientific conclusions. V2 adds an explicit repository-adaptation contract and Git-backed governance for scientific code and test changes.
 
-The normal human interface is a scientific idea stated in ordinary language. Codex turns that idea into the internal Study structure; the scientist does not need to choose IDs, edit templates, or manually route workflow stages.
+For a persistent investigation, the normal human interface is a scientific idea stated in ordinary language plus an explicit request to start or continue research. Codex turns that request into the internal Study structure; the scientist does not need to choose new IDs, edit templates, or manually route workflow stages. One-off scientific discussion remains ordinary conversation and creates no Study.
 
 ## The two chains
 
@@ -212,6 +212,43 @@ python -m tools.studyctl validate-changes SC-0001
 
 Exploratory Runs can still be recorded when Git is unavailable, but their host change scope cannot be verified and they are ineligible for Evidence. Likewise, allowlisted host code or tests must be committed before an Evidence-producing Run; staged, unstaged, or untracked host changes make the sealed Run Evidence-ineligible. Study-state edits remain possible because Brief, Claims, Evidence drafts, and Run records naturally evolve during research.
 
+## Route before intake
+
+Scientific content alone is not consent to create persistent workflow state.
+Route by the user's requested action:
+
+| Request | Route |
+|---|---|
+| One-off discussion, explanation, derivation, critique, or brainstorming | Answer directly; do not create or modify a Study |
+| Explicit request to start, create, or persistently investigate a new question | Use `start-scientific-study` and allocate one new draft |
+| Named existing Study | Run `resolve-study STUDY_ID`; revise an unapproved draft with `start-scientific-study`, resume a fresh approved Study with `scientific-study`, and report missing or invalid state |
+| ID-less request to continue or resume previous/current research | Run `python -m tools.studyctl resolve-study` before selecting either Study Skill |
+
+`resolve-study` is deterministic and read-only. It validates the repository
+profile, safely classifies direct `SC-NNNN` Study directories as `draft`,
+`approved`, or `invalid`, and succeeds only for one unambiguous valid candidate.
+A `draft` is either the exact initialized/revision Brief placeholder state, or
+has no validation error except its missing human Brief approval. Both are
+routed to `start-scientific-study` under the same ID so intake can be completed
+without allocating a replacement. Any other malformed or unsafe state fails
+closed. An `approved` candidate has a fresh approval and is routed to
+`scientific-study`. A human Verdict is an interpretation record, not an
+automatic closed-state marker, so it does not exclude an otherwise valid Study.
+
+```bash
+python -m tools.studyctl resolve-study
+# Or validate and route an explicitly named existing Study:
+python -m tools.studyctl resolve-study SC-0001
+```
+
+The successful JSON names the `study_id`, `phase`, and `skill`. With zero or
+multiple candidates, or with one invalid candidate, the command fails with a
+concise candidate summary. Codex then asks one bounded routing question. It
+must not convert an unresolved continuation into a new Study or run `init` as a
+fallback. Naming a Study on the next turn resolves the route; naming an
+unapproved draft does not bounce between Skills—the start Skill revises that
+same draft through approval.
+
 ## Start directly from a scientific idea
 
 Give Codex the idea, goal, and any constraints you already know. For example:
@@ -221,7 +258,7 @@ Give Codex the idea, goal, and any constraints you already know. For example:
 Laplacian 计算成本。请直接建立研究任务并准备后续研究。
 ```
 
-When no existing Study ID is named, Codex uses the repository `start-scientific-study` skill. It will:
+When the user explicitly requests a new persistent investigation and does not name an existing Study ID, Codex uses the repository `start-scientific-study` skill. It will:
 
 1. inspect only enough of the repository to interpret the idea;
 2. allocate the next Study ID and initialize the Study;
@@ -336,6 +373,22 @@ directory therefore cannot create a second budget namespace or reuse
 authority snapshot. A missing/corrupt ledger or a ledger entry whose Manifest
 disappeared blocks validation and all new Runs.
 
+`<study_root>/<STUDY_ID>/EVIDENCE.sequence.json` applies the same monotone
+principle to Evidence creation pressure. Creating an Evidence draft durably
+advances its digest-bound high-water mark before publishing the draft. A
+failed publication burns that count rather than rolling it back, and deleting
+an unreferenced draft therefore cannot make compaction pressure decrease. A
+missing, corrupt, or rolled-back sequence blocks Evidence growth and
+validation. A pre-sequence Study must use the explicit
+`migrate-evidence-sequence` command; the migration records that deletion before
+the sequence existed cannot be proven absent.
+
+`<study_root>/<STUDY_ID>/CHECKPOINTS.sequence.json` binds the monotone
+Checkpoint high-water mark and latest Checkpoint digest. Validation and active
+context generation reject a missing, renamed, truncated, rolled-back, or
+unindexed Checkpoint chain; the next ID is derived from this authority rather
+than from whichever files remain visible.
+
 When a Run uses newly changed scientific-critical code, pass `--changed-path PATH` and/or `--scientific-critical` to `studyctl run`; pass `--shared-across-runs` when the implementation is being reused. These declarations are sealed as formalization context. `studyctl` independently derives critical paths from the actual Git changes, so omitting a declaration cannot bypass a required METHOD or CHANGESET.
 
 Formal inventory includes current regular files below `formal/`; superseded `changeset-history/` records remain historical provenance and never re-enter active context. Known policy artifacts use their stricter readiness checks; an additional JSON artifact is active only with `"status": "active"` or `"finalized"`, and an additional Markdown artifact (for example `MODEL.md`) uses a `Status: active` or `Status: finalized` line. Other current files remain visible as stale/draft inventory.
@@ -398,10 +451,86 @@ python -m tools.studyctl profile-validate
 python -m tools.studyctl validate-changes SC-0001  # when host code/tests changed
 python -m tools.studyctl check-changes SC-0001
 python -m tools.studyctl validate SC-0001
+python -m tools.studyctl context SC-0001
 python -m tools.studyctl status SC-0001
 ```
 
-`profile-validate` checks repository adaptation. `validate-changes` executes and pins the host validation contract. `check-changes` regenerates `generated/CHANGES.json` from Git. `validate` checks schemas, IDs, immutable digests, approval freshness, references, profile/CHANGESET/validation state, actual change scope, Run dependency integrity and eligibility, Cohort compatibility, Checkpoint links, and Verdict structure. `status` regenerates `generated/STATUS.md`; generated files are projections and are never authoritative.
+`profile-validate` checks repository adaptation. `validate-changes` executes and pins the host validation contract. `check-changes` regenerates `generated/CHANGES.json` from Git. `validate` checks schemas, IDs, immutable digests, approval freshness, references, profile/CHANGESET/validation state, actual change scope, Run dependency integrity and eligibility, Cohort compatibility, Checkpoint links, and Verdict structure. `context` regenerates the bounded `generated/ACTIVE_CONTEXT.json` selector; `status` regenerates `generated/STATUS.md`. Generated files are projections and are never authoritative.
+
+### Bounded active context and automatic compaction pressure
+
+The current working set is a projection, not the whole Study history. After
+validation, run `studyctl context` and start from
+`generated/ACTIVE_CONTEXT.json`. It contains only bounded locators for
+Frontier-selected Claims and the Frontier itself: IDs, short previews, counts,
+and content hashes rather than full semantic payloads. The approved Brief,
+active formal artifacts, and latest Checkpoint are represented by
+path/hash/size and compact count summaries. Inspect only the authoritative
+source sections or IDs needed by the current question. Load older Runs,
+Evidence, Checkpoints, retired Claims, or work notes only by an explicit ID or
+question. `STATUS.md` is a bounded human-facing projection, not the default
+machine context.
+
+Claims have two orthogonal states. `state` records epistemic support, while
+`lifecycle` records whether the Claim is `active`, `retired`, or `superseded`.
+Only active Claims may appear in the Frontier. Retirement and supersession are
+provisional edits until the next immutable Checkpoint seals them; after that
+boundary they are terminal. A replacement receives a new Claim ID and the old
+Claim records `superseded_by`, and every supersession chain must end at an
+active Claim. Legacy Claims without a lifecycle are interpreted as active, but
+schema-V2 Claims must make the lifecycle explicit.
+
+Claims schema V1 is retained only so historical bytes can still be validated
+and audited. Because V1 had no structural size limits, it is never accepted as
+active context: `context`, Run/Evidence growth, review-packet generation and
+compaction preparation fail closed, while `status` emits only a bounded
+migration notice. Migration is deliberately semantic rather than automatic:
+
+1. preserve and commit the exact V1 `CLAIMS.json` (or otherwise pin its hash);
+2. inspect Claims by selected ID and decide which remain active, which are
+   retired, and which are superseded;
+3. construct a schema-V2 `CLAIMS.json` with a small Frontier, bounded current
+   questions/actions, explicit lifecycles, and no silently discarded Claim;
+4. keep omitted historical content recoverable from Git or an immutable
+   archived source, then run `validate`, `context`, and `status`.
+
+The CLI cannot choose those lifecycle or scientific-meaning decisions, so it
+does not provide an automatic truncating migrator. An ID-less resolver reports
+the Study as migration-required instead of allocating a replacement Study.
+
+`policy.json` defines soft and hard thresholds for active, total-authoritative,
+and terminal Claims; `CLAIMS.json` bytes; Frontier questions/actions/decisions;
+serialized active-selector size; Runs and Evidence since the latest Checkpoint;
+and files/bytes under `work/active/`. `status`
+reports every observed value and threshold. Soft pressure deterministically
+requests semantic compaction. Hard pressure prevents another Run, Evidence
+draft, or review packet, while validation, status, `compact-prepare`, and
+`compact-finalize` remain usable so the Study cannot self-lock. The trigger is
+automatic; choosing what the science means remains an Agent/reviewer judgment.
+
+`status` and `context` also write `generated/COMPACTION_DUE.json`. Run and
+Evidence preflights persist the projected advisory in a repository-external
+runtime cache, so crossing a soft threshold becomes visible without dirtying
+the scientific Git worktree.
+
+Each new Checkpoint stores only Frontier-selected active Claim snapshots,
+compact content-addressed references for non-Frontier Claims, and watermarks
+that reset Run/Evidence pressure. `compact-prepare` includes only the latest
+Checkpoint reference, never every historical Frontier.
+
+After a Checkpoint seals `retired` or `superseded` Claims, a later semantic
+compaction may remove those terminal records from the current `CLAIMS.json`.
+Finalization first writes each non-Frontier Claim once as an immutable,
+content-addressed full record under `checkpoints/claim-records/`; the Checkpoint
+pins its path, canonical hash, lifecycle, state, and replacement link.
+Validation requires the exact content-addressed path, the complete applicable
+Claim Schema, a read-only single-link regular file, and immutable full content
+after a terminal lifecycle is sealed. It reconstructs historical supersession
+chains from current and archived Claims, and requires every chain to end at an
+active Claim. A missing, redirected, altered, or tail-truncated record is
+rejected. Archived Claim references remain part of GC reachability. This is how
+total/terminal Claim pressure can fall without losing semantic history; the CLI
+never chooses which Claims to retire or remove.
 
 ## Compaction is not garbage collection
 
@@ -409,12 +538,30 @@ Compaction keeps active context finite while preserving all history. It updates 
 
 ```bash
 python -m tools.studyctl compact-prepare SC-0001
-# Use the repository research-compaction skill to update Evidence/Claims and write the plan.
+# Use research-compaction to update Evidence/Claims, then rerun compact-prepare
+# before binding the final plan to the current hashes.
 python -m tools.studyctl compact-finalize SC-0001 \
   --plan studies/SC-0001/work/COMPACTION_PLAN.json
 ```
 
-The plan must match `scientific-workflow/schemas/compaction-plan.schema.json`, live outside `work/active/`, and pin the current compaction-input, Claims and Evidence hashes. Finalization also rechecks the repository-profile hash, consequential host-scope fingerprint, and complete `work/active/` inventory; drift requires a new prepare step.
+The plan must match `scientific-workflow/schemas/compaction-plan.schema.json`, live outside `work/active/`, and pin the current compaction-input, Claims hash, and constant-size Evidence inventory binding (`total_count` plus the canonical full `inventory_sha256`). It never copies the complete Evidence path/hash map. Finalization recomputes that binding and also rechecks the repository-profile hash, consequential host-scope fingerprint/count, and complete `work/active/` inventory; drift requires a new prepare step.
+
+`COMPACTION_INPUT.json` does not copy an unbounded history into the Agent
+context. Collections that can grow with Runs, Evidence, Cohorts, formal
+artifacts, failed directions, or `work/active/` are bounded indexes. Each index
+contains a deterministic `items` batch plus `total_count`, `selected_count`,
+`truncated`, and an `inventory_sha256` over the complete ordered inventory.
+The same locator rule applies to current Claims, the Frontier, consequential
+host paths, and the lower-assurance pre-ledger Manifest inventory: their source
+path, size, revision, counts, and full hashes remain bound without embedding
+the complete scientific text or historical map.
+The selected batch is navigation, not authority: when `truncated` is true,
+inspect source records by the current question, compact one relevant batch,
+finalize, and prepare again. Finalization recomputes the complete
+`work/active/` inventory hash, so changing an entry omitted from `items` still
+invalidates the prepared plan. Compaction archives only explicitly selected
+scratch files and never deletes historical Runs, Evidence, Claims, or output
+objects.
 
 Garbage collection is storage triage. V2 still only reports candidates and never deletes:
 
@@ -470,5 +617,25 @@ The migration rejects V3 Runs, gaps, an empty history, or an existing ledger.
 It cannot prove from local files alone that a continuous tail was never deleted
 before migration; use Git, backups, scheduler records, or another external
 append-only anchor to establish that historical premise.
+
+A pre-sequence Evidence history has the analogous explicit migration:
+
+```bash
+python -m tools.studyctl migrate-evidence-sequence SC-0001
+```
+
+It validates canonical continuous versions and Checkpoint watermarks before
+creating the monotone counter. Its origin record states the unavoidable lower
+assurance for deletions that may have happened before migration.
+
+A pre-sequence Checkpoint history uses the separate explicit migration:
+
+```bash
+python -m tools.studyctl migrate-checkpoint-sequence SC-0001
+```
+
+It accepts only the currently visible, schema-valid, digest-valid, contiguous
+chain from `CHECKPOINT-000001`. Its origin explicitly records that deletion
+before sequence initialization cannot be disproved from local files alone.
 
 The current implementation cannot automatically classify a process killed by `SIGKILL` or power loss. A crash before launch leaves a never-reused ledger reservation; a crash after launch authorization leaves the `running` Manifest and reservation. Both fail closed until explicit recovery. A terminal Manifest may be durable before its matching ledger update; the next locked registration can reconcile that one-way transition, while a missing Manifest always blocks rather than guessing. The workflow also cannot prove human identity cryptographically, and checks only that a Cohort compatibility justification exists—not whether its scientific argument is sound. Local SHA-256 digests detect inconsistent bytes but are not authenticated signatures or an external rollback anchor; an actor who can replace an entire Study and all of its history is outside this local protocol. Filesystem checks still have an unavoidable time-of-check/time-of-use race against a malicious concurrent local process. GPU-hour and CPU-hour values remain self-reported reservations: their cumulative limits are enforced, but arbitrary schedulers are not independently metered. Declared-output storage is measured after execution. Git detects committed, staged, unstaged, and untracked repository paths, while external and dynamically resolved inputs still must be declared with `--input`. Project hooks remain small guardrails, not a complete security boundary; repository-profile validation, actual-diff checks, immutable snapshots, tests, clean review context, and human review are the enforcement layers.

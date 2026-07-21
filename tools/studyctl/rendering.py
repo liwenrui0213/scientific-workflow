@@ -4,6 +4,12 @@ from pathlib import Path
 import re
 from typing import Any, Iterable
 
+from .active_context import (
+    active_claims,
+    compaction_pressure,
+    refresh_active_projection,
+    write_active_selector,
+)
 from .budget import (
     budget_projection,
     budget_totals_from_manifests,
@@ -12,7 +18,7 @@ from .budget import (
 )
 from .formalization import artifact_ready, collect_formalization_debt, load_policy
 from .hashing import atomic_write_bytes, load_json, sha256_file
-from .models import StudyPaths, ValidationError, WorkflowError
+from .models import CLAIMS_SCHEMA_VERSION, StudyPaths, ValidationError, WorkflowError
 from .run_ledger import (
     bootstrap_or_reconcile_ledger,
     ledger_commitment_totals,
@@ -243,12 +249,60 @@ def _append_items(lines: list[str], items: Iterable[str], empty: str = "None rec
         lines.append(f"- {item}")
 
 
+def _render_historical_claims_status(
+    paths: StudyPaths,
+    claims_data: dict[str, Any],
+    validation_issues: list[Any],
+) -> Path:
+    """Render a bounded migration notice without expanding legacy V1 content."""
+
+    claims = claims_data.get("claims")
+    frontier = claims_data.get("frontier")
+    claim_count = len(claims) if isinstance(claims, list) else 0
+    frontier_ids = (
+        frontier.get("claim_ids", []) if isinstance(frontier, dict) else []
+    )
+    frontier_count = len(frontier_ids) if isinstance(frontier_ids, list) else 0
+    error_count = sum(item.level == "ERROR" for item in validation_issues)
+    warning_count = sum(item.level == "WARNING" for item in validation_issues)
+    lines = [
+        f"# Study Status: {paths.study_id}",
+        "",
+        "## Active Context Migration Required",
+        "",
+        f"- Claims schema version: `{claims_data.get('schema_version')!r}`",
+        f"- Required active schema version: `{CLAIMS_SCHEMA_VERSION}`",
+        f"- Authoritative Claims path: `{paths.claims.relative_to(paths.root).as_posix()}`",
+        f"- Authoritative Claims bytes: {paths.claims.stat().st_size}",
+        f"- Authoritative Claims SHA-256: `{sha256_file(paths.claims)}`",
+        f"- Historical Claim count: {claim_count}",
+        f"- Historical Frontier count: {frontier_count}",
+        f"- Validation summary: {error_count} error(s), {warning_count} warning(s)",
+        "",
+        "This historical Claims format is validation-only because it has no "
+        "structural context bounds. Active context, Runs, Evidence, review, "
+        "and compaction finalization remain blocked until a deliberate semantic "
+        "migration produces a bounded current CLAIMS.json. Preserve the old "
+        "bytes in version history; do not truncate scientific content silently.",
+    ]
+    output = paths.generated / "STATUS.md"
+    atomic_write_bytes(output, ("\n".join(lines) + "\n").encode("utf-8"))
+    return output
+
+
 def render_status(paths: StudyPaths) -> Path:
     validation_issues = validate_study(paths)
     authority_errors = [item for item in validation_issues if item.level == "ERROR"]
     authority_warnings = [item for item in validation_issues if item.level == "WARNING"]
     claims_data = _load_claims(paths)
-    claims = claims_data.get("claims", [])
+    if claims_data.get("schema_version") != CLAIMS_SCHEMA_VERSION:
+        return _render_historical_claims_status(
+            paths,
+            claims_data,
+            validation_issues,
+        )
+    all_claims = claims_data.get("claims", [])
+    claims = active_claims(claims_data)
     frontier = claims_data.get("frontier", {})
     evidence_load_error: str | None = None
     try:
@@ -274,6 +328,7 @@ def render_status(paths: StudyPaths) -> Path:
 
     supporting_keys: list[tuple[str, int]] = []
     contradictory_keys: list[tuple[str, int]] = []
+    other_keys: list[tuple[str, int]] = []
     scientific_chain_valid = not any(
         str(item.path).startswith(str(paths.claims))
         or f"{paths.study / 'evidence'}/" in str(item.path)
@@ -284,12 +339,48 @@ def render_status(paths: StudyPaths) -> Path:
         for claim in claims:
             supporting_keys.extend(_evidence_ref_key(ref) for ref in claim.get("supporting_evidence", []))
             contradictory_keys.extend(_evidence_ref_key(ref) for ref in claim.get("contradictory_evidence", []))
+            other_keys.extend(
+                _evidence_ref_key(ref) for ref in claim.get("other_evidence", [])
+            )
     supporting_keys = list(dict.fromkeys(supporting_keys))
     contradictory_keys = list(dict.fromkeys(contradictory_keys))
+    other_keys = list(dict.fromkeys(other_keys))
 
     debt = collect_formalization_debt(paths)
     budget = _budget_state(paths, runs)
     checkpoint = _latest_checkpoint(paths)
+    pressure_error: str | None = None
+    try:
+        pressure = compaction_pressure(
+            paths,
+            claims_data=claims_data,
+            runs=runs,
+            evidence=evidence,
+        )
+    except (ValidationError, WorkflowError, OSError, ValueError) as exc:
+        pressure = {
+            "level": "invalid",
+            "compaction_due": False,
+            "growth_blocked": False,
+            "metrics": [],
+            "reasons": [],
+        }
+        pressure_error = str(exc)
+    selector_error: str | None = None
+    try:
+        if pressure_error is None:
+            selector_path, compaction_due_path = refresh_active_projection(
+                paths,
+                claims_data=claims_data,
+                pressure=pressure,
+            )
+        else:
+            selector_path = write_active_selector(paths, claims_data=claims_data)
+            compaction_due_path = paths.generated / "COMPACTION_DUE.json"
+    except (ValidationError, WorkflowError, OSError, ValueError) as exc:
+        selector_path = paths.generated / "ACTIVE_CONTEXT.json"
+        compaction_due_path = paths.generated / "COMPACTION_DUE.json"
+        selector_error = str(exc)
     try:
         from .workspace import evaluate_changes, repository_profile_path
 
@@ -394,12 +485,20 @@ def render_status(paths: StudyPaths) -> Path:
 
     lines.extend(["", "## Current Claims", ""])
     if claims:
-        lines.extend(["| Claim | State | Statement |", "|---|---|---|"])
+        lines.extend(["| Claim | Lifecycle | State | Statement |", "|---|---|---|---|"])
         for claim in claims:
             statement = str(claim.get("statement", "")).replace("|", "\\|").replace("\n", " ")
-            lines.append(f"| `{claim.get('claim_id')}` | `{claim.get('state')}` | {statement} |")
+            lines.append(
+                f"| `{claim.get('claim_id')}` | "
+                f"`{claim.get('lifecycle', 'active')}` | "
+                f"`{claim.get('state')}` | {statement} |"
+            )
     else:
-        lines.append("No Claims recorded.")
+        lines.append("No Frontier-selected Claims recorded.")
+    lines.append(
+        f"- Frontier-selected Claims: {len(claims)}; "
+        f"non-Frontier Claims retained by authority: {max(len(all_claims) - len(claims), 0)}"
+    )
 
     lines.extend(["", "## Current Frontier", ""])
     lines.append(str(frontier.get("summary") or "No Frontier summary recorded."))
@@ -412,18 +511,39 @@ def render_status(paths: StudyPaths) -> Path:
     for key in supporting_keys[-10:]:
         record = evidence.get(key)
         if record:
-            _, item = record
-            decisive_rows.append(f"`{key[0]}` v{key[1]} — {item.get('assessment')} — scope: {item.get('scope')}")
+            source, item = record
+            decisive_rows.append(
+                f"`{key[0]}` v{key[1]} — `{item.get('assessment')}` — "
+                f"source: `{source.relative_to(paths.root).as_posix()}` — "
+                f"SHA-256: `{sha256_file(source)}`"
+            )
     _append_items(lines, decisive_rows)
 
     lines.extend(["", "## Contradictory Evidence", ""])
     contradictory_rows: list[str] = []
-    for key in contradictory_keys:
+    for key in contradictory_keys[-10:]:
         record = evidence.get(key)
         if record:
-            _, item = record
-            contradictory_rows.append(f"`{key[0]}` v{key[1]} — {item.get('assessment')} — scope: {item.get('scope')}")
+            source, item = record
+            contradictory_rows.append(
+                f"`{key[0]}` v{key[1]} — `{item.get('assessment')}` — "
+                f"source: `{source.relative_to(paths.root).as_posix()}` — "
+                f"SHA-256: `{sha256_file(source)}`"
+            )
     _append_items(lines, contradictory_rows)
+
+    lines.extend(["", "## Other Active Evidence", ""])
+    other_rows: list[str] = []
+    for key in other_keys[-10:]:
+        record = evidence.get(key)
+        if record:
+            source, item = record
+            other_rows.append(
+                f"`{key[0]}` v{key[1]} — `{item.get('assessment')}` — "
+                f"source: `{source.relative_to(paths.root).as_posix()}` — "
+                f"SHA-256: `{sha256_file(source)}`"
+            )
+    _append_items(lines, other_rows)
 
     lines.extend(["", "## Open Questions", ""])
     _append_items(lines, frontier.get("open_questions", []))
@@ -433,6 +553,42 @@ def render_status(paths: StudyPaths) -> Path:
         lines,
         [f"`{item.get('level')}` — {item.get('artifact')}: {item.get('reason')}" for item in debt],
     )
+
+    lines.extend(["", "## Active Context and Compaction Pressure", ""])
+    if selector_error:
+        lines.append(f"- Active selector: **INVALID** — {selector_error}")
+    else:
+        lines.extend(
+            [
+                f"- Active selector: `{selector_path.relative_to(paths.root).as_posix()}`",
+                f"- Active selector bytes: {selector_path.stat().st_size}",
+                f"- Compaction advisory: `{compaction_due_path.relative_to(paths.root).as_posix()}`",
+            ]
+        )
+    if pressure_error:
+        lines.append(f"- Pressure state: **INVALID** — {pressure_error}")
+    else:
+        lines.append(f"- Pressure level: **{str(pressure['level']).upper()}**")
+        lines.append(
+            "- Growth gate: **BLOCKED** for the next Run, new Evidence, and review"
+            if pressure["growth_blocked"]
+            else "- Growth gate: open"
+        )
+        lines.extend(
+            [
+                "",
+                "| Metric | Observed | Soft | Hard | Level |",
+                "|---|---:|---:|---:|---|",
+            ]
+        )
+        for metric in pressure["metrics"]:
+            lines.append(
+                f"| `{metric['name']}` | {metric['observed']} | "
+                f"{metric['soft']} | {metric['hard']} | `{metric['level']}` |"
+            )
+        if pressure["reasons"]:
+            lines.append("")
+            _append_items(lines, pressure["reasons"])
 
     lines.extend(
         [
@@ -484,6 +640,17 @@ def render_status(paths: StudyPaths) -> Path:
         )
     if authority_warnings:
         attention.append("Review deterministic validation warnings before claiming reproducibility.")
+    if pressure_error:
+        attention.append("Repair the compaction-pressure policy or source state before further growth.")
+    elif pressure["growth_blocked"]:
+        attention.append(
+            "Compaction pressure is HARD: perform semantic compaction "
+            "before the next Run, new Evidence, or scientific review."
+        )
+    elif pressure["compaction_due"]:
+        attention.append(
+            "Compaction pressure is SOFT: plan semantic compaction before a hard growth gate."
+        )
     if change_scope.get("outcome") in {"BLOCKED", "INVALID"}:
         attention.append(
             "Resolve repository change-scope violations before recording an Evidence-eligible Run."

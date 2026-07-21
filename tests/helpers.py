@@ -113,7 +113,13 @@ class WorkflowTestCase(unittest.TestCase):
         )
         paths.brief.write_text(text, encoding="utf-8")
 
-    def add_proposed_claim(self, paths: StudyPaths, claim_id: str = "CLAIM-0001") -> dict[str, Any]:
+    def add_proposed_claim(
+        self,
+        paths: StudyPaths,
+        claim_id: str = "CLAIM-0001",
+        *,
+        lifecycle: str | None = None,
+    ) -> dict[str, Any]:
         claims = load_json(paths.claims)
         claim = {
             "claim_id": claim_id,
@@ -127,6 +133,7 @@ class WorkflowTestCase(unittest.TestCase):
             "limitations": [],
             "updated_at": utc_now(),
         }
+        claim["lifecycle"] = lifecycle or "active"
         claims["claims"].append(claim)
         claims["frontier"]["claim_ids"].append(claim_id)
         claims["frontier"]["summary"] = "Test the deterministic fixture Claim."

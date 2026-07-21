@@ -33,6 +33,7 @@
           },
           "skill": {
             "enum": [
+              null,
               "bootstrap-scientific-workflow",
               "start-scientific-study",
               "scientific-study",

@@ -5,20 +5,20 @@
   "type": "object",
   "required": ["schema_version", "study_id", "revision", "updated_at", "claims", "frontier", "formalization_debt"],
   "properties": {
-    "schema_version": {"const": 1},
-    "study_id": {"type": "string", "pattern": "^SC-[0-9]{4,}$"},
+    "schema_version": {"const": 2},
+    "study_id": {"type": "string", "pattern": "^SC-[0-9]{4,}$", "maxLength": 64},
     "revision": {"type": "integer", "minimum": 1},
-    "updated_at": {"type": "string", "minLength": 1},
-    "claims": {"type": "array", "items": {"$ref": "#/$defs/claim"}},
+    "updated_at": {"type": "string", "minLength": 1, "maxLength": 64},
+    "claims": {"type": "array", "maxItems": 256, "items": {"$ref": "#/$defs/claim"}},
     "frontier": {"$ref": "#/$defs/frontier"},
-    "formalization_debt": {"type": "array", "items": {"$ref": "#/$defs/debt"}}
+    "formalization_debt": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/debt"}}
   },
   "$defs": {
     "evidence_ref": {
       "type": "object",
       "required": ["evidence_id", "version", "sha256"],
       "properties": {
-        "evidence_id": {"type": "string", "pattern": "^EVID-[0-9]{4,}$"},
+        "evidence_id": {"type": "string", "pattern": "^EVID-[0-9]{4,}$", "maxLength": 64},
         "version": {"type": "integer", "minimum": 1},
         "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
       },
@@ -27,20 +27,22 @@
     "claim": {
       "type": "object",
       "required": [
-        "claim_id", "statement", "scope", "state", "supporting_evidence",
+        "claim_id", "statement", "scope", "state", "lifecycle", "supporting_evidence",
         "contradictory_evidence", "other_evidence", "uncertainty", "limitations", "updated_at"
       ],
       "properties": {
-        "claim_id": {"type": "string", "pattern": "^CLAIM-[0-9]{4,}$"},
-        "statement": {"type": "string", "minLength": 1},
-        "scope": {"type": ["string", "null"]},
+        "claim_id": {"type": "string", "pattern": "^CLAIM-[0-9]{4,}$", "maxLength": 64},
+        "statement": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "scope": {"type": ["string", "null"], "maxLength": 4096},
         "state": {"enum": ["proposed", "under_test", "partially_supported", "numerically_supported", "contradicted", "inconclusive"]},
-        "supporting_evidence": {"type": "array", "items": {"$ref": "#/$defs/evidence_ref"}},
-        "contradictory_evidence": {"type": "array", "items": {"$ref": "#/$defs/evidence_ref"}},
-        "other_evidence": {"type": "array", "items": {"$ref": "#/$defs/evidence_ref"}},
-        "uncertainty": {"type": ["string", "null"]},
-        "limitations": {"type": "array", "items": {"type": "string"}},
-        "updated_at": {"type": "string", "minLength": 1}
+        "lifecycle": {"enum": ["active", "retired", "superseded"]},
+        "superseded_by": {"type": ["string", "null"], "pattern": "^CLAIM-[0-9]{4,}$", "maxLength": 64},
+        "supporting_evidence": {"type": "array", "maxItems": 64, "uniqueItems": true, "items": {"$ref": "#/$defs/evidence_ref"}},
+        "contradictory_evidence": {"type": "array", "maxItems": 64, "uniqueItems": true, "items": {"$ref": "#/$defs/evidence_ref"}},
+        "other_evidence": {"type": "array", "maxItems": 64, "uniqueItems": true, "items": {"$ref": "#/$defs/evidence_ref"}},
+        "uncertainty": {"type": ["string", "null"], "maxLength": 4096},
+        "limitations": {"type": "array", "maxItems": 32, "items": {"type": "string", "maxLength": 1024}},
+        "updated_at": {"type": "string", "minLength": 1, "maxLength": 64}
       },
       "additionalProperties": false
     },
@@ -48,11 +50,11 @@
       "type": "object",
       "required": ["summary", "claim_ids", "open_questions", "next_actions", "human_decisions_required"],
       "properties": {
-        "summary": {"type": ["string", "null"]},
-        "claim_ids": {"type": "array", "items": {"type": "string", "pattern": "^CLAIM-[0-9]{4,}$"}},
-        "open_questions": {"type": "array", "items": {"type": "string"}},
-        "next_actions": {"type": "array", "items": {"type": "string"}},
-        "human_decisions_required": {"type": "array", "items": {"type": "string"}}
+        "summary": {"type": ["string", "null"], "maxLength": 4096},
+        "claim_ids": {"type": "array", "maxItems": 64, "uniqueItems": true, "items": {"type": "string", "pattern": "^CLAIM-[0-9]{4,}$", "maxLength": 64}},
+        "open_questions": {"type": "array", "maxItems": 64, "items": {"type": "string", "maxLength": 1024}},
+        "next_actions": {"type": "array", "maxItems": 64, "items": {"type": "string", "maxLength": 1024}},
+        "human_decisions_required": {"type": "array", "maxItems": 32, "items": {"type": "string", "maxLength": 1024}}
       },
       "additionalProperties": false
     },
@@ -60,11 +62,11 @@
       "type": "object",
       "required": ["debt_id", "level", "artifact", "reason", "source_refs"],
       "properties": {
-        "debt_id": {"type": "string", "minLength": 1},
+        "debt_id": {"type": "string", "minLength": 1, "maxLength": 128},
         "level": {"enum": ["advisory", "required_before_expensive_run", "required_before_evidence", "required_before_review", "blocking_now"]},
         "artifact": {"enum": ["METHOD", "PROTOCOL", "EVALUATOR", "PLAN", "BRIEF"]},
-        "reason": {"type": "string", "minLength": 1},
-        "source_refs": {"type": "array", "items": {"type": "string"}}
+        "reason": {"type": "string", "minLength": 1, "maxLength": 2048},
+        "source_refs": {"type": "array", "maxItems": 32, "items": {"type": "string", "maxLength": 1024}}
       },
       "additionalProperties": false
     }

@@ -9,12 +9,22 @@ import re
 import stat
 from typing import Any, Iterable, Iterator
 
+from .active_context import CLAIM_LIFECYCLES, claim_lifecycle
 from .budget import (
     budget_projection,
     manifest_budget_commitment,
     parse_brief_hard_budget,
 )
+from .checkpoint_sequence import (
+    checkpoint_sequence_temporary_paths,
+    load_checkpoint_sequence,
+)
+from .evidence_sequence import (
+    evidence_sequence_temporary_paths,
+    load_evidence_sequence,
+)
 from .hashing import (
+    canonical_json_bytes,
     load_json,
     nested_record_digest,
     record_digest,
@@ -22,6 +32,8 @@ from .hashing import (
     sha256_json,
 )
 from .models import (
+    CHECKPOINT_SCHEMA_VERSION,
+    CLAIMS_SCHEMA_VERSION,
     CLAIM_STATES,
     ID_PATTERNS,
     StudyPaths,
@@ -59,6 +71,22 @@ SCHEMA_FILES = {
     "repository_profile": "repository-profile.schema.json",
     "changeset": "changeset.schema.json",
     "change_validation": "change-validation.schema.json",
+}
+
+VERSIONED_SCHEMA_FILES = {
+    "claims": {
+        1: "claims-v1.schema.json",
+        CLAIMS_SCHEMA_VERSION: SCHEMA_FILES["claims"],
+    },
+    "checkpoint": {
+        1: "checkpoint-v1.schema.json",
+        CHECKPOINT_SCHEMA_VERSION: SCHEMA_FILES["checkpoint"],
+    },
+}
+
+CHECKPOINT_CLAIMS_SCHEMA_VERSIONS = {
+    1: 1,
+    CHECKPOINT_SCHEMA_VERSION: CLAIMS_SCHEMA_VERSION,
 }
 
 _RUN_V2_TOP_LEVEL_KEYS = {
@@ -181,16 +209,28 @@ def _run_v1_shape_messages(value: dict[str, Any]) -> list[str]:
     ]
 
 
-def schema_path(root: Path, name: str) -> Path:
-    try:
-        filename = SCHEMA_FILES[name]
-    except KeyError as exc:
-        raise ValidationError(f"unknown schema: {name}") from exc
+def schema_path(root: Path, name: str, *, version: int | None = None) -> Path:
+    if version is None:
+        try:
+            filename = SCHEMA_FILES[name]
+        except KeyError as exc:
+            raise ValidationError(f"unknown schema: {name}") from exc
+    else:
+        versions = VERSIONED_SCHEMA_FILES.get(name)
+        if versions is None:
+            raise ValidationError(f"schema {name} does not support version selection")
+        filename = versions.get(version)
+        if filename is None:
+            raise ValidationError(
+                f"unsupported {name} schema_version: {version!r}"
+            )
     return root / "scientific-workflow" / "schemas" / filename
 
 
-def load_schema(root: Path, name: str) -> dict[str, Any]:
-    value = load_json(schema_path(root, name))
+def load_schema(
+    root: Path, name: str, *, version: int | None = None
+) -> dict[str, Any]:
+    value = load_json(schema_path(root, name, version=version))
     if not isinstance(value, dict):
         raise ValidationError(f"schema {name} is not an object")
     return value
@@ -242,6 +282,35 @@ def validate_schema_instance(
         return validate_schema_instance(value, target, root_schema=root, location=location)
 
     messages: list[str] = []
+    maximum_canonical_bytes = schema.get("x-maxCanonicalBytes")
+    if maximum_canonical_bytes is not None:
+        if (
+            isinstance(maximum_canonical_bytes, bool)
+            or not isinstance(maximum_canonical_bytes, int)
+            or maximum_canonical_bytes < 0
+        ):
+            raise ValidationError(
+                f"{location}: schema x-maxCanonicalBytes must be a non-negative integer"
+            )
+        statuses = schema.get("x-maxCanonicalBytesStatuses")
+        enforce_size = statuses is None
+        if statuses is not None:
+            if not isinstance(statuses, list) or any(
+                not isinstance(item, str) for item in statuses
+            ):
+                raise ValidationError(
+                    f"{location}: schema x-maxCanonicalBytesStatuses must be a string array"
+                )
+            enforce_size = (
+                isinstance(value, dict) and value.get("status") in statuses
+            )
+        if enforce_size:
+            actual_bytes = len(canonical_json_bytes(value))
+            if actual_bytes > maximum_canonical_bytes:
+                messages.append(
+                    f"{location}: canonical JSON is {actual_bytes} bytes; "
+                    f"maximum is {maximum_canonical_bytes}"
+                )
     if "const" in schema and value != schema["const"]:
         messages.append(f"{location}: expected constant {schema['const']!r}")
     if "enum" in schema and value not in schema["enum"]:
@@ -285,6 +354,15 @@ def validate_schema_instance(
         minimum_items = schema.get("minItems")
         if minimum_items is not None and len(value) < minimum_items:
             messages.append(f"{location}: expected at least {minimum_items} item(s)")
+        maximum_items = schema.get("maxItems")
+        if maximum_items is not None and len(value) > maximum_items:
+            messages.append(f"{location}: expected at most {maximum_items} item(s)")
+        if schema.get("uniqueItems") is True:
+            for index, item in enumerate(value):
+                if any(item == previous for previous in value[:index]):
+                    messages.append(
+                        f"{location}[{index}]: duplicate array item is not allowed"
+                    )
         item_schema = schema.get("items")
         if isinstance(item_schema, dict):
             for index, item in enumerate(value):
@@ -298,6 +376,9 @@ def validate_schema_instance(
         minimum_length = schema.get("minLength")
         if minimum_length is not None and len(value) < minimum_length:
             messages.append(f"{location}: string is shorter than {minimum_length}")
+        maximum_length = schema.get("maxLength")
+        if maximum_length is not None and len(value) > maximum_length:
+            messages.append(f"{location}: string is longer than {maximum_length}")
         pattern = schema.get("pattern")
         if pattern is not None and re.fullmatch(pattern, value) is None:
             messages.append(f"{location}: value does not match {pattern!r}")
@@ -311,10 +392,19 @@ def validate_schema_instance(
 
 def schema_issues(root: Path) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
-    for name, filename in SCHEMA_FILES.items():
+    schema_variants: list[tuple[str, str, int | None]] = [
+        (name, filename, None) for name, filename in SCHEMA_FILES.items()
+    ]
+    schema_variants.extend(
+        (name, filename, version)
+        for name, versions in VERSIONED_SCHEMA_FILES.items()
+        for version, filename in versions.items()
+        if filename != SCHEMA_FILES[name]
+    )
+    for name, filename, version in schema_variants:
         path = root / "scientific-workflow" / "schemas" / filename
         try:
-            schema = load_schema(root, name)
+            schema = load_schema(root, name, version=version)
             if schema.get("$schema") != "https://json-schema.org/draft/2020-12/schema":
                 issues.append(ValidationIssue("ERROR", str(path), "unexpected or missing $schema"))
             for ref in _walk_values(schema):
@@ -339,7 +429,23 @@ def _walk_values(value: Any) -> Iterator[Any]:
 def object_schema_issues(
     root: Path, name: str, path: Path, value: Any
 ) -> list[ValidationIssue]:
-    schema = load_schema(root, name)
+    if name in VERSIONED_SCHEMA_FILES:
+        raw_version = value.get("schema_version") if isinstance(value, dict) else None
+        if (
+            isinstance(raw_version, bool)
+            or not isinstance(raw_version, int)
+            or raw_version not in VERSIONED_SCHEMA_FILES[name]
+        ):
+            return [
+                ValidationIssue(
+                    "ERROR",
+                    str(path),
+                    f"unsupported {name} schema_version: {raw_version!r}",
+                )
+            ]
+        schema = load_schema(root, name, version=raw_version)
+    else:
+        schema = load_schema(root, name)
     validation_value = value
     original_run_version = (
         value.get("schema_version")
@@ -596,7 +702,7 @@ def brief_text_issues(path: Path, text: str) -> list[ValidationIssue]:
 def brief_content_issues(paths: StudyPaths) -> list[ValidationIssue]:
     try:
         text = paths.brief.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeError) as exc:
         return [ValidationIssue("ERROR", str(paths.brief), f"cannot read Brief: {exc}")]
     return brief_text_issues(paths.brief, text)
 
@@ -796,7 +902,43 @@ def run_ledger_issues(
                     "Run ledger is stale relative to visible immutable Manifests",
                 )
             ]
-        return []
+        issues: list[ValidationIssue] = []
+        previous_watermark = 0
+        high_water_mark = int(current["high_water_mark"])
+        for checkpoint_path in checkpoint_paths(paths):
+            checkpoint = load_json(checkpoint_path)
+            if not isinstance(checkpoint, dict):
+                continue
+            watermarks = checkpoint.get("active_context_watermarks")
+            if not isinstance(watermarks, dict):
+                continue
+            watermark = watermarks.get("run_count")
+            if (
+                isinstance(watermark, bool)
+                or not isinstance(watermark, int)
+                or watermark < 0
+            ):
+                continue
+            if watermark < previous_watermark:
+                issues.append(
+                    ValidationIssue(
+                        "ERROR",
+                        str(checkpoint_path),
+                        "Checkpoint Run watermark regressed from "
+                        f"{previous_watermark} to {watermark}",
+                    )
+                )
+            if watermark > high_water_mark:
+                issues.append(
+                    ValidationIssue(
+                        "ERROR",
+                        str(path),
+                        "Run ledger high_water_mark is below Checkpoint "
+                        f"{checkpoint.get('checkpoint_id')} watermark {watermark}",
+                    )
+                )
+            previous_watermark = max(previous_watermark, watermark)
+        return issues
     except (ValidationError, WorkflowError, OSError, ValueError) as exc:
         return [ValidationIssue("ERROR", str(path), str(exc))]
 
@@ -811,6 +953,76 @@ def checkpoint_paths(paths: StudyPaths) -> list[Path]:
     if not paths.checkpoints.is_dir():
         return []
     return sorted(paths.checkpoints.glob("CHECKPOINT-*.json"))
+
+
+def checkpoint_sequence_issues(paths: StudyPaths) -> list[ValidationIssue]:
+    """Reject Checkpoint deletion, renaming, gaps, and tail rollback."""
+
+    issues = [
+        ValidationIssue(
+            "ERROR",
+            str(path),
+            "unfinished Checkpoint-sequence temporary file is present",
+        )
+        for path in checkpoint_sequence_temporary_paths(paths)
+    ]
+    try:
+        sequence = load_checkpoint_sequence(paths)
+        if sequence is None:
+            issues.append(
+                ValidationIssue(
+                    "ERROR",
+                    str(paths.checkpoint_sequence),
+                    "Checkpoint sequence is missing; Checkpoint history cannot be verified",
+                )
+            )
+            return issues
+        visible = checkpoint_paths(paths)
+        high_water_mark = int(sequence["high_water_mark"])
+        expected_names = [
+            f"CHECKPOINT-{number:06d}.json"
+            for number in range(1, high_water_mark + 1)
+        ]
+        actual_names = [path.name for path in visible]
+        if actual_names != expected_names:
+            issues.append(
+                ValidationIssue(
+                    "ERROR",
+                    str(paths.checkpoint_sequence),
+                    "visible Checkpoints do not match the monotone sequence; "
+                    "a Checkpoint may be missing, renamed, duplicated, or unindexed",
+                )
+            )
+        latest = sequence.get("latest_checkpoint")
+        if high_water_mark == 0:
+            if visible:
+                issues.append(
+                    ValidationIssue(
+                        "ERROR",
+                        str(paths.checkpoint_sequence),
+                        "Checkpoint sequence is empty but Checkpoint files exist",
+                    )
+                )
+        elif isinstance(latest, dict) and visible:
+            tail = load_json(visible[-1])
+            if not isinstance(tail, dict):
+                raise ValidationError("latest Checkpoint must be an object")
+            if (
+                latest.get("checkpoint_id") != tail.get("checkpoint_id")
+                or latest.get("sha256") != tail.get("checkpoint_sha256")
+            ):
+                issues.append(
+                    ValidationIssue(
+                        "ERROR",
+                        str(paths.checkpoint_sequence),
+                        "Checkpoint sequence tail binding does not match the latest Checkpoint",
+                    )
+                )
+    except (ValidationError, WorkflowError, OSError, ValueError) as exc:
+        issues.append(
+            ValidationIssue("ERROR", str(paths.checkpoint_sequence), str(exc))
+        )
+    return issues
 
 
 def evidence_index(paths: StudyPaths) -> dict[tuple[str, int], tuple[Path, dict[str, Any]]]:
@@ -1876,6 +2088,79 @@ def _ref_key(ref: dict[str, Any]) -> tuple[str, int]:
     return str(ref.get("evidence_id")), int(ref.get("version", 0))
 
 
+def evidence_sequence_issues(paths: StudyPaths) -> list[ValidationIssue]:
+    """Validate the durable Evidence creation high-water authority."""
+
+    issues = [
+        ValidationIssue(
+            "ERROR",
+            str(path),
+            "unfinished Evidence-sequence temporary file is present",
+        )
+        for path in evidence_sequence_temporary_paths(paths)
+    ]
+    try:
+        sequence = load_evidence_sequence(paths)
+        if sequence is None:
+            issues.append(
+                ValidationIssue(
+                    "ERROR",
+                    str(paths.evidence_sequence),
+                    "Evidence sequence is missing; creation history cannot be verified",
+                )
+            )
+            return issues
+        high_water_mark = int(sequence["high_water_mark"])
+        visible_record_count = len(evidence_paths(paths))
+        if high_water_mark < visible_record_count:
+            issues.append(
+                ValidationIssue(
+                    "ERROR",
+                    str(paths.evidence_sequence),
+                    "Evidence sequence high_water_mark is below the visible Evidence record count",
+                )
+            )
+        previous_watermark = 0
+        for checkpoint_path in checkpoint_paths(paths):
+            checkpoint = load_json(checkpoint_path)
+            if not isinstance(checkpoint, dict):
+                continue
+            watermarks = checkpoint.get("active_context_watermarks")
+            if not isinstance(watermarks, dict):
+                continue
+            watermark = watermarks.get("evidence_record_count")
+            if (
+                isinstance(watermark, bool)
+                or not isinstance(watermark, int)
+                or watermark < 0
+            ):
+                continue
+            if high_water_mark < watermark:
+                issues.append(
+                    ValidationIssue(
+                        "ERROR",
+                        str(paths.evidence_sequence),
+                        "Evidence sequence high_water_mark is below Checkpoint "
+                        f"{checkpoint.get('checkpoint_id')} watermark {watermark}",
+                    )
+                )
+            if watermark < previous_watermark:
+                issues.append(
+                    ValidationIssue(
+                        "ERROR",
+                        str(checkpoint_path),
+                        "Checkpoint Evidence watermark regressed from "
+                        f"{previous_watermark} to {watermark}",
+                    )
+                )
+            previous_watermark = max(previous_watermark, watermark)
+    except (ValidationError, WorkflowError, OSError, ValueError) as exc:
+        issues.append(
+            ValidationIssue("ERROR", str(paths.evidence_sequence), str(exc))
+        )
+    return issues
+
+
 def _claims_issues(
     paths: StudyPaths,
     evidence: dict[tuple[str, int], tuple[Path, dict[str, Any]]],
@@ -1890,13 +2175,60 @@ def _claims_issues(
         issues.extend(object_schema_issues(paths.root, "claims", paths.claims, claims_data))
         if claims_data.get("study_id") != paths.study_id:
             issues.append(ValidationIssue("ERROR", str(paths.claims), "study_id mismatch"))
+        if claims_data.get("schema_version") != CLAIMS_SCHEMA_VERSION:
+            issues.append(
+                ValidationIssue(
+                    "WARNING",
+                    str(paths.claims),
+                    "legacy Claims schema is historical-validation-only; "
+                    "migrate to bounded schema_version 2 before active research",
+                )
+            )
         claim_ids: set[str] = set()
+        claims_by_id: dict[str, dict[str, Any]] = {}
+        lifecycles: dict[str, str] = {}
         refs_by_claim: dict[str, dict[str, set[tuple[str, int]]]] = {}
         for claim in claims_data.get("claims", []):
+            if not isinstance(claim, dict):
+                issues.append(
+                    ValidationIssue(
+                        "ERROR", str(paths.claims), "CLAIMS.json contains a non-object Claim"
+                    )
+                )
+                continue
             claim_id = str(claim.get("claim_id", ""))
             if claim_id in claim_ids:
                 issues.append(ValidationIssue("ERROR", str(paths.claims), f"duplicate Claim ID: {claim_id}"))
             claim_ids.add(claim_id)
+            claims_by_id[claim_id] = claim
+            lifecycle = claim_lifecycle(claim)
+            lifecycles[claim_id] = lifecycle
+            superseded_by = claim.get("superseded_by")
+            if lifecycle not in CLAIM_LIFECYCLES:
+                issues.append(
+                    ValidationIssue(
+                        "ERROR",
+                        str(paths.claims),
+                        f"Claim {claim_id} has invalid lifecycle: {lifecycle!r}",
+                    )
+                )
+            elif lifecycle == "superseded":
+                if not isinstance(superseded_by, str) or not superseded_by:
+                    issues.append(
+                        ValidationIssue(
+                            "ERROR",
+                            str(paths.claims),
+                            f"superseded Claim {claim_id} requires superseded_by",
+                        )
+                    )
+            elif superseded_by is not None:
+                issues.append(
+                    ValidationIssue(
+                        "ERROR",
+                        str(paths.claims),
+                        f"Claim {claim_id} may set superseded_by only when lifecycle is superseded",
+                    )
+                )
             groups = {
                 "supporting": {_ref_key(ref) for ref in claim.get("supporting_evidence", [])},
                 "contradictory": {_ref_key(ref) for ref in claim.get("contradictory_evidence", [])},
@@ -1953,9 +2285,82 @@ def _claims_issues(
                 issues.append(ValidationIssue("ERROR", str(paths.claims), f"Claim {claim_id} state inconclusive requires Evidence"))
             if state not in CLAIM_STATES:
                 issues.append(ValidationIssue("ERROR", str(paths.claims), f"invalid agent Claim state: {state}"))
-        frontier_ids = set(claims_data.get("frontier", {}).get("claim_ids", []))
+        frontier = claims_data.get("frontier")
+        frontier_values = (
+            frontier.get("claim_ids", []) if isinstance(frontier, dict) else []
+        )
+        if not isinstance(frontier_values, list):
+            frontier_values = []
+        frontier_ids = set(frontier_values)
+        if len(frontier_values) != len(frontier_ids):
+            issues.append(
+                ValidationIssue(
+                    "ERROR", str(paths.claims), "Frontier repeats a Claim ID"
+                )
+            )
         for missing in sorted(frontier_ids - claim_ids):
             issues.append(ValidationIssue("ERROR", str(paths.claims), f"Frontier references missing Claim: {missing}"))
+        for claim_id in sorted(frontier_ids & claim_ids):
+            if lifecycles.get(claim_id) != "active":
+                issues.append(
+                    ValidationIssue(
+                        "ERROR",
+                        str(paths.claims),
+                        f"Frontier Claim {claim_id} must have active lifecycle",
+                    )
+                )
+        supersession_edges: dict[str, str] = {}
+        for claim_id, claim in claims_by_id.items():
+            if lifecycles.get(claim_id) != "superseded":
+                continue
+            target = claim.get("superseded_by")
+            if not isinstance(target, str):
+                continue
+            if target == claim_id:
+                issues.append(
+                    ValidationIssue(
+                        "ERROR",
+                        str(paths.claims),
+                        f"Claim {claim_id} cannot supersede itself",
+                    )
+                )
+            elif target not in claims_by_id:
+                issues.append(
+                    ValidationIssue(
+                        "ERROR",
+                        str(paths.claims),
+                        f"Claim {claim_id} superseded_by references missing Claim: {target}",
+                    )
+                )
+            else:
+                supersession_edges[claim_id] = target
+        for origin in sorted(supersession_edges):
+            seen: set[str] = set()
+            current = origin
+            cycle_found = False
+            while current in supersession_edges:
+                if current in seen:
+                    issues.append(
+                        ValidationIssue(
+                            "ERROR",
+                            str(paths.claims),
+                            f"Claim supersession cycle includes {origin}",
+                        )
+                    )
+                    cycle_found = True
+                    break
+                seen.add(current)
+                current = supersession_edges[current]
+            if not cycle_found and lifecycles.get(current) != "active":
+                issues.append(
+                    ValidationIssue(
+                        "ERROR",
+                        str(paths.claims),
+                        f"Claim supersession chain from {origin} must end at an "
+                        f"active Claim; {current} has lifecycle "
+                        f"{lifecycles.get(current)!r}",
+                    )
+                )
         for (evidence_id, version), (_, item) in evidence.items():
             if item.get("status") != "finalized":
                 continue
@@ -1973,19 +2378,218 @@ def _claims_issues(
         return issues, None
 
 
+def _checkpoint_claim_lifecycles(
+    item: dict[str, Any],
+) -> tuple[dict[str, tuple[str, str | None]], list[str], list[str]]:
+    states: dict[str, tuple[str, str | None]] = {}
+    snapshot_ids: list[str] = []
+    inactive_ids: list[str] = []
+    for claim in item.get("claims_snapshot", []):
+        if not isinstance(claim, dict) or not isinstance(claim.get("claim_id"), str):
+            continue
+        claim_id = str(claim["claim_id"])
+        snapshot_ids.append(claim_id)
+        target = claim.get("superseded_by")
+        states[claim_id] = (
+            claim_lifecycle(claim),
+            target if isinstance(target, str) else None,
+        )
+    for ref in item.get("inactive_claim_refs", []):
+        if not isinstance(ref, dict) or not isinstance(ref.get("claim_id"), str):
+            continue
+        claim_id = str(ref["claim_id"])
+        inactive_ids.append(claim_id)
+        target = ref.get("superseded_by")
+        states[claim_id] = (
+            str(ref.get("lifecycle", "")),
+            target if isinstance(target, str) else None,
+        )
+    return states, snapshot_ids, inactive_ids
+
+
+def _lifecycle_transition_message(
+    claim_id: str,
+    previous: tuple[str, str | None],
+    current: tuple[str, str | None],
+) -> str | None:
+    previous_lifecycle, previous_target = previous
+    current_lifecycle, current_target = current
+    if previous_lifecycle == "active":
+        return None
+    if current_lifecycle != previous_lifecycle:
+        return (
+            f"Claim {claim_id} lifecycle regressed or changed from "
+            f"{previous_lifecycle} to {current_lifecycle}"
+        )
+    if previous_lifecycle == "superseded" and current_target != previous_target:
+        return (
+            f"Claim {claim_id} changed superseded_by from "
+            f"{previous_target!r} to {current_target!r}"
+        )
+    return None
+
+
+def _checkpoint_claim_record_issues(
+    paths: StudyPaths,
+    checkpoint_path: Path,
+    ref: dict[str, Any],
+    claims_schema: dict[str, Any] | None,
+) -> tuple[list[ValidationIssue], dict[str, Any] | None]:
+    """Verify one content-addressed non-Frontier Claim record."""
+
+    issues: list[ValidationIssue] = []
+    raw = ref.get("record_path")
+    if not isinstance(raw, str) or not raw:
+        return issues, None  # The schema already reports the missing/invalid field.
+    lexical = Path(raw)
+    if lexical.is_absolute() or ".." in lexical.parts:
+        return [
+            ValidationIssue(
+                "ERROR",
+                str(checkpoint_path),
+                f"unsafe Checkpoint Claim record path: {raw!r}",
+            )
+        ], None
+    candidate = paths.root / lexical
+    records_root = paths.checkpoints / "claim-records"
+    claim_id = ref.get("claim_id")
+    advertised_digest = ref.get("sha256")
+    if isinstance(claim_id, str) and isinstance(advertised_digest, str):
+        expected_path = (
+            records_root / f"{claim_id}.{advertised_digest}.json"
+        ).relative_to(paths.root).as_posix()
+        if raw != expected_path:
+            issues.append(
+                ValidationIssue(
+                    "ERROR",
+                    str(checkpoint_path),
+                    "Checkpoint Claim record path is not the canonical content-addressed path: "
+                    f"{raw!r}",
+                )
+            )
+    try:
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(records_root.resolve(strict=True))
+    except (OSError, ValueError):
+        return issues + [
+            ValidationIssue(
+                "ERROR",
+                str(checkpoint_path),
+                f"Checkpoint Claim record is missing or outside claim-records: {raw!r}",
+            )
+        ], None
+    try:
+        metadata = candidate.lstat()
+    except OSError as exc:
+        return issues + [
+            ValidationIssue("ERROR", str(checkpoint_path), str(exc))
+        ], None
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        return issues + [
+            ValidationIssue(
+                "ERROR",
+                str(checkpoint_path),
+                f"Checkpoint Claim record must be a regular non-symlink file: {raw!r}",
+            )
+        ], None
+    if metadata.st_nlink != 1:
+        issues.append(
+            ValidationIssue(
+                "ERROR",
+                str(checkpoint_path),
+                f"Checkpoint Claim record must not be hard-linked: {raw!r}",
+            )
+        )
+    if metadata.st_mode & 0o222:
+        issues.append(
+            ValidationIssue(
+                "ERROR",
+                str(checkpoint_path),
+                f"Checkpoint Claim record must be sealed read-only: {raw!r}",
+            )
+        )
+    try:
+        claim = load_json(resolved)
+    except ValidationError as exc:
+        return issues + [ValidationIssue("ERROR", str(checkpoint_path), str(exc))], None
+    if not isinstance(claim, dict):
+        return issues + [
+            ValidationIssue(
+                "ERROR",
+                str(checkpoint_path),
+                f"Checkpoint Claim record must contain an object: {raw!r}",
+            )
+        ], None
+    if claims_schema is not None:
+        for message in validate_schema_instance(
+            claim,
+            claims_schema["$defs"]["claim"],
+            root_schema=claims_schema,
+            location=f"$.inactive_claim_refs[{claim_id!r}]",
+        ):
+            issues.append(ValidationIssue("ERROR", str(checkpoint_path), message))
+    digest = sha256_json(claim)
+    if digest != ref.get("sha256"):
+        issues.append(
+            ValidationIssue(
+                "ERROR",
+                str(checkpoint_path),
+                f"Checkpoint Claim record hash mismatch: {raw!r}",
+            )
+        )
+    expected_fields = {
+        "claim_id": claim.get("claim_id"),
+        "lifecycle": claim_lifecycle(claim),
+        "state": claim.get("state"),
+        "superseded_by": claim.get("superseded_by"),
+    }
+    for field, expected in expected_fields.items():
+        actual = ref.get(field)
+        if actual is None and expected is None:
+            continue
+        if actual != expected:
+            issues.append(
+                ValidationIssue(
+                    "ERROR",
+                    str(checkpoint_path),
+                    f"Checkpoint Claim record {field} mismatch for {raw!r}",
+                )
+            )
+    return issues, claim
+
+
 def _checkpoint_issues(
     paths: StudyPaths,
     evidence: dict[tuple[str, int], tuple[Path, dict[str, Any]]],
+    claims_data: dict[str, Any] | None = None,
 ) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
     previous: dict[str, Any] | None = None
-    claims_schema = load_schema(paths.root, "claims")
+    previous_claim_states: dict[str, tuple[str, str | None]] = {}
+    terminal_claim_states: dict[str, tuple[str, str | None]] = {}
+    terminal_claim_digests: dict[str, str] = {}
+    latest_known_claims: dict[str, dict[str, Any]] = {}
     for path in checkpoint_paths(paths):
         try:
             item = load_json(path)
             if not isinstance(item, dict):
                 raise ValidationError("Checkpoint must be an object")
             issues.extend(object_schema_issues(paths.root, "checkpoint", path, item))
+            raw_checkpoint_version = item.get("schema_version")
+            checkpoint_version = (
+                raw_checkpoint_version
+                if isinstance(raw_checkpoint_version, int)
+                and not isinstance(raw_checkpoint_version, bool)
+                else None
+            )
+            claims_version = CHECKPOINT_CLAIMS_SCHEMA_VERSIONS.get(
+                checkpoint_version
+            )
+            claims_schema = (
+                load_schema(paths.root, "claims", version=claims_version)
+                if claims_version is not None
+                else None
+            )
             checkpoint_id = str(item.get("checkpoint_id", ""))
             if item.get("study_id") != paths.study_id:
                 issues.append(
@@ -1997,21 +2601,125 @@ def _checkpoint_issues(
                 issues.append(ValidationIssue("ERROR", str(path), "Checkpoint filename does not match ID"))
             if item.get("checkpoint_sha256") != record_digest(item, "checkpoint_sha256"):
                 issues.append(ValidationIssue("ERROR", str(path), "checkpoint_sha256 does not match"))
-            for index, claim in enumerate(item.get("claims_snapshot", [])):
+            if claims_schema is not None:
+                for index, claim in enumerate(item.get("claims_snapshot", [])):
+                    for message in validate_schema_instance(
+                        claim,
+                        claims_schema["$defs"]["claim"],
+                        root_schema=claims_schema,
+                        location=f"$.claims_snapshot[{index}]",
+                    ):
+                        issues.append(ValidationIssue("ERROR", str(path), message))
+                    if isinstance(claim, dict) and isinstance(
+                        claim.get("claim_id"), str
+                    ):
+                        latest_known_claims[str(claim["claim_id"])] = claim
                 for message in validate_schema_instance(
-                    claim,
-                    claims_schema["$defs"]["claim"],
+                    item.get("frontier"),
+                    claims_schema["$defs"]["frontier"],
                     root_schema=claims_schema,
-                    location=f"$.claims_snapshot[{index}]",
+                    location="$.frontier",
                 ):
                     issues.append(ValidationIssue("ERROR", str(path), message))
-            for message in validate_schema_instance(
-                item.get("frontier"),
-                claims_schema["$defs"]["frontier"],
-                root_schema=claims_schema,
-                location="$.frontier",
-            ):
-                issues.append(ValidationIssue("ERROR", str(path), message))
+            claim_states, snapshot_ids, inactive_ids = _checkpoint_claim_lifecycles(
+                item
+            )
+            if len(snapshot_ids) != len(set(snapshot_ids)):
+                issues.append(
+                    ValidationIssue(
+                        "ERROR", str(path), "Checkpoint repeats a Claim snapshot"
+                    )
+                )
+            if len(inactive_ids) != len(set(inactive_ids)):
+                issues.append(
+                    ValidationIssue(
+                        "ERROR", str(path), "Checkpoint repeats an inactive Claim ref"
+                    )
+                )
+            for ref in item.get("inactive_claim_refs", []):
+                if isinstance(ref, dict):
+                    record_issues, archived_claim = _checkpoint_claim_record_issues(
+                        paths, path, ref, claims_schema
+                    )
+                    issues.extend(record_issues)
+                    if archived_claim is not None and isinstance(
+                        archived_claim.get("claim_id"), str
+                    ):
+                        archived_id = str(archived_claim["claim_id"])
+                        latest_known_claims[archived_id] = archived_claim
+                        if claim_lifecycle(archived_claim) in {
+                            "retired",
+                            "superseded",
+                        }:
+                            archived_digest = sha256_json(archived_claim)
+                            sealed_digest = terminal_claim_digests.get(archived_id)
+                            if (
+                                sealed_digest is not None
+                                and archived_digest != sealed_digest
+                            ):
+                                issues.append(
+                                    ValidationIssue(
+                                        "ERROR",
+                                        str(path),
+                                        f"terminal Claim {archived_id} content changed after it was sealed",
+                                    )
+                                )
+                            else:
+                                terminal_claim_digests[archived_id] = archived_digest
+            overlap = set(snapshot_ids) & set(inactive_ids)
+            if overlap:
+                issues.append(
+                    ValidationIssue(
+                        "ERROR",
+                        str(path),
+                        "Checkpoint Claim snapshot and inactive refs overlap: "
+                        + ", ".join(sorted(overlap)),
+                    )
+                )
+            if "inactive_claim_refs" in item:
+                frontier = item.get("frontier")
+                frontier_ids = (
+                    frontier.get("claim_ids", [])
+                    if isinstance(frontier, dict)
+                    and isinstance(frontier.get("claim_ids", []), list)
+                    else []
+                )
+                if snapshot_ids != frontier_ids:
+                    issues.append(
+                        ValidationIssue(
+                            "ERROR",
+                            str(path),
+                            "Checkpoint claims_snapshot must exactly follow Frontier Claim order",
+                        )
+                    )
+                for claim_id in snapshot_ids:
+                    if claim_states.get(claim_id, ("", None))[0] != "active":
+                        issues.append(
+                            ValidationIssue(
+                                "ERROR",
+                                str(path),
+                                f"Checkpoint active snapshot Claim {claim_id} is not active",
+                            )
+                        )
+            for claim_id, current_state in sorted(claim_states.items()):
+                historical_terminal = terminal_claim_states.get(claim_id)
+                if historical_terminal is not None:
+                    message = _lifecycle_transition_message(
+                        claim_id, historical_terminal, current_state
+                    )
+                    if message is not None:
+                        issues.append(ValidationIssue("ERROR", str(path), message))
+                if current_state[0] in {"retired", "superseded"}:
+                    terminal_claim_states[claim_id] = current_state
+            for claim_id, previous_state in sorted(previous_claim_states.items()):
+                if previous_state[0] == "active" and claim_id not in claim_states:
+                    issues.append(
+                        ValidationIssue(
+                            "ERROR",
+                            str(path),
+                            f"active Claim {claim_id} disappeared without a lifecycle record",
+                        )
+                    )
             for field in ("decisive_evidence", "contradictory_evidence"):
                 for ref in item.get(field, []):
                     if not isinstance(ref, dict):
@@ -2130,8 +2838,99 @@ def _checkpoint_issues(
             if item.get("previous_checkpoint") != expected_previous:
                 issues.append(ValidationIssue("ERROR", str(path), "previous Checkpoint link is invalid"))
             previous = item
+            previous_claim_states = claim_states
         except (ValidationError, OSError, ValueError) as exc:
             issues.append(ValidationIssue("ERROR", str(path), str(exc)))
+    if claims_data is not None:
+        current_states: dict[str, tuple[str, str | None]] = {}
+        for claim in claims_data.get("claims", []):
+            if not isinstance(claim, dict) or not isinstance(claim.get("claim_id"), str):
+                continue
+            target = claim.get("superseded_by")
+            current_states[str(claim["claim_id"])] = (
+                claim_lifecycle(claim),
+                target if isinstance(target, str) else None,
+            )
+            claim_id = str(claim["claim_id"])
+            lifecycle = claim_lifecycle(claim)
+            if lifecycle in {"retired", "superseded"}:
+                sealed_digest = terminal_claim_digests.get(claim_id)
+                if sealed_digest is not None and sha256_json(claim) != sealed_digest:
+                    issues.append(
+                        ValidationIssue(
+                            "ERROR",
+                            str(paths.claims),
+                            f"terminal Claim {claim_id} content changed after it was sealed",
+                        )
+                    )
+            latest_known_claims[claim_id] = claim
+        for claim_id, current_state in sorted(current_states.items()):
+            historical_terminal = terminal_claim_states.get(claim_id)
+            if historical_terminal is not None:
+                message = _lifecycle_transition_message(
+                    claim_id, historical_terminal, current_state
+                )
+                if message is not None:
+                    issues.append(
+                        ValidationIssue("ERROR", str(paths.claims), message)
+                    )
+        for claim_id, previous_state in sorted(previous_claim_states.items()):
+            if previous_state[0] == "active" and claim_id not in current_states:
+                issues.append(
+                    ValidationIssue(
+                        "ERROR",
+                        str(paths.claims),
+                        f"active Claim {claim_id} disappeared without retirement or supersession",
+                    )
+                )
+    supersession_edges: dict[str, str] = {}
+    for claim_id, claim in sorted(latest_known_claims.items()):
+        if claim_lifecycle(claim) != "superseded":
+            continue
+        target = claim.get("superseded_by")
+        if not isinstance(target, str) or target not in latest_known_claims:
+            issues.append(
+                ValidationIssue(
+                    "ERROR",
+                    str(paths.claims),
+                    f"historical superseded Claim {claim_id} references missing Claim {target!r}",
+                )
+            )
+        elif target == claim_id:
+            issues.append(
+                ValidationIssue(
+                    "ERROR",
+                    str(paths.claims),
+                    f"historical Claim {claim_id} cannot supersede itself",
+                )
+            )
+        else:
+            supersession_edges[claim_id] = target
+    for origin in sorted(supersession_edges):
+        seen: set[str] = set()
+        current = origin
+        while current in supersession_edges and current not in seen:
+            seen.add(current)
+            current = supersession_edges[current]
+        if current in seen:
+            issues.append(
+                ValidationIssue(
+                    "ERROR",
+                    str(paths.claims),
+                    f"historical Claim supersession cycle includes {origin}",
+                )
+            )
+            continue
+        terminal = latest_known_claims.get(current)
+        if terminal is not None and claim_lifecycle(terminal) != "active":
+            issues.append(
+                ValidationIssue(
+                    "ERROR",
+                    str(paths.claims),
+                    f"historical Claim supersession chain from {origin} must end at an active Claim; "
+                    f"{current} has lifecycle {claim_lifecycle(terminal)!r}",
+                )
+            )
     return issues
 
 
@@ -2287,9 +3086,11 @@ def validate_study(paths: StudyPaths) -> list[ValidationIssue]:
     issues.extend(run_ledger_issues(paths, runs))
     evidence_issues, evidence = _evidence_issues(paths, runs)
     issues.extend(evidence_issues)
-    claim_issues, _ = _claims_issues(paths, evidence)
+    issues.extend(evidence_sequence_issues(paths))
+    claim_issues, claims_data = _claims_issues(paths, evidence)
     issues.extend(claim_issues)
-    issues.extend(_checkpoint_issues(paths, evidence))
+    issues.extend(_checkpoint_issues(paths, evidence, claims_data))
+    issues.extend(checkpoint_sequence_issues(paths))
     issues.extend(_verdict_issues(paths, evidence))
     return issues
 
@@ -2307,6 +3108,7 @@ def authoritative_string_references(paths: StudyPaths) -> set[str]:
         paths.claims,
         *evidence_paths(paths),
         *checkpoint_paths(paths),
+        *sorted((paths.checkpoints / "claim-records").glob("*.json")),
         *verdict_paths(paths),
     ]
     for path in candidates:

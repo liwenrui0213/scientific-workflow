@@ -17,6 +17,7 @@ import tempfile
 import time
 from typing import Any, Iterator, Sequence
 
+from .active_context import require_growth_allowed
 from .budget import (
     budget_projection,
     format_budget_violation,
@@ -1390,6 +1391,7 @@ def execute_run(
         raise ValidationError("changed paths must be non-empty strings")
     if len(declared_changed_paths) != len(set(declared_changed_paths)):
         raise ValidationError("changed paths must not be repeated")
+    require_growth_allowed(paths, "the next Run")
 
     root = paths.root.resolve()
     profile = load_repository_profile(root)
@@ -1462,6 +1464,9 @@ def execute_run(
     # are one serialized registration transaction.  No child process can
     # start before its reservation is durable and visible.
     with _run_registry_lock(paths):
+        # Recheck under the shared Study authority lock so concurrent Run or
+        # compaction transitions cannot cross the hard pressure boundary.
+        require_growth_allowed(paths, "the next Run")
         brief_bytes, brief_text, approval_payload, approval = (
             _capture_fresh_brief_authority(paths)
         )

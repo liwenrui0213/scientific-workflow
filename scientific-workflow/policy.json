@@ -16,6 +16,22 @@
     "required_before_review",
     "blocking_now"
   ],
+  "active_context": {
+    "compaction_pressure": {
+      "active_claims": {"soft": 24, "hard": 32},
+      "authoritative_claims": {"soft": 160, "hard": 224},
+      "terminal_claims": {"soft": 96, "hard": 160},
+      "claims_source_bytes": {"soft": 1048576, "hard": 4194304},
+      "frontier_open_questions": {"soft": 24, "hard": 32},
+      "frontier_next_actions": {"soft": 24, "hard": 32},
+      "frontier_human_decisions": {"soft": 12, "hard": 16},
+      "active_selector_bytes": {"soft": 65536, "hard": 98304},
+      "runs_since_checkpoint": {"soft": 20, "hard": 40},
+      "evidence_records_since_checkpoint": {"soft": 12, "hard": 24},
+      "active_work_files": {"soft": 32, "hard": 64},
+      "active_work_bytes": {"soft": 4194304, "hard": 16777216}
+    }
+  },
   "default_hardware_class": "unspecified",
   "default_precision": "unspecified"
 }

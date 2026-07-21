@@ -157,6 +157,14 @@ def decide(event: dict[str, Any]) -> str | None:
         study_root,
         r"(?:RUNS\.ledger\.json(?:\b|$)|runs(?:\b|/RUN-[0-9]{6}(?:\b|/manifest\.json(?:\b|$))))",
     )
+    sequence_pattern = _study_regex(
+        study_root,
+        r"(?:EVIDENCE|CHECKPOINTS)\.sequence\.json(?:\b|$)",
+    )
+    checkpoint_pattern = _study_regex(
+        study_root,
+        r"checkpoints/(?:CHECKPOINT-[0-9]{6}\.json|claim-records(?:/|\b))",
+    )
     evidence_pattern = _study_regex(
         study_root,
         r"evidence/(EVID-[0-9]{4,})\.v([0-9]{4,})\.json(?:\b|$)",
@@ -184,6 +192,8 @@ def decide(event: dict[str, Any]) -> str | None:
             return "Validation proofs may be written only by studyctl validate-changes."
         if run_pattern.search(lowered):
             return "Run manifests are sealed execution records and must not be changed or removed."
+        if sequence_pattern.search(lowered) or checkpoint_pattern.search(lowered):
+            return "Checkpoint, sequence, and archived Claim records are sealed authority and must not be changed or removed directly."
         brief_match = brief_pattern.search(lowered)
         if brief_match and _approval_exists(
             repository_root, study_root, brief_match.group(1).upper()
@@ -223,6 +233,10 @@ def decide(event: dict[str, Any]) -> str | None:
             return "Validation proofs may be written only by studyctl validate-changes."
         if run_pattern.search(lowered) and action in {"add", "update", "delete"}:
             return "Run manifests are sealed execution records and must not be changed or removed."
+        if (
+            sequence_pattern.search(lowered) or checkpoint_pattern.search(lowered)
+        ) and action in {"add", "update", "delete"}:
+            return "Checkpoint, sequence, and archived Claim records are sealed authority and must not be changed or removed directly."
         brief_match = brief_pattern.search(normalized)
         if brief_match and _approval_exists(
             repository_root, study_root, brief_match.group(1).upper()

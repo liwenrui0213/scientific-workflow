@@ -3,23 +3,47 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 import os
 from pathlib import Path, PurePosixPath
+import stat
 from typing import Any
 
+from .active_context import (
+    active_claims,
+    build_active_selector,
+    compaction_pressure,
+    inactive_claim_refs,
+    pressure_watermarks,
+)
 from .budget import (
     budget_projection,
     budget_totals_from_manifests,
     parse_brief_hard_budget,
 )
+from .checkpoint_sequence import (
+    advance_checkpoint_sequence,
+    load_checkpoint_sequence,
+    migrate_legacy_checkpoint_sequence,
+    require_checkpoint_sequence,
+)
+from .evidence_sequence import require_evidence_sequence
 from .formalization import collect_formalization_debt
 from .hashing import (
     atomic_write_json,
+    canonical_json_bytes,
     load_json,
+    pretty_json_bytes,
     record_digest,
     sha256_file,
     sha256_json,
 )
 from .locking import study_authority_lock
-from .models import SCHEMA_VERSION, StudyPaths, ValidationError, WorkflowError, utc_now
+from .models import (
+    CHECKPOINT_SCHEMA_VERSION,
+    SCHEMA_VERSION,
+    StudyPaths,
+    ValidationError,
+    WorkflowError,
+    utc_now,
+)
 from .rendering import active_formal_artifacts, render_status
 from .run_ledger import (
     bootstrap_or_reconcile_ledger,
@@ -41,6 +65,48 @@ from .workspace import evaluate_changes, repository_profile_path
 
 
 _STUDY_CHANGE_CLASSIFICATIONS = {"study_state", "other_study"}
+_COMPACTION_INDEX_MAX_ITEMS = 64
+_COMPACTION_INDEX_MAX_SELECTED_BYTES = 8 * 1024
+_COMPACTION_INPUT_MAX_BYTES = 256 * 1024
+_CLAIM_RECORDS_DIRECTORY = "claim-records"
+
+
+def _bounded_index(items: list[Any]) -> dict[str, Any]:
+    """Return a bounded navigation view bound to the complete inventory.
+
+    ``items`` must already be in its deterministic source order.  The selected
+    prefix is only a navigation aid; ``inventory_sha256`` always commits to the
+    complete list, including entries omitted from the projection.
+    """
+
+    selected: list[Any] = []
+    selected_bytes = len(canonical_json_bytes(selected))
+    for item in items:
+        if len(selected) >= _COMPACTION_INDEX_MAX_ITEMS:
+            break
+        candidate = [*selected, item]
+        candidate_bytes = len(canonical_json_bytes(candidate))
+        if candidate_bytes > _COMPACTION_INDEX_MAX_SELECTED_BYTES:
+            break
+        selected = candidate
+        selected_bytes = candidate_bytes
+    return {
+        "items": selected,
+        "total_count": len(items),
+        "selected_count": len(selected),
+        "truncated": len(selected) < len(items),
+        "inventory_sha256": sha256_json(items),
+        "selected_bytes": selected_bytes,
+    }
+
+
+def _inventory_binding(items: list[Any]) -> dict[str, Any]:
+    """Return the constant-size portion of a complete inventory commitment."""
+
+    return {
+        "total_count": len(items),
+        "inventory_sha256": sha256_json(items),
+    }
 
 
 def _claim_evidence_keys(claims: dict[str, Any]) -> set[tuple[str, int]]:
@@ -184,6 +250,18 @@ def _host_change_scope(paths: StudyPaths) -> dict[str, Any]:
     }
 
 
+def _bounded_host_change_scope(scope: dict[str, Any]) -> dict[str, Any]:
+    records = scope.get("consequential_paths", [])
+    if not isinstance(records, list):
+        raise ValidationError("host change scope consequential_paths must be an array")
+    return {
+        "outcome": scope.get("outcome"),
+        "git_available": bool(scope.get("git_available")),
+        "consequential_paths": _bounded_index(records),
+        "fingerprint_sha256": scope.get("fingerprint_sha256"),
+    }
+
+
 def _validate_prepared_bindings(
     paths: StudyPaths,
     compaction_state: dict[str, Any],
@@ -202,8 +280,16 @@ def _validate_prepared_bindings(
         raise ValidationError("Brief approval changed after compact-prepare")
     if source_hashes.get("claims") != sha256_file(paths.claims):
         raise ValidationError("CLAIMS.json changed after compact-prepare")
-    if source_hashes.get("evidence") != current_evidence_hashes(paths):
+    if source_hashes.get("evidence") != current_evidence_inventory_binding(paths):
         raise ValidationError("Evidence set changed after compact-prepare")
+    if source_hashes.get("evidence_sequence") != sha256_file(
+        paths.evidence_sequence
+    ):
+        raise ValidationError("Evidence sequence changed after compact-prepare")
+    if source_hashes.get("checkpoint_sequence") != sha256_file(
+        paths.checkpoint_sequence
+    ):
+        raise ValidationError("Checkpoint sequence changed after compact-prepare")
 
     profile_record = compaction_state.get("repository_profile")
     if not isinstance(profile_record, dict):
@@ -219,16 +305,15 @@ def _validate_prepared_bindings(
     if not isinstance(prepared_scope, dict):
         raise ValidationError("COMPACTION_INPUT.json lacks a host change-scope binding")
     prepared_paths = prepared_scope.get("consequential_paths")
-    if not isinstance(prepared_paths, list) or prepared_scope.get(
-        "fingerprint_sha256"
-    ) != sha256_json(prepared_paths):
+    if not isinstance(prepared_paths, dict):
         raise ValidationError("COMPACTION_INPUT.json host change-scope binding is invalid")
-    current_scope = _host_change_scope(paths)
+    current_scope = _bounded_host_change_scope(_host_change_scope(paths))
     if (
         current_scope["outcome"] != prepared_scope.get("outcome")
         or current_scope["git_available"] != prepared_scope.get("git_available")
         or current_scope["fingerprint_sha256"]
         != prepared_scope.get("fingerprint_sha256")
+        or current_scope["consequential_paths"] != prepared_paths
     ):
         raise ValidationError(
             "host consequential change scope changed after compact-prepare"
@@ -236,13 +321,22 @@ def _validate_prepared_bindings(
 
     prepared_work = compaction_state.get("active_work_inventory")
     prepared_work_hash = compaction_state.get("active_work_inventory_sha256")
-    if not isinstance(prepared_work, list) or prepared_work_hash != sha256_json(
-        prepared_work
-    ):
+    if not isinstance(prepared_work, dict):
         raise ValidationError("COMPACTION_INPUT.json active-work binding is invalid")
     current_work = _tree_inventory(paths.active_work, paths.root)
-    if sha256_json(current_work) != prepared_work_hash:
+    expected_work_index = _bounded_index(current_work)
+    if (
+        prepared_work != expected_work_index
+        or prepared_work_hash != expected_work_index["inventory_sha256"]
+    ):
         raise ValidationError("work/active inventory changed after compact-prepare")
+
+    formal_inventory = active_formal_artifacts(paths)
+    if source_hashes.get("formal_artifacts") != _inventory_binding(formal_inventory):
+        raise ValidationError("formal-artifact inventory changed after compact-prepare")
+    failed_inventory = _file_inventory(paths.study / "failed-directions", paths.root)
+    if source_hashes.get("failed_directions") != _inventory_binding(failed_inventory):
+        raise ValidationError("failed-direction inventory changed after compact-prepare")
 
 
 def budget_totals(runs: dict[str, tuple[Path, dict[str, Any]]]) -> dict[str, Any]:
@@ -344,13 +438,18 @@ def _compaction_budget_state(
         "Unindexed pre-ledger V1/V2 Manifests are a lower-assurance fallback; "
         "migrate the intact Run history before relying on it as authoritative."
     )
+    manifest_inventory = [
+        {
+            "run_id": run_id,
+            "path": path.relative_to(paths.root).as_posix(),
+            "sha256": sha256_file(path),
+        }
+        for run_id, (path, _) in sorted(runs.items())
+    ]
     authority = {
         "kind": "legacy_manifest_fallback",
         "assurance": "legacy_unindexed_lower_assurance",
-        "manifest_sha256": {
-            run_id: sha256_file(path)
-            for run_id, (path, _) in sorted(runs.items())
-        },
+        "manifest_inventory": _bounded_index(manifest_inventory),
     }
     return totals, authority
 
@@ -362,6 +461,93 @@ def current_evidence_hashes(paths: StudyPaths) -> dict[str, str]:
     }
 
 
+def current_evidence_inventory_binding(paths: StudyPaths) -> dict[str, Any]:
+    """Bind the complete Evidence set without copying every path into a plan."""
+
+    records = [
+        {"path": path, "sha256": digest}
+        for path, digest in sorted(current_evidence_hashes(paths).items())
+    ]
+    return _inventory_binding(records)
+
+
+def _materialize_inactive_claim_records(
+    paths: StudyPaths,
+    claims: dict[str, Any],
+    refs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Persist each non-Frontier Claim once as a content-addressed record."""
+
+    records_root = paths.checkpoints / _CLAIM_RECORDS_DIRECTORY
+    if records_root.exists() and (records_root.is_symlink() or not records_root.is_dir()):
+        raise ValidationError(
+            f"Checkpoint Claim-record root must be a non-symlink directory: {records_root}"
+        )
+    records_root.mkdir(parents=True, exist_ok=True)
+    by_id = {
+        str(claim.get("claim_id")): claim
+        for claim in claims.get("claims", [])
+        if isinstance(claim, dict) and isinstance(claim.get("claim_id"), str)
+    }
+    materialized: list[dict[str, Any]] = []
+    for ref in refs:
+        claim_id = str(ref.get("claim_id", ""))
+        claim = by_id.get(claim_id)
+        if claim is None:
+            raise ValidationError(
+                f"cannot persist missing non-Frontier Claim record: {claim_id}"
+            )
+        digest = sha256_json(claim)
+        if digest != ref.get("sha256"):
+            raise ValidationError(
+                f"non-Frontier Claim reference changed before persistence: {claim_id}"
+            )
+        destination = records_root / f"{claim_id}.{digest}.json"
+        if destination.exists():
+            metadata = destination.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                raise ValidationError(
+                    f"Claim record must be a regular non-symlink file: {destination}"
+                )
+            if metadata.st_nlink != 1:
+                raise ValidationError(
+                    f"Claim record must not be hard-linked: {destination}"
+                )
+            if metadata.st_mode & 0o222:
+                raise ValidationError(
+                    f"Claim record must remain sealed read-only: {destination}"
+                )
+            existing = load_json(destination)
+            if not isinstance(existing, dict) or sha256_json(existing) != digest:
+                raise ValidationError(
+                    f"existing Claim record does not match its content address: {destination}"
+                )
+        else:
+            atomic_write_json(
+                destination,
+                claim,
+                overwrite=False,
+                mode=0o444,
+                require_parent_fsync=True,
+            )
+        sealed = destination.lstat()
+        if (
+            not stat.S_ISREG(sealed.st_mode)
+            or sealed.st_nlink != 1
+            or sealed.st_mode & 0o222
+        ):
+            raise ValidationError(
+                f"Claim record was not sealed as an immutable regular file: {destination}"
+            )
+        materialized.append(
+            {
+                **ref,
+                "record_path": destination.relative_to(paths.root).as_posix(),
+            }
+        )
+    return materialized
+
+
 def _reference_mentions_path(references: set[str], *candidates: str) -> bool:
     material = [candidate for candidate in candidates if candidate]
     return any(candidate in reference for reference in references for candidate in material)
@@ -369,7 +555,7 @@ def _reference_mentions_path(references: set[str], *candidates: str) -> bool:
 
 def prepare_compaction(paths: StudyPaths) -> Path:
     assert_valid_study(paths)
-    host_change_scope = _host_change_scope(paths)
+    host_change_scope = _bounded_host_change_scope(_host_change_scope(paths))
     runs = run_index(paths)
     budget_state, budget_authority = _compaction_budget_state(paths, runs)
     evidence = evidence_index(paths)
@@ -396,16 +582,42 @@ def prepare_compaction(paths: StudyPaths) -> Path:
         active_relative = (paths.root / full).relative_to(paths.active_work).as_posix()
         if not _reference_mentions_path(authoritative_refs, full, active_relative):
             candidates.append(active_relative)
-    checkpoints = []
-    for path in checkpoint_paths(paths):
-        item = load_json(path)
+    checkpoints: list[dict[str, Any]] = []
+    checkpoint_files = checkpoint_paths(paths)
+    if checkpoint_files:
+        item = load_json(checkpoint_files[-1])
         checkpoints.append(
             {
                 "checkpoint_id": item.get("checkpoint_id"),
                 "sha256": item.get("checkpoint_sha256"),
-                "frontier": item.get("frontier"),
             }
         )
+    selected_claims = active_claims(claims)
+    inactive_refs = inactive_claim_refs(claims)
+    active_selector = build_active_selector(paths, claims_data=claims)
+    active_formal = [item for item in formal if item["active"]]
+    stale_formal = [item for item in formal if not item["active"]]
+    failed_directions = _file_inventory(
+        paths.study / "failed-directions",
+        paths.root,
+    )
+    unreferenced_runs = sorted(set(runs) - evidence_run_ids)
+    unreferenced_evidence = [
+        {"evidence_id": key[0], "version": key[1], "status": item.get("status")}
+        for key, (_, item) in sorted(evidence.items())
+        if key not in claim_evidence
+    ]
+    cohort_records = [
+        {"cohort": cohort, "status_counts": dict(sorted(counts.items()))}
+        for cohort, counts in sorted(cohort_status.items())
+    ]
+    evidence_binding = current_evidence_inventory_binding(paths)
+    pressure = compaction_pressure(
+        paths,
+        claims_data=claims,
+        runs=runs,
+        evidence=evidence,
+    )
     payload = {
         "schema_version": SCHEMA_VERSION,
         "study_id": paths.study_id,
@@ -413,7 +625,11 @@ def prepare_compaction(paths: StudyPaths) -> Path:
             "brief": sha256_file(paths.brief),
             "brief_approval": sha256_file(paths.brief_approval) if paths.brief_approval.is_file() else None,
             "claims": sha256_file(paths.claims),
-            "evidence": current_evidence_hashes(paths),
+            "evidence": evidence_binding,
+            "evidence_sequence": sha256_file(paths.evidence_sequence),
+            "checkpoint_sequence": sha256_file(paths.checkpoint_sequence),
+            "formal_artifacts": _inventory_binding(formal),
+            "failed_directions": _inventory_binding(failed_directions),
         },
         "repository_profile": {
             "path": repository_profile_path(paths.root)
@@ -423,42 +639,79 @@ def prepare_compaction(paths: StudyPaths) -> Path:
         },
         "host_change_scope": host_change_scope,
         "run_counts_by_status": dict(sorted(status_counts.items())),
-        "run_counts_by_cohort_and_status": {
-            cohort: dict(sorted(counts.items())) for cohort, counts in sorted(cohort_status.items())
-        },
-        "runs_not_referenced_by_evidence": sorted(set(runs) - evidence_run_ids),
-        "evidence_not_referenced_by_claims": [
-            {"evidence_id": key[0], "version": key[1], "status": item.get("status")}
-            for key, (_, item) in sorted(evidence.items())
-            if key not in claim_evidence
-        ],
-        "active_formal_artifacts": [item for item in formal if item["active"]],
-        "stale_formal_artifacts": [item for item in formal if not item["active"]],
-        "active_work_files": work_files,
-        "active_work_inventory": work_inventory,
+        "run_counts_by_cohort_and_status": _bounded_index(cohort_records),
+        "runs_not_referenced_by_evidence": _bounded_index(unreferenced_runs),
+        "evidence_not_referenced_by_claims": _bounded_index(unreferenced_evidence),
+        "active_formal_artifacts": _bounded_index(active_formal),
+        "stale_formal_artifacts": _bounded_index(stale_formal),
+        "active_work_files": _bounded_index(work_files),
+        "active_work_inventory": _bounded_index(work_inventory),
         "active_work_inventory_sha256": sha256_json(work_inventory),
         "previous_checkpoints": checkpoints,
-        "current_claims": claims.get("claims", []),
-        "current_frontier": claims.get("frontier", {}),
-        "failed_direction_records": _file_inventory(paths.study / "failed-directions", paths.root),
+        "claims_source": {
+            **active_selector["claims_source"],
+            "claim_inventory_sha256": sha256_json(claims.get("claims", [])),
+            "frontier_sha256": sha256_json(claims.get("frontier", {})),
+        },
+        "current_claims": _bounded_index(active_selector["selected_claims"]),
+        "inactive_claim_refs": _bounded_index(inactive_refs),
+        "claim_inventory": {
+            "total_count": len(claims.get("claims", [])),
+            "frontier_count": len(selected_claims),
+            "inactive_count": len(inactive_refs),
+            "claims_file_sha256": sha256_file(paths.claims),
+        },
+        "current_frontier": active_selector["frontier"],
+        "failed_direction_records": _bounded_index(failed_directions),
         "budget_totals": budget_state,
         "budget_authority": budget_authority,
-        "candidate_archive_items": candidates,
-        "formalization_debt": collect_formalization_debt(paths),
+        "candidate_archive_items": _bounded_index(candidates),
+        "formalization_debt": _bounded_index(collect_formalization_debt(paths)),
+        "compaction_pressure": pressure,
     }
     output = paths.generated / "COMPACTION_INPUT.json"
+    payload_size = len(pretty_json_bytes(payload))
+    if payload_size > _COMPACTION_INPUT_MAX_BYTES:
+        raise ValidationError(
+            "bounded COMPACTION_INPUT.json would exceed its structural byte "
+            f"budget: {payload_size} > {_COMPACTION_INPUT_MAX_BYTES}"
+        )
     atomic_write_json(output, payload)
     return output
 
 
 def _next_checkpoint_id(paths: StudyPaths) -> str:
-    highest = 0
+    sequence = require_checkpoint_sequence(paths)
+    return f"CHECKPOINT-{int(sequence['high_water_mark']) + 1:06d}"
+
+
+def migrate_checkpoint_sequence(paths: StudyPaths) -> Path:
+    """Bind one intact pre-sequence Checkpoint chain explicitly."""
+
+    if load_checkpoint_sequence(paths) is not None:
+        raise ValidationError("Checkpoint sequence already exists")
+    from .models import errors_only
+    from .validation import validate_study
+
+    sequence_path = str(paths.checkpoint_sequence)
+    unrelated = [
+        issue
+        for issue in errors_only(validate_study(paths))
+        if issue.path != sequence_path
+    ]
+    if unrelated:
+        raise ValidationError(
+            "legacy Checkpoint history is not valid enough to migrate:\n"
+            + "\n".join(issue.render() for issue in unrelated)
+        )
+    checkpoints: list[dict[str, Any]] = []
     for path in checkpoint_paths(paths):
-        try:
-            highest = max(highest, int(path.stem.removeprefix("CHECKPOINT-")))
-        except ValueError:
-            continue
-    return f"CHECKPOINT-{highest + 1:06d}"
+        value = load_json(path)
+        if not isinstance(value, dict):
+            raise ValidationError(f"Checkpoint must be an object: {path}")
+        checkpoints.append(value)
+    migrate_legacy_checkpoint_sequence(paths, checkpoints)
+    return paths.checkpoint_sequence
 
 
 def _evidence_ref_exists(
@@ -535,7 +788,7 @@ def _finalize_compaction_locked(paths: StudyPaths, plan_path: Path) -> Path:
     _validate_prepared_bindings(paths, compaction_state)
     if plan.get("claims_sha256") != sha256_file(paths.claims):
         raise ValidationError("CLAIMS.json changed after the compaction plan was written")
-    if plan.get("evidence_sha256") != current_evidence_hashes(paths):
+    if plan.get("evidence_inventory") != current_evidence_inventory_binding(paths):
         raise ValidationError("Evidence set changed after the compaction plan was written")
     assert_valid_study(paths)
     claims = load_json(paths.claims)
@@ -564,14 +817,15 @@ def _finalize_compaction_locked(paths: StudyPaths, plan_path: Path) -> Path:
         for ref in plan.get(field, []):
             if not _evidence_ref_exists(ref, evidence):
                 raise ValidationError(f"{field} contains a missing or stale Evidence reference: {ref}")
+    selected_claims = active_claims(claims)
     expected_decisive = {
         (str(ref.get("evidence_id")), int(ref.get("version", 0)))
-        for claim in claims.get("claims", [])
+        for claim in selected_claims
         for ref in claim.get("supporting_evidence", [])
     }
     expected_contradictory = {
         (str(ref.get("evidence_id")), int(ref.get("version", 0)))
-        for claim in claims.get("claims", [])
+        for claim in selected_claims
         for ref in claim.get("contradictory_evidence", [])
     }
     actual_decisive = {
@@ -649,18 +903,26 @@ def _finalize_compaction_locked(paths: StudyPaths, plan_path: Path) -> Path:
         }
         mappings.append((source, destination, source.stat().st_mode & 0o777, archive_record))
 
-    previous = None
-    existing = checkpoint_paths(paths)
-    if existing:
-        previous_item = load_json(existing[-1])
-        previous = {
-            "checkpoint_id": previous_item["checkpoint_id"],
-            "sha256": previous_item["checkpoint_sha256"],
-        }
+    checkpoint_sequence = require_checkpoint_sequence(paths)
+    previous = checkpoint_sequence.get("latest_checkpoint")
     approval = load_json(paths.brief_approval)
     formal = active_formal_artifacts(paths)
+    selected_claims = active_claims(claims)
+    inactive_refs = inactive_claim_refs(claims)
+    checkpoint_inactive_refs = _materialize_inactive_claim_records(
+        paths,
+        claims,
+        inactive_refs,
+    )
+    evidence_sequence = require_evidence_sequence(paths)
+    run_ledger = load_ledger(paths)
+    run_high_water_mark = (
+        run_ledger["high_water_mark"]
+        if run_ledger is not None
+        else len(runs)  # Frozen pre-ledger V1/V2 history: visible lower bound.
+    )
     checkpoint = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
         "study_id": paths.study_id,
         "checkpoint_id": checkpoint_id,
         "created_at": utc_now(),
@@ -675,7 +937,12 @@ def _finalize_compaction_locked(paths: StudyPaths, plan_path: Path) -> Path:
         ],
         "active_formal_artifacts": [item for item in formal if item["active"]],
         "claims_file_sha256": sha256_file(paths.claims),
-        "claims_snapshot": claims.get("claims", []),
+        "claims_snapshot": selected_claims,
+        "inactive_claim_refs": checkpoint_inactive_refs,
+        "active_context_watermarks": pressure_watermarks(
+            run_count=run_high_water_mark,
+            evidence_high_water_mark=evidence_sequence["high_water_mark"],
+        ),
         "frontier": frontier,
         "decisive_evidence": plan.get("decisive_evidence", []),
         "contradictory_evidence": plan.get("contradictory_evidence", []),
@@ -691,7 +958,16 @@ def _finalize_compaction_locked(paths: StudyPaths, plan_path: Path) -> Path:
     }
     checkpoint["checkpoint_sha256"] = record_digest(checkpoint, "checkpoint_sha256")
     checkpoint_path = paths.checkpoints / f"{checkpoint_id}.json"
+    checkpoint_schema_issues = object_schema_issues(
+        paths.root, "checkpoint", checkpoint_path, checkpoint
+    )
+    if checkpoint_schema_issues:
+        raise ValidationError(
+            "generated Checkpoint is invalid:\n"
+            + "\n".join(issue.render() for issue in checkpoint_schema_issues)
+        )
     moved: list[tuple[Path, Path, int]] = []
+    checkpoint_created = False
     try:
         for source, destination, original_mode, _ in mappings:
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -699,7 +975,18 @@ def _finalize_compaction_locked(paths: StudyPaths, plan_path: Path) -> Path:
             os.chmod(destination, 0o444)
             moved.append((source, destination, original_mode))
         atomic_write_json(checkpoint_path, checkpoint, overwrite=False, mode=0o444)
+        checkpoint_created = True
+        advance_checkpoint_sequence(
+            paths,
+            checkpoint_id=checkpoint_id,
+            checkpoint_sha256=checkpoint["checkpoint_sha256"],
+        )
     except Exception:
+        if checkpoint_created:
+            try:
+                checkpoint_path.unlink()
+            except FileNotFoundError:
+                pass
         for source, destination, original_mode in reversed(moved):
             source.parent.mkdir(parents=True, exist_ok=True)
             if destination.exists() and not source.exists():
