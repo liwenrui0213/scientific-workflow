@@ -400,7 +400,7 @@ class CoreWorkflowTests(WorkflowTestCase):
                 self.assertEqual(load_json(manifest_path)["status"], "succeeded")
         self.assertEqual(self.error_messages(paths), [])
 
-    def test_run_manifest_is_written_once_in_terminal_form_without_temp_files(self) -> None:
+    def test_run_manifest_is_registered_running_then_atomically_sealed_without_temp_files(self) -> None:
         paths = self.initialize_approved_with_claim()
         observed_manifest_writes: list[dict[str, object]] = []
         real_atomic_write_json = atomic_write_json
@@ -428,10 +428,17 @@ class CoreWorkflowTests(WorkflowTestCase):
             [
                 {
                     "existed_before": False,
+                    "status": "running",
+                    "sealed_at": None,
+                    "manifest_sha256": None,
+                    "overwrite": False,
+                },
+                {
+                    "existed_before": True,
                     "status": "succeeded",
                     "sealed_at": manifest["integrity"]["sealed_at"],
                     "manifest_sha256": manifest["integrity"]["manifest_sha256"],
-                    "overwrite": False,
+                    "overwrite": True,
                 }
             ],
         )
@@ -442,7 +449,11 @@ class CoreWorkflowTests(WorkflowTestCase):
         )
         self.assertEqual(
             {path.name for path in (run_directory / "governance").iterdir()},
-            {"repository-profile.json"},
+            {
+                "repository-profile.json",
+                "BRIEF.md",
+                "BRIEF.approval.json",
+            },
         )
         temporary_files = [
             path for path in run_directory.rglob("*") if path.name.endswith(".tmp")

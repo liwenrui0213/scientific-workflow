@@ -4,9 +4,16 @@ import fnmatch
 from pathlib import Path
 from typing import Any
 
-from .hashing import load_json, require_nonnegative_finite
+from .budget import (
+    budget_projection,
+    format_budget_violation,
+    parse_brief_hard_budget,
+    requested_budget,
+)
+from .hashing import load_json
 from .models import FormalizationResult, StudyPaths, ValidationError
-from .validation import brief_approval_issues, protected_artifact_snapshot
+from .run_ledger import bootstrap_or_reconcile_ledger, ledger_commitment_totals
+from .validation import brief_approval_issues, protected_artifact_snapshot, run_index
 
 
 _LEVEL_RANK = {
@@ -102,16 +109,38 @@ def _protected_change_is_approved(paths: StudyPaths) -> bool:
 def check_formalization(paths: StudyPaths, options: dict[str, Any] | None = None) -> FormalizationResult:
     options = options or {}
     policy = load_policy(paths)
-    gpu_hours = require_nonnegative_finite(
-        "estimated GPU hours", options.get("estimated_gpu_hours", 0.0)
+    requested = requested_budget(
+        gpu_hours=options.get("estimated_gpu_hours", 0.0),
+        cpu_hours=options.get("estimated_cpu_hours", 0.0),
+        storage_gb=options.get("estimated_storage_gb", 0.0),
     )
-    cpu_hours = require_nonnegative_finite(
-        "estimated CPU hours", options.get("estimated_cpu_hours", 0.0)
-    )
+    gpu_hours = requested["gpu_hours"]
+    cpu_hours = requested["cpu_hours"]
     parallel_workers = int(options.get("parallel_workers", 1))
     if parallel_workers < 1:
         raise ValidationError("parallel_workers must be at least 1")
     requirements: list[dict[str, str]] = []
+
+    if options.get("for_run") or options.get("check_hard_budget"):
+        hard_limits = parse_brief_hard_budget(
+            paths.brief.read_text(encoding="utf-8")
+        )
+        runs = run_index(paths)
+        ledger = bootstrap_or_reconcile_ledger(
+            paths, runs, write=False
+        )
+        committed = ledger_commitment_totals(ledger)
+        projection = budget_projection(hard_limits, committed, requested)
+        if projection["violations"]:
+            _add_requirement(
+                requirements,
+                "blocking_now",
+                "BRIEF",
+                "; ".join(
+                    format_budget_violation(item)
+                    for item in projection["violations"]
+                ),
+            )
 
     expensive_gpu = gpu_hours >= float(policy["gpu_protocol_threshold_hours"])
     if expensive_gpu and not artifact_ready(paths, "PROTOCOL"):

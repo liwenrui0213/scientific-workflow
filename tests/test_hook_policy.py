@@ -115,6 +115,13 @@ class HookPolicyTests(WorkflowTestCase):
                 "Run manifests are sealed execution records and must not be changed or removed.",
             ),
             (
+                self.patch_event(
+                    "Update",
+                    f"studies/{paths.study_id}/RUNS.ledger.json",
+                ),
+                "Run manifests are sealed execution records and must not be changed or removed.",
+            ),
+            (
                 self.bash_event(
                     f"tee studies/{paths.study_id}/evidence/EVID-0009.v0001.json"
                 ),

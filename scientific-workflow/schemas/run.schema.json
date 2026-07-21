@@ -22,14 +22,15 @@
     "inputs",
     "outputs",
     "logs",
+    "failure",
     "integrity"
   ],
   "properties": {
-    "schema_version": {"const": 2},
+    "schema_version": {"const": 3},
     "study_id": {"type": "string", "pattern": "^SC-[0-9]{4,}$"},
     "run_id": {"type": "string", "pattern": "^RUN-[0-9]{6}$"},
     "purpose": {"type": "string", "minLength": 1},
-    "status": {"enum": ["succeeded", "failed", "interrupted", "running"]},
+    "status": {"enum": ["succeeded", "failed", "interrupted", "incomplete", "running"]},
     "execution": {
       "type": "object",
       "required": [
@@ -102,11 +103,19 @@
     },
     "brief": {
       "type": "object",
-      "required": ["path", "sha256", "approval_sha256"],
+      "required": [
+        "path",
+        "sha256",
+        "approval_sha256",
+        "snapshot",
+        "approval_snapshot"
+      ],
       "properties": {
         "path": {"type": "string", "minLength": 1},
         "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-        "approval_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        "approval_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "snapshot": {"$ref": "#/$defs/file_hash"},
+        "approval_snapshot": {"$ref": "#/$defs/file_hash"}
       },
       "additionalProperties": false
     },
@@ -169,10 +178,41 @@
     },
     "budget": {
       "type": "object",
-      "required": ["estimated_gpu_hours", "estimated_cpu_hours"],
+      "required": [
+        "estimated_gpu_hours",
+        "estimated_cpu_hours",
+        "estimated_storage_gb",
+        "actual_output_storage_gb",
+        "hard_limits",
+        "committed_before",
+        "requested",
+        "committed_after",
+        "violations"
+      ],
       "properties": {
         "estimated_gpu_hours": {"type": "number", "minimum": 0},
-        "estimated_cpu_hours": {"type": "number", "minimum": 0}
+        "estimated_cpu_hours": {"type": "number", "minimum": 0},
+        "estimated_storage_gb": {"type": "number", "minimum": 0},
+        "actual_output_storage_gb": {"type": ["number", "null"], "minimum": 0},
+        "hard_limits": {"$ref": "#/$defs/hard_budget"},
+        "committed_before": {"$ref": "#/$defs/resource_amounts"},
+        "requested": {"$ref": "#/$defs/resource_amounts"},
+        "committed_after": {"$ref": "#/$defs/resource_amounts"},
+        "violations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["resource", "committed", "requested", "projected", "limit"],
+            "properties": {
+              "resource": {"enum": ["gpu_hours", "cpu_hours", "storage_gb"]},
+              "committed": {"type": "number", "minimum": 0},
+              "requested": {"type": "number", "minimum": 0},
+              "projected": {"type": "number", "minimum": 0},
+              "limit": {"type": ["number", "null"], "minimum": 0}
+            },
+            "additionalProperties": false
+          }
+        }
       },
       "additionalProperties": false
     },
@@ -187,6 +227,21 @@
       },
       "additionalProperties": false
     },
+    "failure": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "required": ["phase", "type", "message"],
+          "properties": {
+            "phase": {"type": "string", "minLength": 1},
+            "type": {"type": "string", "minLength": 1},
+            "message": {"type": "string", "minLength": 1}
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
     "integrity": {
       "type": "object",
       "required": ["sealed_at", "manifest_sha256"],
@@ -198,6 +253,26 @@
     }
   },
   "$defs": {
+    "resource_amounts": {
+      "type": "object",
+      "required": ["gpu_hours", "cpu_hours", "storage_gb"],
+      "properties": {
+        "gpu_hours": {"type": "number", "minimum": 0},
+        "cpu_hours": {"type": "number", "minimum": 0},
+        "storage_gb": {"type": "number", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "hard_budget": {
+      "type": "object",
+      "required": ["gpu_hours", "cpu_hours", "storage_gb"],
+      "properties": {
+        "gpu_hours": {"type": ["number", "null"], "minimum": 0},
+        "cpu_hours": {"type": ["number", "null"], "minimum": 0},
+        "storage_gb": {"type": ["number", "null"], "minimum": 0}
+      },
+      "additionalProperties": false
+    },
     "change_check": {
       "type": "object",
       "required": [

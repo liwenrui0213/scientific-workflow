@@ -280,6 +280,13 @@ python -m tools.studyctl approve-brief SC-0001
 
 This is a procedural local approval, not cryptographic identity. Reviewer identity comes from `STUDYCTL_REVIEWER`, then local Git configuration, then the local account.
 
+The visible `STUDYCTL-HARD-BUDGET` JSON block is the sole numeric authority for
+the Study's lifetime GPU-hour, CPU-hour, and decimal-GB limits. Do not repeat
+different hard numbers in prose or hidden metadata. A numeric zero and `null`
+both authorize no positive declared use; use `null` when the human has not yet
+set a limit. Changing the block changes the Brief hash and therefore requires a
+new approval.
+
 To change an approved Brief safely:
 
 ```bash
@@ -297,6 +304,8 @@ Check before such work and supply facts explicitly:
 ```bash
 python -m tools.studyctl check-formalization SC-0001 \
   --estimated-gpu-hours 12 \
+  --estimated-cpu-hours 2 \
+  --estimated-storage-gb 4 \
   --changed-path models/new_method.py \
   --scientific-critical
 ```
@@ -304,6 +313,28 @@ python -m tools.studyctl check-formalization SC-0001 \
 The result is `PASS`, `ADVISORY`, or `BLOCKED`, with the smallest missing artifact. Policy defaults require an active `formal/PROTOCOL.json` at 10 GPU-hours, `METHOD.md` before scientific-critical shared code enters Evidence, `EVALUATOR.json` plus renewed Brief approval for protected evaluator changes, and `PLAN.json` only for genuine parallel dependencies or multi-worker orchestration.
 
 The command uses flags and configured path patterns; it never guesses scientific meaning from arbitrary code.
+
+`check-formalization` and `run` also enforce the approved cumulative hard
+budget. Registration serializes budget checking and reservation, so concurrent
+Agents cannot both spend the same remaining allowance. Exact equality with a
+limit passes; any positive excess blocks before the child process starts.
+Succeeded, failed, interrupted, incomplete, and still-running Runs all retain
+their reservation, so retrying a failed experiment cannot silently reset the
+budget. Storage is charged as the larger of its declared estimate and the
+actual size of declared outputs; an unexpected storage overrun is preserved as
+an `incomplete` Run and blocks later Runs until the human authorizes a larger
+Brief budget.
+
+`<study_root>/<STUDY_ID>/RUNS.ledger.json` is the durable identity and budget
+index. Its high-water mark is monotone, it contains an entry or aborted
+tombstone for every allocated Run ID, and its digest is validated before
+admission. The ledger lives outside `runs/`, and one Study-directory lock
+serializes Run budget/identity transitions with Brief approval/revision,
+Verdict recording, and compaction finalization. Replacing the entire `runs/`
+directory therefore cannot create a second budget namespace or reuse
+`RUN-000001`, and a concurrent Brief revision cannot cross a compaction or Run
+authority snapshot. A missing/corrupt ledger or a ledger entry whose Manifest
+disappeared blocks validation and all new Runs.
 
 When a Run uses newly changed scientific-critical code, pass `--changed-path PATH` and/or `--scientific-critical` to `studyctl run`; pass `--shared-across-runs` when the implementation is being reused. These declarations are sealed as formalization context. `studyctl` independently derives critical paths from the actual Git changes, so omitting a declaration cannot bypass a required METHOD or CHANGESET.
 
@@ -325,9 +356,11 @@ python -m tools.studyctl run SC-0001 \
   -- python scripts/evaluate.py --config config/baseline.json
 ```
 
-Arguments after `--` are preserved as an argument vector and are never interpreted through a shell. The command runs from the profile's `run_cwd`; the manifest stores both its machine-local absolute path and portable profile-relative path. The terminal manifest and logs are sealed read-only even when the command fails or is interrupted. The manifest points to immutable per-Run copies of the repository profile, CHANGESET, validation proof, and active formal artifacts. It also classifies actual Git changes before and after execution and records whether the Run is Evidence-eligible. Later revisions of `METHOD`, `PROTOCOL`, or other active formal files therefore do not invalidate older Runs; changing a formal artifact during the Run does make that Run ineligible.
+Arguments after `--` are preserved as an argument vector and are never interpreted through a shell. The command runs from the profile's `run_cwd`; the manifest stores both its machine-local absolute path and portable profile-relative path. Before the child process starts, `studyctl` first reserves a never-reused ID and budget in the Study ledger, builds and fsyncs a complete hidden Run tree, atomically publishes its `running` Manifest, and binds that Manifest back into the ledger. Only then may it invoke the child. It later atomically replaces the Manifest with a read-only `succeeded`, `failed`, `interrupted`, or `incomplete` record. Output checking or hashing failures are sealed as visible `incomplete` records. If terminal replacement itself fails, the `running` Manifest and ledger reservation remain visible instead of disappearing from accounting. The terminal logs are sealed read-only whenever finalization can complete.
 
-Every mutable file statically visible in the command argv—including literal paths, quoted paths, and a directly executed local `python -m` module—must also be supplied with `--input`, so mutable code or configuration under `work/` or an ignored scratch directory cannot bypass provenance. Clean tracked files are already pinned by the recorded commit. General dynamic imports, generated path expressions, subprocesses, and obfuscated runtime file access cannot be discovered completely by V2; the researcher or Agent must explicitly declare those mutable dependencies or move them into clean tracked host roots. All declared outputs are required, must be new regular files below `object_root`, and are sealed read-only. Evidence creation and finalization re-check input, output, stdout, stderr, governance-snapshot, and formal-artifact-snapshot file types, sizes, and hashes. A missing or altered dependency makes the Run ineligible; it is not repaired by editing its immutable manifest.
+The manifest points to immutable per-Run copies of the repository profile, CHANGESET, validation proof, and active formal artifacts. It also classifies actual Git changes before and after execution and records whether the Run is Evidence-eligible. Later revisions of `METHOD`, `PROTOCOL`, or other active formal files therefore do not invalidate older Runs; changing a formal artifact during the Run does make that Run ineligible. `running` and `incomplete` Runs cannot enter Evidence. Validation scans allocated `RUN-*` directories as well as existing manifests, so a missing Manifest is an explicit registry error rather than an invisible orphan.
+
+Every mutable file statically visible in the command argv—including literal paths, quoted paths, and a directly executed local `python -m` module—must also be supplied with `--input`, so mutable code or configuration under `work/` or an ignored scratch directory cannot bypass provenance. Clean tracked files are already pinned by the recorded commit. General dynamic imports, generated path expressions, subprocesses, and obfuscated runtime file access cannot be discovered completely; the researcher or Agent must explicitly declare those mutable dependencies or move them into clean tracked host roots. Every declared output must use a new path below `object_root`; every produced regular file is hashed and sealed read-only. A missing declared output makes the Run Evidence-ineligible, and that declared path is thereafter reserved. Within one Study, normalized output ownership is checked inside the serialized registration transaction and becomes visible with the `running` Manifest, so concurrent registrars cannot claim the same still-absent path; validation independently rejects duplicate ownership across manifests. If an absent file appears later, or an existing output could not be hash-pinned, further Run admission fails closed until the retained bytes are resolved. Evidence creation and finalization re-check input, output, stdout, stderr, governance-snapshot, and formal-artifact-snapshot file types, sizes, and hashes. A missing or altered dependency makes the Run ineligible; it is not repaired by editing its immutable manifest.
 
 Every declared `--output` must be a repository-relative path resolving below the configured, Git-ignored `object_root`; absolute outputs and outputs elsewhere are rejected before the computation starts. A declared output path must be new: `studyctl` refuses to overwrite an existing file and makes a produced regular file read-only after hashing it. Directory-shaped results must first be packaged into one immutable file, or represented by a hashed pointer manifest to an external artifact store. Bootstrap must merge an ignore rule for the chosen object root, and profile validation checks it. The manifest stores output paths, sizes, retention classes, and hashes.
 
@@ -423,6 +456,19 @@ Implementation acceptance and scientific acceptance are independent fields. Only
 4. Recreate the recorded Python/runtime, hardware class, precision and selected environment fields.
 5. Execute the recorded `execution.argv` directly as an argument vector, not as a reconstructed shell string. Compare output hashes and inspect `stdout.log` and `stderr.log`.
 
-New Runs use manifest schema V2. An immutable V1 manifest is read through a transient compatibility view and remains unchanged on disk. It is retained as historical execution state and reported with a warning, but it is Evidence-ineligible because it predates the repository-profile, change-scope, validation-proof, and dependency-integrity contract. V2 does not silently “upgrade” or rewrite a V1 Run; a future explicit attestation mechanism would be required to promote one.
+New Runs use manifest schema V3. Immutable pre-budget V2 Runs keep their earlier Evidence semantics and are also conservatively charged for their declared output bytes; V1 remains historical and Evidence-ineligible because it predates the repository-profile, change-scope, validation-proof, and dependency-integrity contract. Compatibility views never rewrite old Manifest bytes.
 
-The current implementation cannot recover from `SIGKILL` or power loss beyond leaving an incomplete Run directory, cannot prove human identity cryptographically, and checks only that a Cohort compatibility justification exists—not whether its scientific argument is sound. `record_sha256` detects accidental or visible record corruption; it is not an authenticated signature proving that only `studyctl` could have created the bytes. Filesystem checks still have an unavoidable time-of-check/time-of-use race against a malicious concurrent local process. Compute estimates are self-reported: hard-budget fields are hash-protected and displayed, but their numerical limits are not automatically inferred from arbitrary schedulers. Git detects committed, staged, unstaged, and untracked repository paths, while external and dynamically resolved inputs still must be declared with `--input`. Project hooks remain small guardrails, not a complete security boundary; repository-profile validation, actual-diff checks, immutable snapshots, tests, clean review context, and human review are the enforcement layers.
+A genuinely pre-ledger Study cannot silently create a new identity namespace.
+After independently checking that its visible V1/V2 history is intact and has
+contiguous IDs beginning at `RUN-000001`, explicitly run:
+
+```bash
+python -m tools.studyctl ledger-migrate SC-0001
+```
+
+The migration rejects V3 Runs, gaps, an empty history, or an existing ledger.
+It cannot prove from local files alone that a continuous tail was never deleted
+before migration; use Git, backups, scheduler records, or another external
+append-only anchor to establish that historical premise.
+
+The current implementation cannot automatically classify a process killed by `SIGKILL` or power loss. A crash before launch leaves a never-reused ledger reservation; a crash after launch authorization leaves the `running` Manifest and reservation. Both fail closed until explicit recovery. A terminal Manifest may be durable before its matching ledger update; the next locked registration can reconcile that one-way transition, while a missing Manifest always blocks rather than guessing. The workflow also cannot prove human identity cryptographically, and checks only that a Cohort compatibility justification exists—not whether its scientific argument is sound. Local SHA-256 digests detect inconsistent bytes but are not authenticated signatures or an external rollback anchor; an actor who can replace an entire Study and all of its history is outside this local protocol. Filesystem checks still have an unavoidable time-of-check/time-of-use race against a malicious concurrent local process. GPU-hour and CPU-hour values remain self-reported reservations: their cumulative limits are enforced, but arbitrary schedulers are not independently metered. Declared-output storage is measured after execution. Git detects committed, staged, unstaged, and untracked repository paths, while external and dynamically resolved inputs still must be declared with `--input`. Project hooks remain small guardrails, not a complete security boundary; repository-profile validation, actual-diff checks, immutable snapshots, tests, clean review context, and human review are the enforcement layers.

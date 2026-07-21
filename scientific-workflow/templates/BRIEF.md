@@ -36,7 +36,22 @@ Brief version: 1
 
 ## Resource Budget
 
-[REPLACE: State hard and advisory GPU-hour, CPU-hour, storage, and calendar limits.]
+The JSON block below is the single machine-enforced source for lifetime Study
+hard limits. A numeric zero authorizes no positive use; `null` leaves positive
+use unauthorized until a new Brief version supplies a numeric limit. Storage
+uses decimal gigabytes (`1 GB = 10^9 bytes`).
+
+<!-- STUDYCTL-HARD-BUDGET-BEGIN -->
+```json
+{
+  "gpu_hours": null,
+  "cpu_hours": null,
+  "storage_gb": null
+}
+```
+<!-- STUDYCTL-HARD-BUDGET-END -->
+
+[REPLACE: State advisory allocation or calendar guidance only; do not duplicate hard numeric limits in prose.]
 
 ## Escalation Conditions
 
@@ -45,11 +60,6 @@ Brief version: 1
 <!-- STUDYCTL-METADATA-BEGIN
 {
   "brief_version": 1,
-  "hard_budget": {
-    "gpu_hours": null,
-    "cpu_hours": null,
-    "storage_gb": null
-  },
   "protected_labels": [
     "evaluator_principles",
     "dataset_split",

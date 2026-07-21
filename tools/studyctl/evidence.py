@@ -24,11 +24,13 @@ from .models import (
     require_id,
     utc_now,
 )
+from .run_ledger import require_consistent_ledger
 from .validation import (
     brief_approval_issues,
     brief_content_issues,
     errors_only,
     object_schema_issues,
+    run_index,
     run_dependency_integrity_issues,
     sealed_run_evidence_eligible,
 )
@@ -169,6 +171,7 @@ def _run_references_for_draft(
     paths: StudyPaths, run_ids: Sequence[str]
 ) -> tuple[list[dict[str, str]], list[str], list[str]]:
     normalized = _normalize_ids("run", run_ids)
+    require_consistent_ledger(paths, run_index(paths))
     manifests = [_terminal_run(paths, run_id) for run_id in normalized]
     references = [
         {
@@ -290,6 +293,7 @@ def create_evidence_draft(
 def _validate_run_references(
     paths: StudyPaths, item: dict[str, Any]
 ) -> tuple[list[str], list[str]]:
+    require_consistent_ledger(paths, run_index(paths))
     seen: set[str] = set()
     fingerprints: set[str] = set()
     manifests: list[dict[str, Any]] = []

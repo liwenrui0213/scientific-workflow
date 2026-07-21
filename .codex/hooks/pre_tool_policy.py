@@ -155,7 +155,7 @@ def decide(event: dict[str, Any]) -> str | None:
     verdict_pattern = _study_regex(study_root, r"VERDICT(?:\.v[0-9]+)?\.json(?:\b|$)")
     run_pattern = _study_regex(
         study_root,
-        r"runs(?:\b|/RUN-[0-9]{6}(?:\b|/manifest\.json(?:\b|$)))",
+        r"(?:RUNS\.ledger\.json(?:\b|$)|runs(?:\b|/RUN-[0-9]{6}(?:\b|/manifest\.json(?:\b|$))))",
     )
     evidence_pattern = _study_regex(
         study_root,

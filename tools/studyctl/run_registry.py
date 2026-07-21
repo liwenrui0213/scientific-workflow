@@ -1,16 +1,28 @@
 from __future__ import annotations
 
+import copy
+from contextlib import contextmanager
 import json
 import hashlib
 import os
 from pathlib import Path
 import platform
 import re
+import signal
+import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import time
-from typing import Any, Sequence
+from typing import Any, Iterator, Sequence
 
+from .budget import (
+    budget_projection,
+    format_budget_violation,
+    parse_brief_hard_budget,
+    requested_budget,
+)
 from .formalization import check_formalization, load_policy
 from .git_state import git_state, git_tracked_state
 from .hashing import (
@@ -18,20 +30,41 @@ from .hashing import (
     atomic_write_json,
     file_record,
     load_json,
+    load_json_bytes,
     nested_record_digest,
-    require_nonnegative_finite,
+    record_digest,
+    sha256_bytes,
     sha256_file,
     sha256_json,
 )
+from .locking import study_authority_lock
 from .models import (
     RunInterrupted,
     StudyPaths,
     ValidationError,
+    ValidationIssue,
     WorkflowError,
     require_id,
     utc_now,
 )
-from .validation import brief_approval_issues, brief_content_issues, errors_only
+from .run_ledger import (
+    bootstrap_or_reconcile_ledger,
+    ledger_commitment_totals,
+    mark_registration_aborted,
+    migrate_legacy_ledger,
+    record_manifest_in_ledger,
+    reserve_run_id,
+)
+from .validation import (
+    brief_text_issues,
+    errors_only,
+    normalized_run_output_key,
+    object_schema_issues,
+    protected_artifact_snapshot,
+    retained_run_output_budget_issues,
+    run_index,
+    run_output_ownership,
+)
 from .workspace import (
     change_validation_path,
     change_state_evidence_eligible,
@@ -43,8 +76,7 @@ from .workspace import (
 )
 
 
-_RUN_DIRECTORY_RE = re.compile(r"^RUN-([0-9]{6})$")
-_RUN_SCHEMA_VERSION = 2
+_RUN_SCHEMA_VERSION = 3
 _REPRODUCIBILITY_ENVIRONMENT_KEYS = (
     "CONDA_DEFAULT_ENV",
     "CONDA_PREFIX",
@@ -65,6 +97,15 @@ def _display_path(path: Path, root: Path) -> str:
         return resolved.relative_to(root.resolve()).as_posix()
     except ValueError:
         return str(resolved)
+
+
+def _tracked_state(paths: StudyPaths, root: Path) -> dict[str, Any]:
+    ledger_relative = (paths.study / "RUNS.ledger.json").relative_to(
+        root.resolve()
+    )
+    return git_tracked_state(
+        root, exclude_paths=[ledger_relative.as_posix()]
+    )
 
 
 def _user_path(root: Path, raw: str | os.PathLike[str]) -> Path:
@@ -322,46 +363,171 @@ def _require_declared_mutable_command_inputs(
         )
 
 
-def _seal_output_paths(
+def _seal_recorded_output_paths(
     root: Path,
-    raw_paths: Sequence[str | os.PathLike[str]] | None,
-) -> None:
-    for raw in raw_paths or ():
+    records: Sequence[dict[str, Any]],
+) -> list[str]:
+    """Freeze every declared regular output that currently exists.
+
+    ``present`` means that a stable size/hash record was established, not that
+    the declared path may be ignored when it is false.  A hash failure can
+    therefore leave ``present=false`` even though retained bytes exist.  Such
+    bytes are still made read-only; if a stable record cannot be recovered,
+    later Run admission treats the extant path as unverifiable and fails
+    closed.
+    """
+
+    errors: list[str] = []
+    for record in records:
+        raw = record.get("path")
+        if not isinstance(raw, str) or not raw:
+            errors.append("recorded Run output has no usable path")
+            continue
         candidate = _user_path(root, raw)
-        if not candidate.is_symlink() and candidate.is_file():
+        link = _symlink_component(root, candidate)
+        if link is not None:
+            errors.append(f"Run output uses a symbolic-link component: {link}")
+            continue
+        try:
+            metadata = candidate.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            if record.get("present") is True:
+                errors.append(f"Run output disappeared before it could be sealed: {raw}")
+            continue
+        except OSError as exc:
+            errors.append(f"cannot inspect Run output {raw} before sealing: {exc}")
+            continue
+        try:
+            if not stat.S_ISREG(metadata.st_mode):
+                errors.append(f"Run output is no longer a regular file: {raw}")
+                continue
+            # Preserve the latest known byte lower bound even when hashing
+            # failed.  The immutable ledger will charge it, and a surviving
+            # unverifiable path blocks every later Run.
+            if record.get("present") is not True:
+                record["size"] = metadata.st_size
             os.chmod(candidate, 0o444)
+            after = file_record(candidate, root)
+            after_metadata = candidate.stat(follow_symlinks=False)
+            if (
+                not stat.S_ISREG(after_metadata.st_mode)
+                or after_metadata.st_mode & 0o222
+            ):
+                errors.append(f"Run output was not sealed read-only: {raw}")
+                continue
+            if record.get("present") is True:
+                if (
+                    after.get("size") != record.get("size")
+                    or after.get("sha256") != record.get("sha256")
+                ):
+                    errors.append(f"Run output changed before it could be sealed: {raw}")
+            else:
+                record.update(
+                    {
+                        "path": after["path"],
+                        "present": True,
+                        "size": after["size"],
+                        "sha256": after["sha256"],
+                    }
+                )
+        except (OSError, WorkflowError) as exc:
+            errors.append(f"cannot seal Run output {raw}: {exc}")
+    return errors
 
 
-def _require_fresh_brief(paths: StudyPaths) -> dict[str, Any]:
-    issues = errors_only(brief_content_issues(paths) + brief_approval_issues(paths))
+def _capture_fresh_brief_authority(
+    paths: StudyPaths,
+) -> tuple[bytes, str, bytes, dict[str, Any]]:
+    """Capture and validate one exact approved Brief/approval byte pair."""
+
+    for path, label in (
+        (paths.brief, "Brief"),
+        (paths.brief_approval, "Brief approval"),
+    ):
+        if path.is_symlink() or not path.is_file():
+            raise ValidationError(f"{label} must be a regular, non-symbolic-link file")
+    try:
+        brief_bytes = paths.brief.read_bytes()
+        brief_text = brief_bytes.decode("utf-8")
+        approval_bytes = paths.brief_approval.read_bytes()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValidationError(f"cannot capture approved Brief authority: {exc}") from exc
+    approval = load_json_bytes(approval_bytes, label=str(paths.brief_approval))
+    issues = errors_only(brief_text_issues(paths.brief, brief_text))
+    issues.extend(
+        errors_only(
+            object_schema_issues(
+                paths.root,
+                "brief_approval",
+                paths.brief_approval,
+                approval,
+            )
+        )
+    )
+    if not isinstance(approval, dict):
+        raise ValidationError("Brief approval must be a JSON object")
+    brief_hash = sha256_bytes(brief_bytes)
+    approved_brief = approval.get("brief")
+    expected_path = paths.brief.relative_to(paths.root).as_posix()
+    if approval.get("study_id") != paths.study_id:
+        issues.append(
+            ValidationIssue("ERROR", str(paths.brief_approval), "approval study_id does not match Study")
+        )
+    if approval.get("approval_sha256") != record_digest(
+        approval, "approval_sha256"
+    ):
+        issues.append(
+            ValidationIssue("ERROR", str(paths.brief_approval), "approval_sha256 does not match record")
+        )
+    if not isinstance(approved_brief, dict) or (
+        approved_brief.get("path") != expected_path
+        or approved_brief.get("sha256") != brief_hash
+    ):
+        issues.append(
+            ValidationIssue("ERROR", str(paths.brief_approval), "approval does not authorize the captured Brief")
+        )
+    if approval.get("protected_artifacts") != protected_artifact_snapshot(paths):
+        issues.append(
+            ValidationIssue(
+                "ERROR",
+                str(paths.brief_approval),
+                "protected evaluator, data split, or acceptance criteria changed after approval",
+            )
+        )
     if issues:
         details = "\n".join(issue.render() for issue in issues)
         raise ValidationError(f"a fresh approved Brief is required before a Run:\n{details}")
-    approval = load_json(paths.brief_approval)
-    if not isinstance(approval, dict):
-        raise ValidationError("Brief approval must be a JSON object")
-    return approval
+    return brief_bytes, brief_text, approval_bytes, approval
 
 
-def _allocate_run_directory(paths: StudyPaths) -> tuple[str, Path]:
-    paths.runs.mkdir(parents=True, exist_ok=True)
-    highest = 0
-    for entry in paths.runs.iterdir():
-        match = _RUN_DIRECTORY_RE.fullmatch(entry.name)
-        if match:
-            highest = max(highest, int(match.group(1)))
-    candidate = highest + 1
-    while candidate <= 999_999:
-        run_id = f"RUN-{candidate:06d}"
-        run_directory = paths.runs / run_id
-        try:
-            # Allocation, rather than a preceding existence check, arbitrates
-            # concurrent registrars. A loser retries with the next Run ID.
-            os.mkdir(run_directory, 0o755)
-            return run_id, run_directory
-        except FileExistsError:
-            candidate += 1
-    raise WorkflowError("Run ID space is exhausted")
+def _require_fresh_brief(paths: StudyPaths) -> dict[str, Any]:
+    return _capture_fresh_brief_authority(paths)[3]
+
+
+@contextmanager
+def _run_registry_lock(paths: StudyPaths) -> Iterator[None]:
+    """Serialize budget projection, Run allocation, and the running record.
+
+    Lock the Study directory inode rather than runs/. Replacing the entire Run
+    directory therefore cannot create a second lock domain and budget ledger.
+    POSIX advisory locks are released by the kernel if the registrar crashes.
+    """
+
+    if paths.runs.is_symlink() or not paths.runs.is_dir():
+        raise ValidationError(
+            "Run registry directory is missing or is not a regular directory"
+        )
+    with study_authority_lock(paths):
+        yield
+
+
+def migrate_legacy_run_ledger(paths: StudyPaths) -> Path:
+    """Explicitly bind one intact pre-V3 Run history to a durable ledger."""
+
+    with _run_registry_lock(paths):
+        manifests = run_index(paths)
+        migrate_legacy_ledger(paths, manifests)
+    return paths.study / "RUNS.ledger.json"
 
 
 def _capture_formal_artifacts(
@@ -411,11 +577,68 @@ def _formal_capture_digest(
     )
 
 
+def _captured_protected_artifacts(
+    paths: StudyPaths,
+    captured: Sequence[tuple[Path, str, str, bytes]],
+) -> dict[str, Any]:
+    by_source = {source.resolve(): digest for source, _, digest, _ in captured}
+    result: dict[str, Any] = {}
+    for filename in (
+        "EVALUATOR.json",
+        "DATASET_SPLIT.json",
+        "ACCEPTANCE_CRITERIA.json",
+    ):
+        source = (paths.formal / filename).resolve()
+        key = filename.removesuffix(".json").lower()
+        digest = by_source.get(source)
+        result[key] = (
+            {
+                "path": (paths.formal / filename)
+                .relative_to(paths.root)
+                .as_posix(),
+                "sha256": digest,
+            }
+            if digest is not None
+            else None
+        )
+    return result
+
+
+def _planned_file_record(root: Path, path: Path, payload: bytes) -> dict[str, Any]:
+    return {
+        "path": _display_path(path, root),
+        "size": len(payload),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
+
+
+def _planned_formal_artifacts(
+    root: Path,
+    paths: StudyPaths,
+    run_directory: Path,
+    captured: Sequence[tuple[Path, str, str, bytes]],
+) -> list[dict[str, Any]]:
+    snapshot_root = run_directory / "formal-artifacts"
+    records: list[dict[str, Any]] = []
+    for source, kind, digest, payload in captured:
+        destination = snapshot_root / source.relative_to(paths.formal)
+        record = _planned_file_record(root, destination, payload)
+        if record["sha256"] != digest:
+            raise WorkflowError(
+                f"captured formal-artifact digest is inconsistent: {source}"
+            )
+        record["kind"] = kind
+        records.append(record)
+    return records
+
+
 def _snapshot_formal_artifacts(
     root: Path,
     paths: StudyPaths,
     run_directory: Path,
     captured: Sequence[tuple[Path, str, str, bytes]],
+    *,
+    record_run_directory: Path | None = None,
 ) -> list[dict[str, Any]]:
     snapshot_root = run_directory / "formal-artifacts"
     records: list[dict[str, Any]] = []
@@ -428,6 +651,11 @@ def _snapshot_formal_artifacts(
         if record["sha256"] != digest:
             raise ValidationError(
                 f"formal artifact changed while its Run snapshot was created: {source}"
+            )
+        if record_run_directory is not None:
+            record["path"] = _display_path(
+                record_run_directory / "formal-artifacts" / relative,
+                root,
             )
         record["kind"] = kind
         records.append(record)
@@ -446,15 +674,12 @@ def _formal_artifacts_unchanged(
     return _formal_capture_digest(paths, current) == before_digest
 
 
-def _snapshot_change_authorities(
+def _capture_change_authorities(
     root: Path,
     paths: StudyPaths,
-    run_directory: Path,
-) -> dict[str, dict[str, Any] | None]:
-    """Copy mutable governance records into the immutable Run directory."""
+) -> dict[str, tuple[str, bytes] | None]:
+    """Capture mutable governance bytes before a Run identity is allocated."""
 
-    governance = run_directory / "governance"
-    governance.mkdir()
     sources: tuple[tuple[str, Path, str, bool], ...] = (
         (
             "repository_profile",
@@ -465,22 +690,94 @@ def _snapshot_change_authorities(
         ("changeset", changeset_path(paths), "CHANGESET.json", False),
         ("validation", change_validation_path(paths), "VALIDATION.json", False),
     )
-    records: dict[str, dict[str, Any] | None] = {}
+    captured: dict[str, tuple[str, bytes] | None] = {}
     for key, source, filename, required in sources:
-        if not source.is_file():
+        if source.is_symlink() or not source.is_file():
             if required:
                 raise ValidationError(f"required Run authority is unavailable: {source}")
+            captured[key] = None
+            continue
+        captured[key] = (filename, source.read_bytes())
+    return captured
+
+
+def _planned_change_authorities(
+    root: Path,
+    run_directory: Path,
+    captured: dict[str, tuple[str, bytes] | None],
+) -> dict[str, dict[str, Any] | None]:
+    governance = run_directory / "governance"
+    return {
+        key: (
+            None
+            if item is None
+            else _planned_file_record(root, governance / item[0], item[1])
+        )
+        for key, item in captured.items()
+    }
+
+
+def _snapshot_change_authorities(
+    root: Path,
+    run_directory: Path,
+    captured: dict[str, tuple[str, bytes] | None],
+    *,
+    record_run_directory: Path | None = None,
+) -> dict[str, dict[str, Any] | None]:
+    """Copy captured governance records into the immutable Run directory."""
+
+    governance = run_directory / "governance"
+    governance.mkdir(exist_ok=True)
+    records: dict[str, dict[str, Any] | None] = {}
+    for key, item in captured.items():
+        if item is None:
             records[key] = None
             continue
+        filename, payload = item
         destination = governance / filename
         atomic_write_bytes(
             destination,
-            source.read_bytes(),
+            payload,
             overwrite=False,
             mode=0o444,
         )
-        records[key] = file_record(destination, root)
+        record = file_record(destination, root)
+        if record_run_directory is not None:
+            record["path"] = _display_path(
+                record_run_directory / "governance" / filename,
+                root,
+            )
+        records[key] = record
     return records
+
+
+def _fsync_directory_tree(root: Path) -> None:
+    """Durably publish every directory entry below a staged Run tree."""
+
+    directories = [root]
+    directories.extend(
+        path
+        for path in root.rglob("*")
+        if path.is_dir() and not path.is_symlink()
+    )
+    for directory in sorted(
+        directories,
+        key=lambda item: len(item.relative_to(root).parts),
+        reverse=True,
+    ):
+        try:
+            descriptor = os.open(
+                directory,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        except OSError as exc:
+            raise WorkflowError(
+                f"cannot durably sync staged Run directory {directory}: {exc}"
+            ) from exc
 
 
 def _load_protocol(paths: StudyPaths) -> tuple[Path, dict[str, Any] | None]:
@@ -689,22 +986,77 @@ def _output_records(
     raw_paths: Sequence[str | os.PathLike[str]] | None,
     policies: dict[Path, dict[str, Any]],
 ) -> list[dict[str, Any]]:
+    records, errors = _inspect_output_records(root, raw_paths, policies)
+    if errors:
+        raise ValidationError("; ".join(errors))
+    return records
+
+
+def _lexical_output_key(root: Path, raw: str | os.PathLike[str]) -> Path:
+    """Return a normalized key that is stable if the output becomes a symlink."""
+
+    return normalized_run_output_key(root, raw)
+
+
+def _display_lexical_output_path(
+    root: Path, raw: str | os.PathLike[str]
+) -> str:
+    path = _lexical_output_key(root, raw)
+    try:
+        return path.relative_to(root.absolute()).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def _inspect_output_records(
+    root: Path,
+    raw_paths: Sequence[str | os.PathLike[str]] | None,
+    policies: dict[Path, dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Inspect each declared output independently.
+
+    A malformed output must not erase the size and hash records of other safe
+    outputs.  This matters for incomplete Runs: every retained regular file
+    still consumes the human-authorized storage budget.
+    """
+
     records: list[dict[str, Any]] = []
+    errors: list[str] = []
     for raw in raw_paths or ():
         path = _user_path(root, raw)
-        link = _symlink_component(root, path)
-        if link is not None:
-            raise ValidationError(f"Run output uses a symbolic-link component: {link}")
+        policy = policies[_lexical_output_key(root, raw)]
         base: dict[str, Any] = {
-            "path": _display_path(path, root),
+            "path": _display_lexical_output_path(root, raw),
             "present": False,
             "size": None,
             "sha256": None,
-            "classification": policies[path.resolve(strict=False)]["classification"],
-            "pinned": policies[path.resolve(strict=False)]["pinned"],
+            "classification": policy["classification"],
+            "pinned": policy["pinned"],
         }
-        if not path.is_symlink() and path.is_file():
+        link = _symlink_component(root, path)
+        if link is not None:
+            errors.append(f"Run output uses a symbolic-link component: {link}")
+            records.append(base)
+            continue
+        try:
+            metadata = path.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            records.append(base)
+            continue
+        except OSError as exc:
+            errors.append(f"cannot inspect Run output {base['path']}: {exc}")
+            records.append(base)
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            records.append(base)
+            continue
+        # Record the retained bytes even if hashing subsequently fails.
+        base["size"] = metadata.st_size
+        try:
             snapshot = file_record(path, root)
+        except (OSError, WorkflowError) as exc:
+            errors.append(f"cannot record Run output {base['path']}: {exc}")
+        else:
             base.update(
                 {
                     "path": snapshot["path"],
@@ -714,7 +1066,7 @@ def _output_records(
                 }
             )
         records.append(base)
-    return records
+    return records, errors
 
 
 def _output_policies(
@@ -727,7 +1079,7 @@ def _output_policies(
 ) -> dict[Path, dict[str, Any]]:
     policies: dict[Path, dict[str, Any]] = {}
     for raw in raw_outputs or ():
-        key = _user_path(root, raw).resolve(strict=False)
+        key = _lexical_output_key(root, raw)
         if key in policies:
             raise ValidationError(f"duplicate output path: {_display_path(key, root)}")
         policies[key] = {"classification": "ordinary", "pinned": False}
@@ -739,7 +1091,7 @@ def _output_policies(
         selected: list[Path] = []
         seen: set[Path] = set()
         for raw in values or ():
-            key = _user_path(root, raw).resolve(strict=False)
+            key = _lexical_output_key(root, raw)
             if key in seen:
                 raise ValidationError(f"duplicate {label} path: {_display_path(key, root)}")
             seen.add(key)
@@ -763,21 +1115,65 @@ def _output_policies(
     return policies
 
 
-def _open_exclusive_log(path: Path) -> Any:
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    return os.fdopen(descriptor, "wb")
+def _open_registered_log(path: Path) -> Any:
+    """Open a log that was created before the running Manifest was registered."""
+
+    if path.is_symlink() or not path.is_file():
+        raise WorkflowError(f"registered Run log is unavailable or unsafe: {path}")
+    return path.open("ab")
 
 
 def _flush_log(handle: Any) -> None:
     handle.flush()
     try:
         os.fsync(handle.fileno())
-    except OSError:
-        pass
+    except OSError as exc:
+        raise WorkflowError(f"cannot durably sync Run log: {exc}") from exc
+
+
+def _process_group_exists(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # pragma: no cover - same-user children are normal
+        return True
+    return True
+
+
+def _drain_process_group(process_group_id: int, *, grace_seconds: float = 0.25) -> None:
+    """Terminate every descendant in a Run's dedicated POSIX process group."""
+
+    if os.name != "posix":  # pragma: no cover - POSIX is enforced for registry locks
+        return
+    try:
+        os.killpg(process_group_id, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + grace_seconds
+    while _process_group_exists(process_group_id) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if _process_group_exists(process_group_id):
+        try:
+            os.killpg(process_group_id, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        kill_deadline = time.monotonic() + 1.0
+        while (
+            _process_group_exists(process_group_id)
+            and time.monotonic() < kill_deadline
+        ):
+            time.sleep(0.01)
+        if _process_group_exists(process_group_id):
+            raise WorkflowError(
+                "could not confirm that every Run descendant terminated"
+            )
 
 
 def _terminate_process(process: subprocess.Popen[Any]) -> int | None:
-    if process.poll() is None:
+    if os.name == "posix":
+        _drain_process_group(process.pid)
+    elif process.poll() is None:  # pragma: no cover - exercised on non-POSIX hosts
         try:
             process.terminate()
         except ProcessLookupError:
@@ -786,10 +1182,176 @@ def _terminate_process(process: subprocess.Popen[Any]) -> int | None:
         return process.wait(timeout=5.0)
     except subprocess.TimeoutExpired:
         try:
-            process.kill()
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGKILL)
+            else:  # pragma: no cover - exercised on non-POSIX hosts
+                process.kill()
         except ProcessLookupError:
             pass
         return process.wait()
+
+
+def _planned_output_records(
+    root: Path,
+    raw_paths: Sequence[str | os.PathLike[str]] | None,
+    policies: dict[Path, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for raw in raw_paths or ():
+        path = _user_path(root, raw)
+        policy = policies[_lexical_output_key(root, raw)]
+        records.append(
+            {
+                "path": _display_path(path, root),
+                "present": False,
+                "size": None,
+                "sha256": None,
+                "classification": policy["classification"],
+                "pinned": policy["pinned"],
+            }
+        )
+    return records
+
+
+def _actual_output_storage_gb(outputs: Sequence[dict[str, Any]]) -> float:
+    total_bytes = sum(
+        int(record.get("size") or 0)
+        for record in outputs
+        if isinstance(record.get("size"), int)
+        and not isinstance(record.get("size"), bool)
+        and int(record["size"]) >= 0
+    )
+    return total_bytes / 1_000_000_000.0
+
+
+def _seal_terminal_manifest(path: Path, manifest: dict[str, Any]) -> None:
+    current = load_json(path)
+    if not isinstance(current, dict) or current.get("status") != "running":
+        raise WorkflowError(
+            f"refusing to replace a Run manifest that is not running: {path}"
+        )
+    integrity = current.get("integrity")
+    if not isinstance(integrity, dict) or any(
+        integrity.get(key) is not None for key in ("sealed_at", "manifest_sha256")
+    ):
+        raise WorkflowError(f"running Run manifest has unexpected terminal integrity: {path}")
+    atomic_write_json(
+        path,
+        manifest,
+        overwrite=True,
+        mode=0o444,
+        require_parent_fsync=True,
+    )
+
+
+def _failure_record(phase: str, exc: BaseException) -> dict[str, str]:
+    return {
+        "phase": phase,
+        "type": type(exc).__name__,
+        "message": str(exc) or repr(exc),
+    }
+
+
+def _seal_incomplete_after_failure(
+    *,
+    paths: StudyPaths,
+    root: Path,
+    policy: dict[str, Any],
+    manifest_path: Path,
+    initial_manifest: dict[str, Any],
+    inputs: list[tuple[Path, dict[str, Any]]],
+    output_paths: Sequence[str | os.PathLike[str]] | None,
+    output_policies: dict[Path, dict[str, Any]],
+    stdout_path: Path,
+    stderr_path: Path,
+    formal_capture_digest: str,
+    started_monotonic: float,
+    exit_code: int | None,
+    phase: str,
+    exc: BaseException,
+) -> dict[str, Any]:
+    """Best-effort conversion of a visible running record to incomplete."""
+
+    manifest = copy.deepcopy(initial_manifest)
+    manifest["status"] = "incomplete"
+    manifest["failure"] = _failure_record(phase, exc)
+    manifest["execution"].update(
+        {
+            "ended_at": utc_now(),
+            "duration_seconds": max(0.0, time.monotonic() - started_monotonic),
+            "exit_code": exit_code,
+        }
+    )
+    try:
+        code_after = _tracked_state(paths, root)
+    except BaseException:
+        code_after = manifest["code_state"]["before"]
+    manifest["code_state"].update(
+        {
+            "after": code_after,
+            "changed_during_run": manifest["code_state"]["before"] != code_after,
+        }
+    )
+    try:
+        scope_after = evaluate_changes(paths)
+    except BaseException:
+        scope_after = manifest["change_scope"]["before"]
+    manifest["change_scope"].update(
+        {"after": scope_after, "evidence_eligible": False}
+    )
+    try:
+        manifest["inputs"] = _finalize_input_records(inputs)
+    except BaseException:
+        pass
+    try:
+        outputs, output_errors = _inspect_output_records(
+            root, output_paths, output_policies
+        )
+    except BaseException as output_exc:
+        outputs = manifest["outputs"]
+        output_errors = [f"output inspection failed: {output_exc}"]
+    manifest["outputs"] = outputs
+    output_errors.extend(_seal_recorded_output_paths(root, outputs))
+    if output_errors:
+        manifest["failure"]["message"] += "; " + "; ".join(output_errors)
+    actual_storage = _actual_output_storage_gb(outputs)
+    manifest["budget"]["actual_output_storage_gb"] = actual_storage
+    requested = dict(manifest["budget"]["requested"])
+    requested["storage_gb"] = max(requested["storage_gb"], actual_storage)
+    projection = budget_projection(
+        manifest["budget"]["hard_limits"],
+        manifest["budget"]["committed_before"],
+        requested,
+    )
+    manifest["budget"]["requested"] = requested
+    manifest["budget"]["committed_after"] = projection["committed_after"]
+    manifest["budget"]["violations"] = projection["violations"]
+    manifest["formalization"]["artifacts_unchanged_during_run"] = (
+        _formal_artifacts_unchanged(paths, policy, formal_capture_digest)
+    )
+    for path in (stdout_path, stderr_path):
+        try:
+            os.chmod(path, 0o444)
+        except OSError:
+            pass
+    try:
+        manifest["logs"] = {
+            "stdout": file_record(stdout_path, root),
+            "stderr": file_record(stderr_path, root),
+        }
+    except BaseException:
+        # The initial records still identify the intended files; validation
+        # will report any missing or changed log explicitly.
+        pass
+    manifest["integrity"] = {
+        "sealed_at": utc_now(),
+        "manifest_sha256": None,
+    }
+    manifest["integrity"]["manifest_sha256"] = nested_record_digest(
+        manifest, "integrity", "manifest_sha256"
+    )
+    _seal_terminal_manifest(manifest_path, manifest)
+    return manifest
 
 
 def execute_run(
@@ -800,6 +1362,7 @@ def execute_run(
     cohort_id: str | None = None,
     estimated_gpu_hours: float = 0.0,
     estimated_cpu_hours: float = 0.0,
+    estimated_storage_gb: float = 0.0,
     input_paths: Sequence[str | os.PathLike[str]] | None = None,
     output_paths: Sequence[str | os.PathLike[str]] | None = None,
     pinned_outputs: Sequence[str | os.PathLike[str]] | None = None,
@@ -861,8 +1424,14 @@ def execute_run(
             for item in change_scope_before["violations"]
         )
         raise ValidationError(f"change-scope gate blocked Run:\n{details}")
-    gpu_hours = require_nonnegative_finite("estimated GPU hours", estimated_gpu_hours)
-    cpu_hours = require_nonnegative_finite("estimated CPU hours", estimated_cpu_hours)
+    requested_resources = requested_budget(
+        gpu_hours=estimated_gpu_hours,
+        cpu_hours=estimated_cpu_hours,
+        storage_gb=estimated_storage_gb,
+    )
+    gpu_hours = requested_resources["gpu_hours"]
+    cpu_hours = requested_resources["cpu_hours"]
+    storage_gb = requested_resources["storage_gb"]
     actual_critical_paths = critical_actual_paths(change_scope_before, profile)
     effective_changed_paths = list(
         dict.fromkeys([*declared_changed_paths, *actual_critical_paths])
@@ -873,9 +1442,11 @@ def execute_run(
         {
             "estimated_gpu_hours": gpu_hours,
             "estimated_cpu_hours": cpu_hours,
+            "estimated_storage_gb": storage_gb,
             "changed_path": effective_changed_paths,
             "scientific_critical": effective_scientific_critical,
             "shared_across_runs": bool(shared_across_runs),
+            "for_run": True,
         },
     )
     if formalization.blocked:
@@ -885,201 +1456,618 @@ def execute_run(
         )
         raise ValidationError(f"formalization gate blocked Run:\n{requirements}")
 
-    policy = load_policy(paths)
-    protocol_path, protocol = _load_protocol(paths)
-    captured_formal_artifacts = _capture_formal_artifacts(paths, policy)
-    formal_capture_digest = _formal_capture_digest(paths, captured_formal_artifacts)
-    runtime_environment = _selected_runtime_environment()
-    cohort, effective_hardware, effective_precision = _cohort_record(
-        paths,
-        policy,
-        protocol_path,
-        protocol,
-        cohort_id,
-        hardware_class,
-        precision,
-        cohort_fields,
-        runtime_environment,
-    )
-    inputs = _input_records(root, input_paths)
-    git = git_state(root)
-    code_state_before = git_tracked_state(root)
-    environment = _environment_record(
-        effective_hardware,
-        effective_precision,
-        runtime_environment,
-    )
-    brief = {
-        "path": _display_path(paths.brief, root),
-        "sha256": sha256_file(paths.brief),
-        "approval_sha256": str(approval["approval_sha256"]),
-    }
-
-    run_id, run_directory = _allocate_run_directory(paths)
-    formal_artifacts = _snapshot_formal_artifacts(
-        root,
-        paths,
-        run_directory,
-        captured_formal_artifacts,
-    )
-    change_authorities = _snapshot_change_authorities(
-        root,
-        paths,
-        run_directory,
-    )
-    stdout_path = run_directory / "stdout.log"
-    stderr_path = run_directory / "stderr.log"
     command = list(argv)
-    started_at = utc_now()
-    started_monotonic = time.monotonic()
+
+    # Budget check, reservation, Run-ID allocation, and the initial Manifest
+    # are one serialized registration transaction.  No child process can
+    # start before its reservation is durable and visible.
+    with _run_registry_lock(paths):
+        brief_bytes, brief_text, approval_payload, approval = (
+            _capture_fresh_brief_authority(paths)
+        )
+        brief_digest = sha256_bytes(brief_bytes)
+        approval_file_digest = sha256_bytes(approval_payload)
+        hard_limits = parse_brief_hard_budget(brief_text)
+        change_scope_before = evaluate_changes(paths)
+        if change_scope_before["outcome"] == "BLOCKED":
+            details = "\n".join(
+                f"- {item['rule']}: {item['path'] or '<repository>'}: {item['reason']}"
+                for item in change_scope_before["violations"]
+            )
+            raise ValidationError(f"change-scope gate blocked Run:\n{details}")
+        actual_critical_paths = critical_actual_paths(change_scope_before, profile)
+        effective_changed_paths = list(
+            dict.fromkeys([*declared_changed_paths, *actual_critical_paths])
+        )
+        effective_scientific_critical = bool(
+            scientific_critical or actual_critical_paths
+        )
+        formalization = check_formalization(
+            paths,
+            {
+                "estimated_gpu_hours": gpu_hours,
+                "estimated_cpu_hours": cpu_hours,
+                "estimated_storage_gb": storage_gb,
+                "changed_path": effective_changed_paths,
+                "scientific_critical": effective_scientific_critical,
+                "shared_across_runs": bool(shared_across_runs),
+                "for_run": True,
+            },
+        )
+        if formalization.blocked:
+            requirements = "\n".join(
+                f"- {item['level']}: {item['artifact']}: {item['reason']}"
+                for item in formalization.requirements
+            )
+            raise ValidationError(f"formalization gate blocked Run:\n{requirements}")
+
+        existing_runs = run_index(paths)
+        # The early output check is only a fast preflight. Re-check filesystem
+        # novelty and reserve every normalized path while registration is
+        # serialized. The running Manifest is published before this lock is
+        # released, so a concurrent registrar must observe the reservation
+        # even when the first Run never produces the declared file.
+        _require_output_root(root, object_root, output_paths)
+        claimed_outputs, _ = run_output_ownership(root, existing_runs)
+        for output_path in output_policies:
+            owner = claimed_outputs.get(output_path)
+            if owner is not None:
+                owner_run_id, _ = owner
+                raise ValidationError(
+                    f"Run output path {_display_path(output_path, root)} is "
+                    f"already claimed by {owner_run_id}"
+                )
+        _require_new_output_paths(root, output_paths)
+        unresolved = sorted(
+            run_id
+            for run_id, (_, item) in existing_runs.items()
+            if item.get("status") == "running" and item.get("outputs")
+        )
+        if unresolved:
+            raise ValidationError(
+                "unresolved output-producing running Run(s) block new "
+                "registration because their final storage use is not yet "
+                "known: "
+                + ", ".join(unresolved)
+            )
+        retained_output_issues = [
+            issue
+            for _, manifest_record in existing_runs.values()
+            for issue in retained_run_output_budget_issues(
+                paths, manifest_record
+            )
+        ]
+        if retained_output_issues:
+            details = "\n".join(issue.render() for issue in retained_output_issues)
+            raise ValidationError(
+                "retained Run output integrity blocks budget admission:\n"
+                + details
+            )
+        ledger = bootstrap_or_reconcile_ledger(
+            paths, existing_runs, write=True
+        )
+        committed_before = ledger_commitment_totals(ledger)
+        reservation = budget_projection(
+            hard_limits, committed_before, requested_resources
+        )
+        if reservation["violations"]:
+            details = "; ".join(
+                format_budget_violation(item)
+                for item in reservation["violations"]
+            )
+            raise ValidationError(f"hard-budget gate blocked Run: {details}")
+
+        policy = load_policy(paths)
+        protocol_path, protocol = _load_protocol(paths)
+        captured_formal_artifacts = _capture_formal_artifacts(paths, policy)
+        if _captured_protected_artifacts(
+            paths, captured_formal_artifacts
+        ) != approval.get("protected_artifacts"):
+            raise ValidationError(
+                "protected artifacts changed while Run authority was captured"
+            )
+        formal_capture_digest = _formal_capture_digest(
+            paths, captured_formal_artifacts
+        )
+        captured_change_authorities = _capture_change_authorities(root, paths)
+        runtime_environment = _selected_runtime_environment()
+        cohort, effective_hardware, effective_precision = _cohort_record(
+            paths,
+            policy,
+            protocol_path,
+            protocol,
+            cohort_id,
+            hardware_class,
+            precision,
+            cohort_fields,
+            runtime_environment,
+        )
+        inputs = _input_records(root, input_paths)
+        git = git_state(root)
+        code_state_before = _tracked_state(paths, root)
+        environment = _environment_record(
+            effective_hardware,
+            effective_precision,
+            runtime_environment,
+        )
+        brief = {
+            "path": _display_path(paths.brief, root),
+            "sha256": brief_digest,
+            "approval_sha256": str(approval["approval_sha256"]),
+        }
+
+        ledger, run_id = reserve_run_id(
+            paths, ledger, reservation["requested"]
+        )
+        run_directory = paths.runs / run_id
+        staging_directory = Path(
+            tempfile.mkdtemp(
+                prefix=f".{run_id}.",
+                suffix=".registration.tmp",
+                dir=paths.runs,
+            )
+        )
+        formal_artifacts = _planned_formal_artifacts(
+            root,
+            paths,
+            run_directory,
+            captured_formal_artifacts,
+        )
+        change_authorities = _planned_change_authorities(
+            root,
+            run_directory,
+            captured_change_authorities,
+        )
+        stdout_path = run_directory / "stdout.log"
+        stderr_path = run_directory / "stderr.log"
+        staged_stdout_path = staging_directory / "stdout.log"
+        staged_stderr_path = staging_directory / "stderr.log"
+        brief_snapshot_path = run_directory / "governance" / "BRIEF.md"
+        approval_snapshot_path = (
+            run_directory / "governance" / "BRIEF.approval.json"
+        )
+        staged_brief_snapshot_path = (
+            staging_directory / "governance" / "BRIEF.md"
+        )
+        staged_approval_snapshot_path = (
+            staging_directory / "governance" / "BRIEF.approval.json"
+        )
+        brief_snapshot = _planned_file_record(
+            root, brief_snapshot_path, brief_bytes
+        )
+        approval_snapshot = _planned_file_record(
+            root, approval_snapshot_path, approval_payload
+        )
+        brief["snapshot"] = brief_snapshot
+        brief["approval_snapshot"] = approval_snapshot
+        started_at = utc_now()
+        started_monotonic = time.monotonic()
+        initial_manifest: dict[str, Any] = {
+            "schema_version": _RUN_SCHEMA_VERSION,
+            "study_id": paths.study_id,
+            "run_id": run_id,
+            "purpose": purpose,
+            "status": "running",
+            "execution": {
+                "argv": command,
+                "cwd": str(configured_cwd),
+                "cwd_relative": str(profile["run_cwd"]),
+                "started_at": started_at,
+                "ended_at": None,
+                "duration_seconds": None,
+                "exit_code": None,
+                "seed": seed,
+            },
+            "git": git,
+            "code_state": {
+                "before": code_state_before,
+                "after": code_state_before,
+                "changed_during_run": False,
+            },
+            "change_scope": {
+                "repository_profile": change_authorities["repository_profile"],
+                "changeset": change_authorities["changeset"],
+                "validation": change_authorities["validation"],
+                "before": change_scope_before,
+                "after": change_scope_before,
+                "evidence_eligible": False,
+            },
+            "brief": brief,
+            "formal_artifacts": formal_artifacts,
+            "formalization": {
+                "changed_paths": effective_changed_paths,
+                "declared_changed_paths": declared_changed_paths,
+                "actual_changed_paths": [
+                    record["path"]
+                    for record in change_scope_before["changed_paths"]
+                ],
+                "scientific_critical": effective_scientific_critical,
+                "shared_across_runs": bool(shared_across_runs),
+                "artifacts_unchanged_during_run": True,
+                "outcome": formalization.outcome,
+                "requirements": formalization.requirements,
+            },
+            "cohort": cohort,
+            "environment": environment,
+            "budget": {
+                "estimated_gpu_hours": gpu_hours,
+                "estimated_cpu_hours": cpu_hours,
+                "estimated_storage_gb": storage_gb,
+                "actual_output_storage_gb": None,
+                "hard_limits": hard_limits,
+                "committed_before": reservation["committed_before"],
+                "requested": reservation["requested"],
+                "committed_after": reservation["committed_after"],
+                "violations": [],
+            },
+            "inputs": [dict(record) for _, record in inputs],
+            "outputs": _planned_output_records(
+                root, output_paths, output_policies
+            ),
+            "logs": {
+                "stdout": _planned_file_record(root, stdout_path, b""),
+                "stderr": _planned_file_record(root, stderr_path, b""),
+            },
+            "failure": None,
+            "integrity": {
+                "sealed_at": None,
+                "manifest_sha256": None,
+            },
+        }
+        try:
+            atomic_write_bytes(
+                staged_stdout_path, b"", overwrite=False, mode=0o600
+            )
+            atomic_write_bytes(
+                staged_stderr_path, b"", overwrite=False, mode=0o600
+            )
+            staged_brief_snapshot_path.parent.mkdir(exist_ok=True)
+            atomic_write_bytes(
+                staged_brief_snapshot_path,
+                brief_bytes,
+                overwrite=False,
+                mode=0o444,
+            )
+            atomic_write_bytes(
+                staged_approval_snapshot_path,
+                approval_payload,
+                overwrite=False,
+                mode=0o444,
+            )
+            recorded_brief = file_record(staged_brief_snapshot_path, root)
+            recorded_brief["path"] = brief_snapshot["path"]
+            if recorded_brief != brief_snapshot:
+                raise WorkflowError(
+                    f"{run_id} Brief snapshot differs from registration"
+                )
+            recorded_approval = file_record(
+                staged_approval_snapshot_path, root
+            )
+            recorded_approval["path"] = approval_snapshot["path"]
+            if recorded_approval != approval_snapshot:
+                raise WorkflowError(
+                    f"{run_id} Brief-approval snapshot differs from registration"
+                )
+            recorded_formal_artifacts = _snapshot_formal_artifacts(
+                root,
+                paths,
+                staging_directory,
+                captured_formal_artifacts,
+                record_run_directory=run_directory,
+            )
+            recorded_change_authorities = _snapshot_change_authorities(
+                root,
+                staging_directory,
+                captured_change_authorities,
+                record_run_directory=run_directory,
+            )
+            if recorded_formal_artifacts != formal_artifacts:
+                raise WorkflowError(
+                    f"{run_id} formal-artifact snapshots differ from registration"
+                )
+            if recorded_change_authorities != change_authorities:
+                raise WorkflowError(
+                    f"{run_id} governance snapshots differ from registration"
+                )
+            staged_manifest_path = staging_directory / "manifest.json"
+            atomic_write_json(
+                staged_manifest_path,
+                initial_manifest,
+                overwrite=False,
+                mode=0o600,
+            )
+            _fsync_directory_tree(staging_directory)
+            if (
+                paths.brief.is_symlink()
+                or paths.brief_approval.is_symlink()
+                or sha256_file(paths.brief) != brief_digest
+                or sha256_file(paths.brief_approval) != approval_file_digest
+                or protected_artifact_snapshot(paths)
+                != approval.get("protected_artifacts")
+            ):
+                raise WorkflowError(
+                    "Brief authority changed during Run registration"
+                )
+            os.rename(staging_directory, run_directory)
+            try:
+                registry_fd = os.open(paths.runs, os.O_RDONLY)
+                try:
+                    os.fsync(registry_fd)
+                finally:
+                    os.close(registry_fd)
+            except OSError as exc:
+                raise WorkflowError(
+                    f"cannot durably publish {run_id} in the Run registry: {exc}"
+                ) from exc
+            manifest_path = run_directory / "manifest.json"
+            ledger = record_manifest_in_ledger(
+                paths,
+                ledger,
+                run_id,
+                manifest_path,
+                initial_manifest,
+            )
+        except BaseException:
+            # Nothing below a RUN-* name becomes authoritative until the
+            # complete staged directory, including its running Manifest, is
+            # atomically renamed into place. A registration failure therefore
+            # cannot create an orphan Run or launch the child process.
+            if staging_directory.exists() and not staging_directory.is_symlink():
+                shutil.rmtree(staging_directory, ignore_errors=True)
+            if not run_directory.exists() and not run_directory.is_symlink():
+                try:
+                    mark_registration_aborted(paths, ledger, run_id)
+                except BaseException:
+                    # A visible reservation is safer than silently reusing
+                    # its ID or dropping its conservative budget charge.
+                    pass
+            raise
+
     exit_code: int | None = None
     interrupted = False
     execution_failed = False
+    execution_error: BaseException | None = None
+    unexpected_error: BaseException | None = None
     process: subprocess.Popen[Any] | None = None
+    manifest: dict[str, Any] | None = None
 
-    with _open_exclusive_log(stdout_path) as stdout_log, _open_exclusive_log(
-        stderr_path
-    ) as stderr_log:
-        try:
-            process = subprocess.Popen(
-                command,
-                cwd=configured_cwd,
-                stdout=stdout_log,
-                stderr=stderr_log,
-                shell=False,
-            )
-            exit_code = process.wait()
-        except KeyboardInterrupt:
-            interrupted = True
-            if process is not None:
-                try:
-                    exit_code = _terminate_process(process)
-                except (
-                    OSError,
-                    ValueError,
-                    subprocess.SubprocessError,
-                    KeyboardInterrupt,
-                ) as exc:
-                    exit_code = None
-                    stderr_log.write(
-                        f"studyctl: interrupted command cleanup failed: {exc}\n".encode("utf-8")
+    try:
+        with _open_registered_log(stdout_path) as stdout_log, _open_registered_log(
+            stderr_path
+        ) as stderr_log:
+            try:
+                process = subprocess.Popen(
+                    command,
+                    cwd=configured_cwd,
+                    stdout=stdout_log,
+                    stderr=stderr_log,
+                    shell=False,
+                    start_new_session=os.name == "posix",
+                )
+                exit_code = process.wait()
+                # A command may exit after daemonizing descendants.  Do not
+                # seal a Run while same-session workers can still mutate its
+                # outputs or repository state.
+                if os.name == "posix":
+                    _drain_process_group(process.pid)
+            except KeyboardInterrupt:
+                interrupted = True
+                if process is not None:
+                    try:
+                        exit_code = _terminate_process(process)
+                    except (
+                        OSError,
+                        ValueError,
+                        subprocess.SubprocessError,
+                        KeyboardInterrupt,
+                    ) as exc:
+                        exit_code = None
+                        stderr_log.write(
+                            (
+                                "studyctl: interrupted command cleanup failed: "
+                                f"{exc}\n"
+                            ).encode("utf-8")
+                        )
+            except (OSError, ValueError) as exc:
+                execution_failed = True
+                execution_error = exc
+                if process is None:
+                    exit_code = 127
+                    message = f"studyctl: failed to start command: {exc}\n"
+                else:
+                    try:
+                        exit_code = _terminate_process(process)
+                    except (OSError, ValueError, subprocess.SubprocessError):
+                        exit_code = None
+                    message = f"studyctl: command execution failed: {exc}\n"
+                stderr_log.write(message.encode("utf-8"))
+            except BaseException as exc:
+                unexpected_error = exc
+                if process is not None:
+                    try:
+                        exit_code = _terminate_process(process)
+                    except BaseException:
+                        exit_code = None
+                stderr_log.write(
+                    f"studyctl: unexpected execution failure: {exc}\n".encode(
+                        "utf-8"
                     )
-        except (OSError, ValueError) as exc:
-            execution_failed = True
-            if process is None:
-                exit_code = 127
-                message = f"studyctl: failed to start command: {exc}\n"
-            else:
-                try:
-                    exit_code = _terminate_process(process)
-                except (OSError, ValueError, subprocess.SubprocessError):
-                    exit_code = None
-                message = f"studyctl: command execution failed: {exc}\n"
-            stderr_log.write(message.encode("utf-8"))
-        finally:
-            _flush_log(stdout_log)
-            _flush_log(stderr_log)
+                )
+            finally:
+                _flush_log(stdout_log)
+                _flush_log(stderr_log)
 
-    ended_at = utc_now()
-    duration_seconds = max(0.0, time.monotonic() - started_monotonic)
-    code_state_after = git_tracked_state(root)
-    change_scope_after = evaluate_changes(paths)
-    os.chmod(stdout_path, 0o444)
-    os.chmod(stderr_path, 0o444)
-    outputs = _output_records(root, output_paths, output_policies)
-    _seal_output_paths(root, output_paths)
-    finalized_inputs = _finalize_input_records(inputs)
-    formal_artifacts_unchanged = _formal_artifacts_unchanged(
-        paths,
-        policy,
-        formal_capture_digest,
-    )
-    dependencies_evidence_eligible = (
-        all(record.get("changed_during_run") is False for record in finalized_inputs)
-        and all(record.get("present") is True for record in outputs)
-        and formal_artifacts_unchanged
-    )
-    status = (
-        "interrupted"
-        if interrupted
-        else "succeeded"
-        if exit_code == 0 and not execution_failed
-        else "failed"
-    )
-    manifest: dict[str, Any] = {
-        "schema_version": _RUN_SCHEMA_VERSION,
-        "study_id": paths.study_id,
-        "run_id": run_id,
-        "purpose": purpose,
-        "status": status,
-        "execution": {
-            "argv": command,
-            "cwd": str(configured_cwd),
-            "cwd_relative": str(profile["run_cwd"]),
-            "started_at": started_at,
-            "ended_at": ended_at,
-            "duration_seconds": duration_seconds,
-            "exit_code": exit_code,
-            "seed": seed,
-        },
-        "git": git,
-        "code_state": {
-            "before": code_state_before,
-            "after": code_state_after,
-            "changed_during_run": code_state_before != code_state_after,
-        },
-        "change_scope": {
-            "repository_profile": change_authorities["repository_profile"],
-            "changeset": change_authorities["changeset"],
-            "validation": change_authorities["validation"],
-            "before": change_scope_before,
-            "after": change_scope_after,
-            "evidence_eligible": (
-                change_state_evidence_eligible(change_scope_before)
-                and change_state_evidence_eligible(change_scope_after)
-                and dependencies_evidence_eligible
-            ),
-        },
-        "brief": brief,
-        "formal_artifacts": formal_artifacts,
-        "formalization": {
-            "changed_paths": effective_changed_paths,
-            "declared_changed_paths": declared_changed_paths,
-            "actual_changed_paths": [
-                record["path"] for record in change_scope_before["changed_paths"]
-            ],
-            "scientific_critical": effective_scientific_critical,
-            "shared_across_runs": bool(shared_across_runs),
-            "artifacts_unchanged_during_run": formal_artifacts_unchanged,
-            "outcome": formalization.outcome,
-            "requirements": formalization.requirements,
-        },
-        "cohort": cohort,
-        "environment": environment,
-        "budget": {
-            "estimated_gpu_hours": gpu_hours,
-            "estimated_cpu_hours": cpu_hours,
-        },
-        "inputs": finalized_inputs,
-        "outputs": outputs,
-        "logs": {
+        if unexpected_error is not None:
+            raise unexpected_error
+
+        code_state_after = _tracked_state(paths, root)
+        change_scope_after = evaluate_changes(paths)
+        outputs = _output_records(root, output_paths, output_policies)
+        sealing_errors = _seal_recorded_output_paths(root, outputs)
+        if sealing_errors:
+            raise ValidationError("; ".join(sealing_errors))
+        finalized_inputs = _finalize_input_records(inputs)
+        formal_artifacts_unchanged = _formal_artifacts_unchanged(
+            paths, policy, formal_capture_digest
+        )
+        dependencies_evidence_eligible = (
+            all(
+                record.get("changed_during_run") is False
+                for record in finalized_inputs
+            )
+            and all(record.get("present") is True for record in outputs)
+            and formal_artifacts_unchanged
+        )
+        status = (
+            "interrupted"
+            if interrupted
+            else "succeeded"
+            if exit_code == 0 and not execution_failed
+            else "failed"
+        )
+        manifest = copy.deepcopy(initial_manifest)
+        manifest["status"] = status
+        manifest["execution"].update(
+            {
+                "ended_at": utc_now(),
+                "duration_seconds": max(
+                    0.0, time.monotonic() - started_monotonic
+                ),
+                "exit_code": exit_code,
+            }
+        )
+        manifest["code_state"].update(
+            {
+                "after": code_state_after,
+                "changed_during_run": code_state_before != code_state_after,
+            }
+        )
+        manifest["change_scope"].update(
+            {
+                "after": change_scope_after,
+                "evidence_eligible": (
+                    change_state_evidence_eligible(change_scope_before)
+                    and change_state_evidence_eligible(change_scope_after)
+                    and dependencies_evidence_eligible
+                ),
+            }
+        )
+        manifest["formalization"][
+            "artifacts_unchanged_during_run"
+        ] = formal_artifacts_unchanged
+        manifest["inputs"] = finalized_inputs
+        manifest["outputs"] = outputs
+        actual_storage = _actual_output_storage_gb(outputs)
+        os.chmod(stdout_path, 0o444)
+        os.chmod(stderr_path, 0o444)
+        terminal_logs = {
             "stdout": file_record(stdout_path, root),
             "stderr": file_record(stderr_path, root),
-        },
-        "integrity": {
-            "sealed_at": utc_now(),
-            "manifest_sha256": None,
-        },
-    }
-    manifest["integrity"]["manifest_sha256"] = nested_record_digest(
-        manifest, "integrity", "manifest_sha256"
-    )
-    atomic_write_json(
-        run_directory / "manifest.json",
-        manifest,
-        overwrite=False,
-        mode=0o444,
-    )
+        }
+
+        with _run_registry_lock(paths):
+            current_runs = run_index(paths)
+            current_ledger = bootstrap_or_reconcile_ledger(
+                paths, current_runs, write=True
+            )
+            committed_without_self = ledger_commitment_totals(
+                current_ledger, exclude_run_id=run_id
+            )
+            charged = dict(requested_resources)
+            charged["storage_gb"] = max(storage_gb, actual_storage)
+            final_budget = budget_projection(
+                hard_limits, committed_without_self, charged
+            )
+            manifest["budget"].update(
+                {
+                    "actual_output_storage_gb": actual_storage,
+                    "committed_before": final_budget["committed_before"],
+                    "requested": final_budget["requested"],
+                    "committed_after": final_budget["committed_after"],
+                    "violations": final_budget["violations"],
+                }
+            )
+            if final_budget["violations"]:
+                manifest["status"] = "incomplete"
+                manifest["failure"] = {
+                    "phase": "budget_finalization",
+                    "type": "HardBudgetExceeded",
+                    "message": "; ".join(
+                        format_budget_violation(item)
+                        for item in final_budget["violations"]
+                    ),
+                }
+                manifest["change_scope"]["evidence_eligible"] = False
+            elif execution_error is not None:
+                manifest["failure"] = _failure_record(
+                    "execution", execution_error
+                )
+
+            manifest["logs"] = terminal_logs
+            manifest["integrity"] = {
+                "sealed_at": utc_now(),
+                "manifest_sha256": None,
+            }
+            manifest["integrity"]["manifest_sha256"] = nested_record_digest(
+                manifest, "integrity", "manifest_sha256"
+            )
+            _seal_terminal_manifest(manifest_path, manifest)
+            record_manifest_in_ledger(
+                paths,
+                current_ledger,
+                run_id,
+                manifest_path,
+                manifest,
+            )
+    except BaseException as exc:
+        try:
+            with _run_registry_lock(paths):
+                current_runs = run_index(paths)
+                current_ledger = bootstrap_or_reconcile_ledger(
+                    paths, current_runs, write=True
+                )
+                committed_without_self = ledger_commitment_totals(
+                    current_ledger, exclude_run_id=run_id
+                )
+                initial_manifest["budget"][
+                    "committed_before"
+                ] = committed_without_self
+                incomplete_manifest = _seal_incomplete_after_failure(
+                    paths=paths,
+                    root=root,
+                    policy=policy,
+                    manifest_path=manifest_path,
+                    initial_manifest=initial_manifest,
+                    inputs=inputs,
+                    output_paths=output_paths,
+                    output_policies=output_policies,
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                    formal_capture_digest=formal_capture_digest,
+                    started_monotonic=started_monotonic,
+                    exit_code=exit_code,
+                    phase=(
+                        "execution"
+                        if unexpected_error is not None
+                        else "finalization"
+                    ),
+                    exc=exc,
+                )
+                record_manifest_in_ledger(
+                    paths,
+                    current_ledger,
+                    run_id,
+                    manifest_path,
+                    incomplete_manifest,
+                )
+        except BaseException:
+            # A durable running Manifest still exposes the unfinished Run and
+            # keeps its budget reserved until explicit recovery.
+            pass
+        raise
+
     if interrupted:
         raise RunInterrupted(f"{run_id} was interrupted and sealed")
+    if manifest is None:  # pragma: no cover - defensive invariant
+        raise WorkflowError(f"{run_id} completed without a terminal manifest")
     return manifest

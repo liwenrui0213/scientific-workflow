@@ -9,7 +9,6 @@ import sys
 from tests.helpers import TTYBuffer, WorkflowTestCase
 from tools.studyctl.approval import record_verdict
 from tools.studyctl.compaction import (
-    budget_totals,
     current_evidence_hashes,
     finalize_compaction,
     prepare_compaction,
@@ -27,7 +26,7 @@ from tools.studyctl.cli import main as studyctl_main
 from tools.studyctl.models import StudyPaths
 from tools.studyctl.rendering import render_status
 from tools.studyctl.review import create_review_packet
-from tools.studyctl.validation import errors_only, run_index, validate_study
+from tools.studyctl.validation import errors_only, validate_study
 
 
 class DemonstrationLifecycleTests(WorkflowTestCase):
@@ -39,6 +38,7 @@ class DemonstrationLifecycleTests(WorkflowTestCase):
         evidence_ref: dict[str, object],
     ) -> Path:
         compaction_input = prepare_compaction(paths)
+        prepared = load_json(compaction_input)
         claims = load_json(paths.claims)
         destination = paths.work / "demonstration-compaction-plan.json"
         atomic_write_json(
@@ -56,7 +56,7 @@ class DemonstrationLifecycleTests(WorkflowTestCase):
                 "open_questions": claims["frontier"]["open_questions"],
                 "next_actions": claims["frontier"]["next_actions"],
                 "representative_failures": [],
-                "budget_state": budget_totals(run_index(paths)),
+                "budget_state": prepared["budget_totals"],
             },
         )
         return destination

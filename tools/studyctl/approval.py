@@ -1,20 +1,24 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import re
 import sys
 from typing import Any, TextIO
 
+from .budget import format_brief_hard_budget_block, normalize_hard_budget
 from .git_state import git_state, reviewer_identity
 from .hashing import (
     atomic_write_bytes,
     atomic_write_json,
     load_json,
+    load_json_bytes,
     record_digest,
     sha256_file,
     sha256_json,
 )
+from .locking import serialized_study_authority
 from .models import (
     HUMAN_SCIENTIFIC_VERDICTS,
     SCHEMA_VERSION,
@@ -26,6 +30,7 @@ from .models import (
     utc_now,
 )
 from .validation import (
+    REQUIRED_BRIEF_HEADINGS,
     brief_approval_issues,
     brief_content_issues,
     checkpoint_paths,
@@ -43,6 +48,10 @@ _BRIEF_METADATA_BLOCK = re.compile(
 )
 _REPLACEMENT_PLACEHOLDER = re.compile(r"\[REPLACE(?:[^\]]*)\]")
 _VERDICT_VERSION = re.compile(r"^VERDICT\.v([0-9]+)\.json$")
+_RESOURCE_BUDGET_SECTION = re.compile(
+    r"^##\s+Resource Budget\s*$.*?(?=^##\s+|<!--\s*STUDYCTL-METADATA-BEGIN|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
 
 
 def _require_human_tty(stdin: TextIO, stdout: TextIO) -> None:
@@ -120,6 +129,7 @@ def _next_reapproval_archive(paths: StudyPaths, brief_version: int) -> Path:
     return history / f"{prefix}{highest + 1:04d}.json"
 
 
+@serialized_study_authority
 def approve_brief(
     paths: StudyPaths,
     stdin: TextIO = sys.stdin,
@@ -208,7 +218,57 @@ def approve_brief(
     return paths.brief_approval
 
 
-def _new_brief_draft(text: str, current_version: int) -> bytes:
+def _legacy_approved_brief(
+    paths: StudyPaths,
+) -> tuple[str, int, dict[str, float | None]]:
+    """Validate an approved pre-visible-budget Brief for one-way migration."""
+
+    if paths.brief.is_symlink() or not paths.brief.is_file():
+        raise ValidationError("Brief must be a regular, non-symbolic-link file")
+    text = paths.brief.read_text(encoding="utf-8")
+    if "STUDYCTL-HARD-BUDGET-BEGIN" in text or "STUDYCTL-HARD-BUDGET-END" in text:
+        raise ValidationError("legacy Brief migration requires no visible budget block")
+    if _REPLACEMENT_PLACEHOLDER.search(text) or re.search(r"\{\{[^{}]+\}\}", text):
+        raise ValidationError("legacy Brief still contains a replacement placeholder")
+    for heading in REQUIRED_BRIEF_HEADINGS:
+        if re.search(
+            rf"^##\s+{re.escape(heading)}\s*$", text, flags=re.MULTILINE
+        ) is None:
+            raise ValidationError(f"legacy Brief is missing heading: {heading}")
+    if len(re.findall(r"^##\s+Resource Budget\s*$", text, re.MULTILINE)) != 1:
+        raise ValidationError("legacy Brief must contain exactly one Resource Budget heading")
+    metadata = parse_brief_metadata(text, allow_legacy_hard_budget=True)
+    if "hard_budget" not in metadata:
+        raise ValidationError("Brief is not a recognized legacy hard-budget format")
+    limits = normalize_hard_budget(
+        metadata["hard_budget"], label="legacy Brief hard_budget"
+    )
+    version = metadata["brief_version"]
+    if version < 1:
+        raise ValidationError("legacy Brief brief_version must be at least 1")
+    version_match = _BRIEF_VERSION_LINE.search(text)
+    if version_match is None or int(version_match.group(1)) != version:
+        raise ValidationError("visible Brief version does not match legacy Brief metadata")
+    # The exact legacy Brief must still be the approved byte sequence.  A
+    # protected artifact may already have drifted; that must not deadlock the
+    # one-way migration because opening the new draft revokes the approval.
+    approval = _load_existing_approval(paths)
+    approved_brief = approval.get("brief")
+    if not isinstance(approved_brief, dict):
+        raise ValidationError("legacy Brief approval has no Brief binding")
+    if approved_brief.get("path") != _brief_relative_path(paths):
+        raise ValidationError("legacy Brief approval records the wrong Brief path")
+    if approved_brief.get("sha256") != sha256_file(paths.brief):
+        raise ValidationError("legacy Brief changed after approval")
+    return text, version, limits
+
+
+def _new_brief_draft(
+    text: str,
+    current_version: int,
+    *,
+    legacy_budget: dict[str, float | None] | None = None,
+) -> bytes:
     next_version = current_version + 1
     version_match = _BRIEF_VERSION_LINE.search(text)
     if version_match is None or int(version_match.group(1)) != current_version:
@@ -216,7 +276,11 @@ def _new_brief_draft(text: str, current_version: int) -> bytes:
     metadata_match = _BRIEF_METADATA_BLOCK.search(text)
     if metadata_match is None:
         raise ValidationError("Brief is missing the STUDYCTL-METADATA block")
-    metadata = parse_brief_metadata(text)
+    metadata = parse_brief_metadata(
+        text, allow_legacy_hard_budget=legacy_budget is not None
+    )
+    if legacy_budget is not None:
+        metadata.pop("hard_budget", None)
     metadata["brief_version"] = next_version
     metadata_block = (
         "<!-- STUDYCTL-METADATA-BEGIN\n"
@@ -224,6 +288,22 @@ def _new_brief_draft(text: str, current_version: int) -> bytes:
         + "\nSTUDYCTL-METADATA-END -->"
     )
     revised = text[: metadata_match.start()] + metadata_block + text[metadata_match.end() :]
+    if legacy_budget is not None:
+        if _RESOURCE_BUDGET_SECTION.search(revised) is None:
+            raise ValidationError("legacy Brief is missing its Resource Budget section")
+        budget_section = (
+            "## Resource Budget\n\n"
+            "The JSON block below is the single machine-enforced source for "
+            "lifetime Study hard limits. A numeric zero authorizes no positive "
+            "use; `null` leaves positive use unauthorized until a new Brief "
+            "version supplies a numeric limit. Storage uses decimal gigabytes "
+            "(`1 GB = 10^9 bytes`).\n\n"
+            + format_brief_hard_budget_block(legacy_budget)
+            + "\n\n"
+            "[REPLACE: Review the migrated hard limits and state advisory "
+            "allocation or calendar guidance only.]\n\n"
+        )
+        revised = _RESOURCE_BUDGET_SECTION.sub(budget_section, revised, count=1)
     version_match = _BRIEF_VERSION_LINE.search(revised)
     if version_match is None:
         raise ValidationError("new Brief draft lost its visible version line")
@@ -237,31 +317,79 @@ def _new_brief_draft(text: str, current_version: int) -> bytes:
     return revised.encode("utf-8")
 
 
+@serialized_study_authority
 def begin_brief_revision(paths: StudyPaths) -> Path:
     """Archive a fresh approved Brief and open the next editable draft."""
 
-    text, version = _validate_approvable_brief(paths)
-    _raise_validation_issues(
-        "a new Brief version requires a fresh approved Brief",
-        brief_approval_issues(paths),
-    )
-    _load_existing_approval(paths)
+    legacy_budget: dict[str, float | None] | None = None
+    try:
+        text, version = _validate_approvable_brief(paths)
+    except ValidationError as current_error:
+        try:
+            text, version, legacy_budget = _legacy_approved_brief(paths)
+        except (ValidationError, WorkflowError) as legacy_error:
+            try:
+                raw_text = paths.brief.read_text(encoding="utf-8")
+                raw_metadata = parse_brief_metadata(
+                    raw_text, allow_legacy_hard_budget=True
+                )
+            except (OSError, ValidationError):
+                raise current_error
+            if "hard_budget" in raw_metadata:
+                raise legacy_error
+            raise current_error
+    else:
+        _raise_validation_issues(
+            "a new Brief version requires a fresh approved Brief",
+            brief_approval_issues(paths),
+        )
+        _load_existing_approval(paths)
 
     history = paths.study / "brief-history"
     archived_brief = history / f"BRIEF.v{version:04d}.md"
     archived_approval = history / f"BRIEF.approval.v{version:04d}.json"
-    for destination in (archived_brief, archived_approval):
-        if destination.exists():
-            raise WorkflowError(f"refusing to overwrite existing Brief history: {destination}")
-
     old_brief = paths.brief.read_bytes()
     old_approval = paths.brief_approval.read_bytes()
-    new_brief = _new_brief_draft(text, version)
+    try:
+        captured_text = old_brief.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValidationError("captured Brief is not valid UTF-8") from exc
+    if captured_text != text:
+        raise WorkflowError("Brief changed while opening a new version")
+    approval = _load_existing_approval(paths)
+    captured_approval = load_json_bytes(
+        old_approval, label=str(paths.brief_approval)
+    )
+    if captured_approval != approval:
+        raise WorkflowError("Brief approval changed while opening a new version")
+    approved_brief = approval.get("brief")
+    if not isinstance(approved_brief, dict) or (
+        approved_brief.get("path") != _brief_relative_path(paths)
+        or approved_brief.get("sha256")
+        != hashlib.sha256(old_brief).hexdigest()
+    ):
+        raise ValidationError("captured Brief is not authorized by its approval")
+    new_brief = _new_brief_draft(
+        text, version, legacy_budget=legacy_budget
+    )
     approved_brief_mode = paths.brief.stat().st_mode & 0o777
     draft_brief_mode = approved_brief_mode | 0o200
 
-    atomic_write_bytes(archived_brief, old_brief, overwrite=False, mode=0o444)
-    atomic_write_bytes(archived_approval, old_approval, overwrite=False, mode=0o444)
+    def ensure_exact_archive(destination: Path, payload: bytes) -> None:
+        if destination.exists() or destination.is_symlink():
+            if (
+                destination.is_symlink()
+                or not destination.is_file()
+                or destination.read_bytes() != payload
+            ):
+                raise WorkflowError(
+                    f"Brief history conflicts with captured authority: {destination}"
+                )
+            return
+        atomic_write_bytes(destination, payload, overwrite=False, mode=0o444)
+
+    ensure_exact_archive(archived_brief, old_brief)
+    ensure_exact_archive(archived_approval, old_approval)
     try:
         atomic_write_bytes(paths.brief, new_brief, overwrite=True, mode=draft_brief_mode)
         paths.brief_approval.unlink()
@@ -477,6 +605,7 @@ def _reject_duplicate_verdict_id(paths: StudyPaths, verdict_id: str) -> None:
             raise WorkflowError(f"Verdict ID already exists: {verdict_id}")
 
 
+@serialized_study_authority
 def record_verdict(
     paths: StudyPaths,
     source_path: Path,

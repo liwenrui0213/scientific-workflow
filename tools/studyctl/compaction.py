@@ -5,6 +5,11 @@ import os
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from .budget import (
+    budget_projection,
+    budget_totals_from_manifests,
+    parse_brief_hard_budget,
+)
 from .formalization import collect_formalization_debt
 from .hashing import (
     atomic_write_json,
@@ -13,8 +18,15 @@ from .hashing import (
     sha256_file,
     sha256_json,
 )
+from .locking import study_authority_lock
 from .models import SCHEMA_VERSION, StudyPaths, ValidationError, WorkflowError, utc_now
 from .rendering import active_formal_artifacts, render_status
+from .run_ledger import (
+    bootstrap_or_reconcile_ledger,
+    ledger_commitment_totals,
+    ledger_path,
+    load_ledger,
+)
 from .validation import (
     assert_valid_study,
     authoritative_string_references,
@@ -176,6 +188,23 @@ def _validate_prepared_bindings(
     paths: StudyPaths,
     compaction_state: dict[str, Any],
 ) -> None:
+    source_hashes = compaction_state.get("source_hashes")
+    if not isinstance(source_hashes, dict):
+        raise ValidationError("COMPACTION_INPUT.json lacks source bindings")
+    if source_hashes.get("brief") != sha256_file(paths.brief):
+        raise ValidationError("Brief changed after compact-prepare")
+    current_approval_hash = (
+        sha256_file(paths.brief_approval)
+        if paths.brief_approval.is_file()
+        else None
+    )
+    if source_hashes.get("brief_approval") != current_approval_hash:
+        raise ValidationError("Brief approval changed after compact-prepare")
+    if source_hashes.get("claims") != sha256_file(paths.claims):
+        raise ValidationError("CLAIMS.json changed after compact-prepare")
+    if source_hashes.get("evidence") != current_evidence_hashes(paths):
+        raise ValidationError("Evidence set changed after compact-prepare")
+
     profile_record = compaction_state.get("repository_profile")
     if not isinstance(profile_record, dict):
         raise ValidationError("COMPACTION_INPUT.json lacks a repository profile binding")
@@ -217,19 +246,113 @@ def _validate_prepared_bindings(
 
 
 def budget_totals(runs: dict[str, tuple[Path, dict[str, Any]]]) -> dict[str, Any]:
-    gpu = 0.0
-    cpu = 0.0
+    committed = budget_totals_from_manifests(
+        manifest for _, manifest in runs.values()
+    )
     duration = 0.0
     for _, manifest in runs.values():
-        gpu += float(manifest.get("budget", {}).get("estimated_gpu_hours", 0.0))
-        cpu += float(manifest.get("budget", {}).get("estimated_cpu_hours", 0.0))
         duration += float(manifest.get("execution", {}).get("duration_seconds") or 0.0)
     return {
-        "estimated_gpu_hours": gpu,
-        "estimated_cpu_hours": cpu,
+        "estimated_gpu_hours": committed["gpu_hours"],
+        "estimated_cpu_hours": committed["cpu_hours"],
+        "charged_storage_gb": committed["storage_gb"],
         "recorded_wall_clock_hours": duration / 3600.0,
         "run_count": len(runs),
     }
+
+
+def _compaction_budget_state(
+    paths: StudyPaths,
+    runs: dict[str, tuple[Path, dict[str, Any]]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return budget totals plus the exact authority used to derive them.
+
+    Resource commitments for a current Study come exclusively from the
+    durable ledger.  Visible Manifests still supply wall-clock duration, but
+    cannot reduce the charged GPU/CPU/storage projection.  An intact V1/V2
+    history without a ledger is the only supported fallback, and its resulting
+    budget state carries an explicit lower-assurance marker into a Checkpoint.
+    """
+
+    ledger = load_ledger(paths)
+    duration = sum(
+        float(manifest.get("execution", {}).get("duration_seconds") or 0.0)
+        for _, manifest in runs.values()
+    )
+    if ledger is not None:
+        reconciled = bootstrap_or_reconcile_ledger(paths, runs, write=False)
+        if reconciled != ledger:
+            raise ValidationError(
+                "Run ledger is stale relative to visible immutable Manifests"
+            )
+        committed = ledger_commitment_totals(ledger)
+        totals = {
+            "estimated_gpu_hours": committed["gpu_hours"],
+            "estimated_cpu_hours": committed["cpu_hours"],
+            "charged_storage_gb": committed["storage_gb"],
+            "recorded_wall_clock_hours": duration / 3600.0,
+            "run_count": sum(
+                entry["status"] != "aborted" for entry in ledger["runs"].values()
+            ),
+        }
+        hard_limits = parse_brief_hard_budget(
+            paths.brief.read_text(encoding="utf-8")
+        )
+        projection = budget_projection(
+            hard_limits,
+            committed,
+            {"gpu_hours": 0.0, "cpu_hours": 0.0, "storage_gb": 0.0},
+        )
+        totals["hard_limits"] = hard_limits
+        totals["existing_hard_budget_violations"] = projection["violations"]
+        authority = {
+            "kind": "durable_run_ledger",
+            "assurance": "authoritative",
+            "path": ledger_path(paths).relative_to(paths.root).as_posix(),
+            "sha256": sha256_file(ledger_path(paths)),
+            "high_water_mark": ledger["high_water_mark"],
+        }
+        return totals, authority
+
+    if not runs or any(
+        manifest.get("schema_version") not in {1, 2}
+        for _, manifest in runs.values()
+    ):
+        raise ValidationError(
+            "Run ledger is missing; compaction cannot establish authoritative "
+            "Run identity or budget history"
+        )
+
+    totals = budget_totals(runs)
+    hard_limits = parse_brief_hard_budget(
+        paths.brief.read_text(encoding="utf-8")
+    )
+    committed = {
+        "gpu_hours": totals["estimated_gpu_hours"],
+        "cpu_hours": totals["estimated_cpu_hours"],
+        "storage_gb": totals["charged_storage_gb"],
+    }
+    projection = budget_projection(
+        hard_limits,
+        committed,
+        {"gpu_hours": 0.0, "cpu_hours": 0.0, "storage_gb": 0.0},
+    )
+    totals["hard_limits"] = hard_limits
+    totals["existing_hard_budget_violations"] = projection["violations"]
+    totals["authority"] = "legacy_manifest_fallback"
+    totals["authority_warning"] = (
+        "Unindexed pre-ledger V1/V2 Manifests are a lower-assurance fallback; "
+        "migrate the intact Run history before relying on it as authoritative."
+    )
+    authority = {
+        "kind": "legacy_manifest_fallback",
+        "assurance": "legacy_unindexed_lower_assurance",
+        "manifest_sha256": {
+            run_id: sha256_file(path)
+            for run_id, (path, _) in sorted(runs.items())
+        },
+    }
+    return totals, authority
 
 
 def current_evidence_hashes(paths: StudyPaths) -> dict[str, str]:
@@ -248,6 +371,7 @@ def prepare_compaction(paths: StudyPaths) -> Path:
     assert_valid_study(paths)
     host_change_scope = _host_change_scope(paths)
     runs = run_index(paths)
+    budget_state, budget_authority = _compaction_budget_state(paths, runs)
     evidence = evidence_index(paths)
     claims = load_json(paths.claims)
     if not isinstance(claims, dict):
@@ -317,7 +441,8 @@ def prepare_compaction(paths: StudyPaths) -> Path:
         "current_claims": claims.get("claims", []),
         "current_frontier": claims.get("frontier", {}),
         "failed_direction_records": _file_inventory(paths.study / "failed-directions", paths.root),
-        "budget_totals": budget_totals(runs),
+        "budget_totals": budget_state,
+        "budget_authority": budget_authority,
         "candidate_archive_items": candidates,
         "formalization_debt": collect_formalization_debt(paths),
     }
@@ -381,7 +506,8 @@ def finalize_compaction(paths: StudyPaths, plan_path: Path) -> Path:
         raise WorkflowError("another compaction finalize operation is active") from exc
     os.close(lock_fd)
     try:
-        return _finalize_compaction_locked(paths, plan_path)
+        with study_authority_lock(paths):
+            return _finalize_compaction_locked(paths, plan_path)
     finally:
         try:
             lock_path.unlink()
@@ -422,6 +548,18 @@ def _finalize_compaction_locked(paths: StudyPaths, plan_path: Path) -> Path:
         raise ValidationError("compaction plan next_actions must equal the authoritative Frontier")
     evidence = evidence_index(paths)
     runs = run_index(paths)
+    expected_budget, expected_budget_authority = _compaction_budget_state(
+        paths,
+        runs,
+    )
+    if compaction_state.get("budget_authority") != expected_budget_authority:
+        raise ValidationError(
+            "Run budget authority changed after compact-prepare"
+        )
+    if compaction_state.get("budget_totals") != expected_budget:
+        raise ValidationError(
+            "Run budget totals changed after compact-prepare"
+        )
     for field in ("decisive_evidence", "contradictory_evidence"):
         for ref in plan.get(field, []):
             if not _evidence_ref_exists(ref, evidence):
@@ -448,9 +586,10 @@ def _finalize_compaction_locked(paths: StudyPaths, plan_path: Path) -> Path:
         raise ValidationError("compaction plan omits supporting Evidence referenced by a Claim")
     if not expected_contradictory.issubset(actual_contradictory):
         raise ValidationError("compaction plan omits contradictory Evidence referenced by a Claim")
-    expected_budget = budget_totals(runs)
     if plan.get("budget_state") != expected_budget:
-        raise ValidationError("compaction plan budget_state must equal deterministic Run budget totals")
+        raise ValidationError(
+            "compaction plan budget_state must equal authoritative Run budget totals"
+        )
     failed_direction_records = {
         item["path"]: item
         for item in _file_inventory(paths.study / "failed-directions", paths.root)
@@ -459,8 +598,11 @@ def _finalize_compaction_locked(paths: StudyPaths, plan_path: Path) -> Path:
     for failure in plan.get("representative_failures", []):
         if failure in runs:
             manifest = runs[failure][1]
-            if manifest.get("status") not in {"failed", "interrupted"}:
-                raise ValidationError(f"representative failure Run is not failed/interrupted: {failure}")
+            if manifest.get("status") not in {"failed", "interrupted", "incomplete"}:
+                raise ValidationError(
+                    "representative failure Run is not failed/interrupted/incomplete: "
+                    f"{failure}"
+                )
             representative_failure_records.append(
                 {
                     "kind": "run",

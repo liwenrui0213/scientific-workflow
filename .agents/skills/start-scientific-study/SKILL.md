@@ -70,7 +70,8 @@ to make falsifiable without changing the human's intent.
 - Do not begin a Study with unresolved profile root or object-ignore warnings.
 - Do not invent a hard budget, acceptance threshold, dataset split, evaluator
   principle, baseline change, or permission. Record absent values as `None
-  stated`; an omitted budget never authorizes expensive compute.
+  stated`; leave absent numeric limits as `null` in the visible hard-budget
+  block. Both `null` and numeric zero authorize no positive declared use.
 - Stop before `approve-brief`, scientific source edits, formal artifacts, Runs,
   compute spending, Evidence, or claims of scientific support.
 - If the user names an existing Study, route to `scientific-study`. If workflow

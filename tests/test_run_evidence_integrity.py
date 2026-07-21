@@ -2,16 +2,26 @@ from __future__ import annotations
 
 import copy
 from pathlib import Path
+import platform
 import sys
 import tempfile
 import unittest
 
 from tests.helpers import WorkflowTestCase
 from tools.studyctl.evidence import create_evidence_draft, finalize_evidence
-from tools.studyctl.hashing import atomic_write_json, load_json, nested_record_digest
-from tools.studyctl.models import ValidationError
-from tools.studyctl.run_registry import execute_run
+from tools.studyctl.budget import manifest_budget_commitment
+from tools.studyctl.git_state import git_state, git_tracked_state
+from tools.studyctl.hashing import (
+    atomic_write_json,
+    load_json,
+    nested_record_digest,
+    sha256_file,
+    sha256_json,
+)
+from tools.studyctl.models import ValidationError, utc_now
+from tools.studyctl.run_registry import execute_run, migrate_legacy_run_ledger
 from tools.studyctl.validation import errors_only, validate_study
+from tools.studyctl.workspace import evaluate_changes
 
 
 class RunEvidenceIntegrityTests(WorkflowTestCase):
@@ -57,17 +67,246 @@ class RunEvidenceIntegrityTests(WorkflowTestCase):
         script.write_text("print(2 + 2)\n", encoding="utf-8")
         return script
 
-    def test_v2_run_with_intact_dependencies_finalizes_evidence(self) -> None:
+    def test_v3_run_with_intact_dependencies_finalizes_evidence(self) -> None:
         paths = self.initialize_approved_with_claim()
         manifest = self.successful_run(paths, output=".objects/result.txt")
 
         finalized_path = finalize_evidence(paths, self.populated_draft(paths, manifest))
         finalized = load_json(finalized_path)
 
-        self.assertEqual(manifest["schema_version"], 2)
+        self.assertEqual(manifest["schema_version"], 3)
         self.assertTrue(manifest["change_scope"]["evidence_eligible"])
         self.assertEqual(finalized["status"], "finalized")
         self.assertEqual(errors_only(validate_study(paths)), [])
+
+    def test_frozen_pre_budget_v2_run_remains_usable_and_charges_output_bytes(self) -> None:
+        paths = self.initialize()
+        self.fill_brief(paths)
+        self.set_hard_budget(
+            paths,
+            gpu_hours=1,
+            cpu_hours=1,
+            storage_gb=1e-8,
+        )
+        self.add_proposed_claim(paths)
+        self.approve(paths)
+        # This is a genuinely frozen pre-ledger fixture: build every V2 field
+        # and dependency directly instead of creating a current Run and
+        # deleting newer fields.  That makes accidental V2 contract drift
+        # observable to this test.
+        (paths.study / "RUNS.ledger.json").unlink()
+        run_id = "RUN-000001"
+        run_directory = paths.runs / run_id
+        governance = run_directory / "governance"
+        governance.mkdir(parents=True)
+
+        profile_source = self.root / "scientific-workflow/repository-profile.json"
+        profile_snapshot = governance / "repository-profile.json"
+        profile_snapshot.write_bytes(profile_source.read_bytes())
+        profile_snapshot.chmod(0o444)
+
+        stdout_path = run_directory / "stdout.log"
+        stderr_path = run_directory / "stderr.log"
+        stdout_path.write_bytes(b"4\n")
+        stderr_path.write_bytes(b"")
+
+        output_paths = [
+            self.root / ".objects/v2-a.bin",
+            self.root / ".objects/v2-b.bin",
+        ]
+        output_payloads = [b"1234", b"123456"]
+        for output_path, payload in zip(output_paths, output_payloads, strict=True):
+            output_path.write_bytes(payload)
+            output_path.chmod(0o444)
+
+        def file_record(path: Path) -> dict[str, object]:
+            return {
+                "path": path.resolve().relative_to(paths.root.resolve()).as_posix(),
+                "size": path.stat().st_size,
+                "sha256": sha256_file(path),
+            }
+
+        change_state = evaluate_changes(paths)
+        self.assertEqual(change_state["outcome"], "PASS")
+        self.assertTrue(change_state["git"]["available"])
+        ledger_relative = (paths.study / "RUNS.ledger.json").relative_to(
+            paths.root
+        ).as_posix()
+        tracked_state = git_tracked_state(
+            self.root,
+            exclude_paths=[ledger_relative],
+        )
+        cohort_fields = {
+            "fixture": "frozen-pre-budget-v2",
+            "hardware_class": "test-cpu",
+            "precision": "exact-integer",
+        }
+        approval = load_json(paths.brief_approval)
+        self.assertIsInstance(approval, dict)
+        timestamp = utc_now()
+        v2: dict[str, object] = {
+            "schema_version": 2,
+            "study_id": paths.study_id,
+            "run_id": run_id,
+            "purpose": "frozen pre-budget V2 compatibility fixture",
+            "status": "succeeded",
+            "execution": {
+                "argv": [sys.executable, "-c", "print(4)"],
+                "cwd": str(self.root.resolve()),
+                "cwd_relative": ".",
+                "started_at": timestamp,
+                "ended_at": timestamp,
+                "duration_seconds": 0.0,
+                "exit_code": 0,
+                "seed": None,
+            },
+            "git": git_state(self.root),
+            "code_state": {
+                "before": tracked_state,
+                "after": copy.deepcopy(tracked_state),
+                "changed_during_run": False,
+            },
+            "change_scope": {
+                "repository_profile": file_record(profile_snapshot),
+                "changeset": None,
+                "validation": None,
+                "before": change_state,
+                "after": copy.deepcopy(change_state),
+                "evidence_eligible": True,
+            },
+            "brief": {
+                "path": paths.brief.relative_to(paths.root).as_posix(),
+                "sha256": sha256_file(paths.brief),
+                "approval_sha256": approval["approval_sha256"],
+            },
+            "formal_artifacts": [],
+            "formalization": {
+                "changed_paths": [],
+                "declared_changed_paths": [],
+                "actual_changed_paths": [
+                    item["path"] for item in change_state["changed_paths"]
+                ],
+                "scientific_critical": False,
+                "shared_across_runs": False,
+                "artifacts_unchanged_during_run": True,
+                "outcome": "PASS",
+                "requirements": [],
+            },
+            "cohort": {
+                "cohort_id": "COHORT-001",
+                "fields": cohort_fields,
+                "fingerprint_sha256": sha256_json(cohort_fields),
+            },
+            "environment": {
+                "python_executable": sys.executable,
+                "python_version": platform.python_version(),
+                "python_implementation": platform.python_implementation(),
+                "platform": platform.platform(),
+                "system": platform.system(),
+                "release": platform.release(),
+                "machine": platform.machine(),
+                "processor": platform.processor(),
+                "hardware_class": "test-cpu",
+                "precision": "exact-integer",
+                "environment_variables": {},
+            },
+            "budget": {
+                "estimated_gpu_hours": 0.25,
+                "estimated_cpu_hours": 0.5,
+            },
+            "inputs": [],
+            "outputs": [
+                {
+                    **file_record(output_path),
+                    "present": True,
+                    "classification": "ordinary",
+                    "pinned": False,
+                }
+                for output_path in output_paths
+            ],
+            "logs": {
+                "stdout": file_record(stdout_path),
+                "stderr": file_record(stderr_path),
+            },
+            "integrity": {
+                "sealed_at": timestamp,
+                "manifest_sha256": None,
+            },
+        }
+        v2["integrity"]["manifest_sha256"] = nested_record_digest(
+            v2, "integrity", "manifest_sha256"
+        )
+        manifest_path = run_directory / "manifest.json"
+        atomic_write_json(manifest_path, v2, mode=0o444)
+        frozen_bytes = manifest_path.read_bytes()
+
+        legacy_issues = validate_study(paths)
+        self.assertEqual(errors_only(legacy_issues), [])
+        self.assertTrue(
+            any(
+                issue.level == "WARNING"
+                and "legacy Run history has not yet been indexed" in issue.message
+                for issue in legacy_issues
+            ),
+            [issue.render() for issue in legacy_issues],
+        )
+        commitment = manifest_budget_commitment(v2)
+        self.assertAlmostEqual(commitment["gpu_hours"], 0.25, delta=1e-15)
+        self.assertAlmostEqual(commitment["cpu_hours"], 0.5, delta=1e-15)
+        self.assertAlmostEqual(commitment["storage_gb"], 1e-8, delta=1e-18)
+        self.assertEqual(sum(record["size"] for record in v2["outputs"]), 10)
+        with self.assertRaisesRegex(ValidationError, "Run ledger is missing"):
+            create_evidence_draft(
+                paths,
+                "EVID-0001",
+                ["CLAIM-0001"],
+                [run_id],
+            )
+        self.assertEqual(manifest_path.read_bytes(), frozen_bytes)
+
+        migrated_ledger = migrate_legacy_run_ledger(paths)
+        self.assertEqual(
+            migrated_ledger,
+            paths.study / "RUNS.ledger.json",
+        )
+        self.assertTrue(migrated_ledger.is_file())
+        self.assertEqual(errors_only(validate_study(paths)), [])
+        finalized = finalize_evidence(paths, self.populated_draft(paths, v2))
+        self.assertEqual(load_json(finalized)["status"], "finalized")
+        self.assertEqual(errors_only(validate_study(paths)), [])
+        self.assertEqual(manifest_path.read_bytes(), frozen_bytes)
+
+        with self.assertRaisesRegex(
+            ValidationError, "hard storage gb budget exceeded"
+        ):
+            execute_run(
+                paths,
+                argv=[sys.executable, "-c", "print(4)"],
+                purpose="prove frozen V2 storage remains charged",
+                estimated_storage_gb=1e-12,
+            )
+        self.assertEqual(manifest_path.read_bytes(), frozen_bytes)
+
+    def test_resealed_v2_missing_a_v2_required_field_is_rejected(self) -> None:
+        paths = self.initialize_approved_with_claim()
+        current = self.successful_run(paths)
+        manifest_path = paths.runs / str(current["run_id"]) / "manifest.json"
+        malformed = copy.deepcopy(current)
+        malformed["schema_version"] = 2
+        malformed["brief"].pop("snapshot")
+        malformed["brief"].pop("approval_snapshot")
+        malformed["budget"] = {"estimated_cpu_hours": 0.0}
+        malformed.pop("failure")
+        malformed["integrity"]["manifest_sha256"] = nested_record_digest(
+            malformed, "integrity", "manifest_sha256"
+        )
+        atomic_write_json(manifest_path, malformed, mode=0o444)
+
+        messages = [issue.message for issue in errors_only(validate_study(paths))]
+        self.assertTrue(
+            any("estimated_gpu_hours" in message for message in messages),
+            messages,
+        )
 
     def test_declared_but_absent_output_is_evidence_ineligible(self) -> None:
         paths = self.initialize_approved_with_claim()
@@ -314,17 +553,31 @@ class RunEvidenceIntegrityTests(WorkflowTestCase):
         legacy = copy.deepcopy(manifest)
         legacy["schema_version"] = 1
         legacy.pop("change_scope")
+        legacy.pop("failure")
+        legacy["execution"].pop("cwd_relative")
+        legacy["brief"].pop("snapshot")
+        legacy["brief"].pop("approval_snapshot")
+        legacy["budget"] = {
+            "estimated_gpu_hours": manifest["budget"]["estimated_gpu_hours"],
+            "estimated_cpu_hours": manifest["budget"]["estimated_cpu_hours"],
+        }
         legacy["formalization"].pop("declared_changed_paths")
         legacy["formalization"].pop("actual_changed_paths")
+        legacy["formalization"].pop("artifacts_unchanged_during_run")
         legacy["integrity"]["manifest_sha256"] = nested_record_digest(
             legacy,
             "integrity",
             "manifest_sha256",
         )
         atomic_write_json(manifest_path, legacy, mode=0o444)
+        (paths.study / "RUNS.ledger.json").unlink()
 
         issues = validate_study(paths)
         self.assertEqual(errors_only(issues), [])
+        self.assertTrue(
+            all(issue.level == "WARNING" for issue in issues),
+            [issue.render() for issue in issues],
+        )
         self.assertTrue(
             any(
                 issue.level == "WARNING"
@@ -333,6 +586,15 @@ class RunEvidenceIntegrityTests(WorkflowTestCase):
             ),
             [issue.render() for issue in issues],
         )
+        self.assertTrue(
+            any(
+                issue.level == "WARNING"
+                and "legacy Run history has not yet been indexed" in issue.message
+                for issue in issues
+            ),
+            [issue.render() for issue in issues],
+        )
+        migrate_legacy_run_ledger(paths)
         with self.assertRaisesRegex(
             ValidationError,
             "legacy V1 Run is historical and Evidence-ineligible",

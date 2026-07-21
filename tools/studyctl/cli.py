@@ -19,6 +19,7 @@ from .models import (
     study_paths,
     utc_now,
 )
+from .run_ledger import empty_ledger, write_ledger
 from .validation import validate_study
 
 
@@ -44,6 +45,7 @@ def initialize_study(root: Path, study_id: str, title: str) -> Path:
     )
     for directory in directories:
         directory.mkdir(parents=True, exist_ok=False if directory == paths.formal else True)
+    write_ledger(paths, empty_ledger(paths))
     template_root = root / "scientific-workflow" / "templates"
     brief_template = (template_root / "BRIEF.md").read_text(encoding="utf-8")
     brief_text = brief_template.replace("{{STUDY_ID}}", study_id).replace("{{TITLE}}", title.strip())
@@ -74,7 +76,9 @@ def _print_json(value: Any) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="studyctl", description="Claim-to-Evidence Scientific Workflow, V2")
+    parser = argparse.ArgumentParser(
+        prog="studyctl", description="Claim-to-Evidence Scientific Workflow"
+    )
     parser.add_argument("--root", help=argparse.SUPPRESS)
     subparsers = parser.add_subparsers(dest="command_name", required=True)
 
@@ -92,6 +96,12 @@ def build_parser() -> argparse.ArgumentParser:
     new_brief = subparsers.add_parser("brief-new-version", help="preserve an approved Brief and open a new draft")
     new_brief.add_argument("study_id")
 
+    ledger_migrate = subparsers.add_parser(
+        "ledger-migrate",
+        help="explicitly index an intact contiguous pre-V3 Run history",
+    )
+    ledger_migrate.add_argument("study_id")
+
     validate = subparsers.add_parser("validate", help="validate authoritative records and references")
     validate.add_argument("study_id")
 
@@ -102,6 +112,7 @@ def build_parser() -> argparse.ArgumentParser:
     formalization.add_argument("study_id")
     formalization.add_argument("--estimated-gpu-hours", type=float, default=0.0)
     formalization.add_argument("--estimated-cpu-hours", type=float, default=0.0)
+    formalization.add_argument("--estimated-storage-gb", type=float, default=0.0)
     formalization.add_argument("--changed-path", action="append", default=[])
     formalization.add_argument("--changes-evaluator", action="store_true")
     formalization.add_argument("--changes-dataset-split", action="store_true")
@@ -146,6 +157,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--cohort")
     run.add_argument("--estimated-gpu-hours", type=float, default=0.0)
     run.add_argument("--estimated-cpu-hours", type=float, default=0.0)
+    run.add_argument("--estimated-storage-gb", type=float, default=0.0)
     run.add_argument("--input", action="append", default=[])
     run.add_argument("--output", action="append", default=[])
     run.add_argument("--pin-output", action="append", default=[])
@@ -244,6 +256,11 @@ def dispatch(args: argparse.Namespace) -> int:
 
         print(begin_brief_revision(paths))
         return 0
+    if name == "ledger-migrate":
+        from .run_registry import migrate_legacy_run_ledger
+
+        print(migrate_legacy_run_ledger(paths))
+        return 0
     if name == "status":
         from .rendering import render_status
 
@@ -252,7 +269,9 @@ def dispatch(args: argparse.Namespace) -> int:
     if name == "check-formalization":
         from .formalization import check_formalization
 
-        result = check_formalization(paths, vars(args))
+        options = vars(args).copy()
+        options["check_hard_budget"] = True
+        result = check_formalization(paths, options)
         print(result.outcome)
         for requirement in result.requirements:
             print(f"- {requirement['level']}: {requirement['artifact']}: {requirement['reason']}")
@@ -324,6 +343,7 @@ def dispatch(args: argparse.Namespace) -> int:
             cohort_id=args.cohort,
             estimated_gpu_hours=args.estimated_gpu_hours,
             estimated_cpu_hours=args.estimated_cpu_hours,
+            estimated_storage_gb=args.estimated_storage_gb,
             input_paths=args.input,
             output_paths=args.output,
             pinned_outputs=args.pin_output,
@@ -338,12 +358,21 @@ def dispatch(args: argparse.Namespace) -> int:
             cohort_fields=args.cohort_field,
         )
         _print_json({"run_id": manifest["run_id"], "status": manifest["status"], "exit_code": manifest["execution"]["exit_code"]})
-        process_code = int(manifest["execution"]["exit_code"] or 0)
-        if process_code == 0 and not manifest.get("change_scope", {}).get(
+        status = manifest["status"]
+        raw_exit_code = manifest["execution"]["exit_code"]
+        if status == "succeeded" and manifest.get("change_scope", {}).get(
             "evidence_eligible", False
         ):
+            return 0
+        if status == "failed" and isinstance(raw_exit_code, int) and raw_exit_code != 0:
+            # subprocess uses negative return codes for signal termination,
+            # while a CLI process must return an unsigned shell status.
+            return 128 + abs(raw_exit_code) if raw_exit_code < 0 else raw_exit_code
+        if status == "interrupted":
+            return 130
+        if status in {"incomplete", "running"}:
             return 2
-        return process_code
+        return 2
     if name == "evidence-new":
         from .evidence import create_evidence_draft
 

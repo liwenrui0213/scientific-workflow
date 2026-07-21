@@ -150,6 +150,17 @@ python -m tools.studyctl approve-brief SC-0001
 
 该命令和最终 `verdict` 命令都是 human-only gate，要求真实的 stdin/stdout TTY；不要让 Agent 代为调用，也不要通过管道、heredoc 或输出重定向伪造确认。
 
+Brief 中可见的 `STUDYCTL-HARD-BUDGET` JSON 块是唯一的数值预算权威。
+`null` 与数值 `0` 都不授权任何正用量；GPU-hour、CPU-hour 和存储预算
+由 `studyctl run` 在启动子进程前累计检查并预留。失败、中断、未完整封存
+和仍在运行的 Run 也占用预留量，避免通过失败重试绕过人的授权边界。
+每个 Study 的 `RUNS.ledger.json` 保存连续、只增不减的 Run 编号高水位与
+预算承诺；它位于 `runs/` 外，因此移动或重建整个 `runs/` 也不会重置历史。
+ledger 缺失、损坏或引用的 Run 消失时，验证和新 Run 都会失败关闭。
+同一 Study 内，声明的输出路径会在上述串行注册事务中随 `running`
+Manifest 一起被预留；即使文件最终没有产生，后续 Run 也不能认领同一路径。
+验证器还会拒绝任何伪造或历史损坏造成的重复输出所有权。
+
 然后只需告诉 Codex：
 
 ```text
@@ -176,6 +187,21 @@ python -m tools.studyctl check-changes SC-0001
 ```
 
 只有范围、宿主验证和 provenance 合格的 Run 才能进入正式 Evidence。完整执行、Evidence、Compaction 和 Review 命令见[工作流指南](docs/scientific-agent-workflow.md)。
+
+每次重要计算都会先登记 `running` Manifest，再启动程序，最后原子封存为
+`succeeded`、`failed`、`interrupted` 或 `incomplete`。后处理失败不会留下
+不可见的执行；`validate` 还会交叉检查 ledger、所有 `RUN-*` 目录和
+Manifest。注册在启动程序前依次持久化预算/ID、完整 `running` 目录和启动
+授权；任何中途失败都会保留可诊断、占预算且不可复用的记录。
+同一 Study 的 Run 登记、Brief 审批/修订、Verdict 与压缩落盘共享一个锁，
+不会在并发操作中混用不同版本的权威状态。已声明但未产出的输出路径也会被
+保留；若文件稍后出现，或已有输出无法建立稳定哈希，后续 Run 将 fail-closed，
+防止存储预算被绕过。
+
+升级前已经存在的连续 V1/V2 Run 历史不会被普通 `run` 自动重建 ledger。
+先用外部记录确认历史完整，再显式执行
+`python -m tools.studyctl ledger-migrate SC-NNNN`；迁移拒绝空历史、ID 缺口、
+V3 Run 或已有 ledger。
 
 ## 仓库结构
 

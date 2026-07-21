@@ -24,16 +24,23 @@ def _reject_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def load_json_bytes(data: bytes, *, label: str = "<bytes>") -> Any:
+    try:
+        return json.loads(
+            data.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_pairs,
+            parse_constant=_reject_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValidationError(f"cannot read JSON {label}: {exc}") from exc
+
+
 def load_json(path: Path) -> Any:
     try:
-        with path.open("r", encoding="utf-8") as handle:
-            return json.load(
-                handle,
-                object_pairs_hook=_reject_duplicate_pairs,
-                parse_constant=_reject_constant,
-            )
-    except (OSError, json.JSONDecodeError) as exc:
+        data = path.read_bytes()
+    except OSError as exc:
         raise ValidationError(f"cannot read JSON {path}: {exc}") from exc
+    return load_json_bytes(data, label=str(path))
 
 
 def canonical_json_bytes(value: Any) -> bytes:
@@ -107,6 +114,7 @@ def atomic_write_bytes(
     overwrite: bool = True,
     mode: int | None = None,
     before_replace: Callable[[Path], None] | None = None,
+    require_parent_fsync: bool = False,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not overwrite and path.exists():
@@ -142,8 +150,11 @@ def atomic_write_bytes(
                 os.fsync(directory_fd)
             finally:
                 os.close(directory_fd)
-        except OSError:
-            pass
+        except OSError as exc:
+            if require_parent_fsync:
+                raise WorkflowError(
+                    f"cannot durably sync parent directory for {path}: {exc}"
+                ) from exc
     finally:
         if temp_path is not None:
             try:
@@ -159,6 +170,7 @@ def atomic_write_json(
     overwrite: bool = True,
     mode: int | None = None,
     before_replace: Callable[[Path], None] | None = None,
+    require_parent_fsync: bool = False,
 ) -> None:
     atomic_write_bytes(
         path,
@@ -166,6 +178,7 @@ def atomic_write_json(
         overwrite=overwrite,
         mode=mode,
         before_replace=before_replace,
+        require_parent_fsync=require_parent_fsync,
     )
 
 

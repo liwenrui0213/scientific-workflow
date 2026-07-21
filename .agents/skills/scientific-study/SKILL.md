@@ -47,14 +47,20 @@ for a purely mechanical resume, validation, or rendering operation.
    `formal/CHANGESET.json` with `studyctl changeset-new`. After explicit base
    synchronization, use `changeset-renew`; never hand-edit the anchor.
 3. Before consequential work, run `studyctl check-formalization` with honest
-   cost and semantic flags. Create only the smallest required artifact.
+   GPU-hour, CPU-hour, storage, and semantic flags. Create only the smallest
+   required artifact. Treat every registered reservation—including failed,
+   interrupted, incomplete, or still-running work—as consuming the Study's
+   cumulative hard budget.
 4. After source, test, or experiment edits, run focused checks, commit the
    allowlisted changes, then run `studyctl validate-changes` and
    `studyctl check-changes`.
 5. Execute consequential calculations through `studyctl run`. Declare all
    mutable or external inputs and every new output below the configured
-   `object_root`; preserve the Run and its sealed snapshots.
-6. Create Evidence only from eligible terminal V2 Runs. Fill analysis, result,
+   `object_root`; preserve the Run and its sealed snapshots. Never treat a
+   `running` or `incomplete` Run as Evidence-ready.
+6. Create Evidence only from eligible sealed Runs (current V3, or an intact
+   pre-budget V2 Run after explicit ledger migration). Never use V1,
+   `running`, or `incomplete` Runs. Fill analysis, result,
    scope, uncertainty, limitations, assessment, Run roles, and any Cohort
    compatibility justification; seal with `evidence-finalize`.
 7. Update Claims only with finalized `{evidence_id, version, sha256}` references.

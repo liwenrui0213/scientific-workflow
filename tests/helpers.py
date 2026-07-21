@@ -10,6 +10,7 @@ import unittest
 from typing import Any
 
 from tools.studyctl.approval import approve_brief
+from tools.studyctl.budget import replace_brief_hard_budget
 from tools.studyctl.cli import initialize_study
 from tools.studyctl.evidence import create_evidence_draft, finalize_evidence
 from tools.studyctl.hashing import atomic_write_json, load_json, sha256_file
@@ -79,8 +80,8 @@ class WorkflowTestCase(unittest.TestCase):
                 "Use exact integer equality, no dataset split, the recorded Python baseline, and fixed precision.",
             "[REPLACE: Specify required comparisons, uncertainty reporting, contradictory checks, and reproducibility expectations.]":
                 "Require a deterministic Run, explicit scope and limitations, and a contradictory-evidence check.",
-            "[REPLACE: State hard and advisory GPU-hour, CPU-hour, storage, and calendar limits.]":
-                "Hard budget: zero GPU hours, one CPU hour, and one gigabyte of storage.",
+            "[REPLACE: State advisory allocation or calendar guidance only; do not duplicate hard numeric limits in prose.]":
+                "No additional advisory allocation or calendar guidance.",
             "[REPLACE: State which events require human attention or a new Brief version.]":
                 "Escalate evaluator, data split, acceptance criterion, budget, or Claim-scope changes.",
         }
@@ -88,6 +89,28 @@ class WorkflowTestCase(unittest.TestCase):
         for old, new in replacements.items():
             self.assertIn(old, text)
             text = text.replace(old, new)
+        text = replace_brief_hard_budget(
+            text,
+            gpu_hours=0,
+            cpu_hours=1,
+            storage_gb=1,
+        )
+        paths.brief.write_text(text, encoding="utf-8")
+
+    def set_hard_budget(
+        self,
+        paths: StudyPaths,
+        *,
+        gpu_hours: float | int | None,
+        cpu_hours: float | int | None,
+        storage_gb: float | int | None,
+    ) -> None:
+        text = replace_brief_hard_budget(
+            paths.brief.read_text(encoding="utf-8"),
+            gpu_hours=gpu_hours,
+            cpu_hours=cpu_hours,
+            storage_gb=storage_gb,
+        )
         paths.brief.write_text(text, encoding="utf-8")
 
     def add_proposed_claim(self, paths: StudyPaths, claim_id: str = "CLAIM-0001") -> dict[str, Any]:

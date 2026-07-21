@@ -4,7 +4,7 @@ import getpass
 import os
 from pathlib import Path
 import subprocess
-from typing import Any
+from typing import Any, Sequence
 
 from .hashing import sha256_bytes
 
@@ -43,14 +43,22 @@ def git_state(root: Path) -> dict[str, Any]:
     }
 
 
-def git_tracked_state(root: Path) -> dict[str, Any]:
+def git_tracked_state(
+    root: Path, *, exclude_paths: Sequence[str] = ()
+) -> dict[str, Any]:
     """Fingerprint the commit and tracked worktree bytes, excluding Run outputs."""
 
     probe = _git(root, ["rev-parse", "--show-toplevel"])
     if probe.returncode != 0:
         return {"available": False, "commit": None, "diff_sha256": None}
     commit = _git(root, ["rev-parse", "HEAD"])
-    diff = _git(root, ["diff", "--binary", "HEAD", "--"])
+    pathspecs = ["."]
+    for raw in exclude_paths:
+        candidate = Path(raw)
+        if candidate.is_absolute() or ".." in candidate.parts or not raw.strip():
+            raise ValueError("tracked-state exclusions must be safe repository-relative paths")
+        pathspecs.append(f":(top,exclude){candidate.as_posix()}")
+    diff = _git(root, ["diff", "--binary", "HEAD", "--", *pathspecs])
     return {
         "available": True,
         "commit": commit.stdout.strip() if commit.returncode == 0 else None,

@@ -9,6 +9,11 @@ import re
 import stat
 from typing import Any, Iterable, Iterator
 
+from .budget import (
+    budget_projection,
+    manifest_budget_commitment,
+    parse_brief_hard_budget,
+)
 from .hashing import (
     load_json,
     nested_record_digest,
@@ -25,6 +30,11 @@ from .models import (
     WorkflowError,
     errors_only,
     require_id,
+)
+from .run_ledger import (
+    bootstrap_or_reconcile_ledger,
+    ledger_path,
+    load_ledger,
 )
 
 
@@ -50,6 +60,125 @@ SCHEMA_FILES = {
     "changeset": "changeset.schema.json",
     "change_validation": "change-validation.schema.json",
 }
+
+_RUN_V2_TOP_LEVEL_KEYS = {
+    "schema_version",
+    "study_id",
+    "run_id",
+    "purpose",
+    "status",
+    "execution",
+    "git",
+    "code_state",
+    "change_scope",
+    "brief",
+    "formal_artifacts",
+    "formalization",
+    "cohort",
+    "environment",
+    "budget",
+    "inputs",
+    "outputs",
+    "logs",
+    "integrity",
+}
+_RUN_V1_TOP_LEVEL_KEYS = _RUN_V2_TOP_LEVEL_KEYS - {"change_scope"}
+
+
+def _run_v2_shape_messages(value: dict[str, Any]) -> list[str]:
+    """Validate fields that differ between the frozen V2 and current schema."""
+
+    messages: list[str] = []
+    missing = sorted(_RUN_V2_TOP_LEVEL_KEYS - set(value))
+    extra = sorted(set(value) - _RUN_V2_TOP_LEVEL_KEYS)
+    messages.extend(f"$: missing required property {key!r}" for key in missing)
+    messages.extend(f"$: additional property is not allowed: {key!r}" for key in extra)
+    if value.get("status") not in {"succeeded", "failed", "interrupted", "running"}:
+        messages.append("$.status: value is not valid for Run schema V2")
+    brief = value.get("brief")
+    expected_brief = {"path", "sha256", "approval_sha256"}
+    if not isinstance(brief, dict):
+        messages.append("$.brief: expected type 'object'")
+    else:
+        messages.extend(
+            f"$.brief: missing required property {key!r}"
+            for key in sorted(expected_brief - set(brief))
+        )
+        messages.extend(
+            f"$.brief: additional property is not allowed: {key!r}"
+            for key in sorted(set(brief) - expected_brief)
+        )
+    budget = value.get("budget")
+    expected_budget = {"estimated_gpu_hours", "estimated_cpu_hours"}
+    if not isinstance(budget, dict):
+        messages.append("$.budget: expected type 'object'")
+    else:
+        messages.extend(
+            f"$.budget: missing required property {key!r}"
+            for key in sorted(expected_budget - set(budget))
+        )
+        messages.extend(
+            f"$.budget: additional property is not allowed: {key!r}"
+            for key in sorted(set(budget) - expected_budget)
+        )
+    return messages
+
+
+def _run_v1_shape_messages(value: dict[str, Any]) -> list[str]:
+    messages: list[str] = []
+    missing = sorted(_RUN_V1_TOP_LEVEL_KEYS - set(value))
+    extra = sorted(set(value) - _RUN_V1_TOP_LEVEL_KEYS)
+    messages.extend(f"$: missing required property {key!r}" for key in missing)
+    messages.extend(f"$: additional property is not allowed: {key!r}" for key in extra)
+    execution = value.get("execution")
+    expected_execution = {
+        "argv",
+        "cwd",
+        "started_at",
+        "ended_at",
+        "duration_seconds",
+        "exit_code",
+        "seed",
+    }
+    if not isinstance(execution, dict):
+        messages.append("$.execution: expected type 'object'")
+    else:
+        messages.extend(
+            f"$.execution: missing required property {key!r}"
+            for key in sorted(expected_execution - set(execution))
+        )
+        messages.extend(
+            f"$.execution: additional property is not allowed: {key!r}"
+            for key in sorted(set(execution) - expected_execution)
+        )
+    formalization = value.get("formalization")
+    expected_formalization = {
+        "changed_paths",
+        "scientific_critical",
+        "shared_across_runs",
+        "outcome",
+        "requirements",
+    }
+    if not isinstance(formalization, dict):
+        messages.append("$.formalization: expected type 'object'")
+    else:
+        messages.extend(
+            f"$.formalization: missing required property {key!r}"
+            for key in sorted(expected_formalization - set(formalization))
+        )
+        messages.extend(
+            f"$.formalization: additional property is not allowed: {key!r}"
+            for key in sorted(set(formalization) - expected_formalization)
+        )
+    # V1 and V2 shared the same exact Brief and budget shapes.
+    shadow = dict(value)
+    shadow["change_scope"] = {}
+    messages.extend(_run_v2_shape_messages(shadow))
+    return [
+        message
+        for message in messages
+        if "missing required property 'change_scope'" not in message
+    ]
 
 
 def schema_path(root: Path, name: str) -> Path:
@@ -212,18 +341,80 @@ def object_schema_issues(
 ) -> list[ValidationIssue]:
     schema = load_schema(root, name)
     validation_value = value
-    if (
-        name == "run"
-        and isinstance(value, dict)
-        and isinstance(value.get("schema_version"), int)
-        and not isinstance(value.get("schema_version"), bool)
-        and value.get("schema_version") == 1
-    ):
-        # V1 manifests are immutable historical records.  Validate a transient
-        # V2-shaped view instead of rewriting the on-disk manifest.  Synthetic
-        # scope is deliberately Evidence-ineligible; no attestation is invented.
+    original_run_version = (
+        value.get("schema_version")
+        if name == "run" and isinstance(value, dict)
+        else None
+    )
+    if original_run_version == 2:
+        v2_messages = _run_v2_shape_messages(value)
+        if v2_messages:
+            return [
+                ValidationIssue("ERROR", str(path), message)
+                for message in v2_messages
+            ]
+        # Validate all fields shared by V2/V3 through a transient current view,
+        # adding only fields that did not exist in V2.
         validation_value = copy.deepcopy(value)
-        validation_value["schema_version"] = 2
+        validation_value["schema_version"] = 3
+        brief = validation_value["brief"]
+        brief["snapshot"] = {
+            "path": "<legacy-v2-unattested-brief>",
+            "size": 0,
+            "sha256": str(brief.get("sha256") or "0" * 64),
+        }
+        brief["approval_snapshot"] = {
+            "path": "<legacy-v2-unattested-approval>",
+            "size": 0,
+            "sha256": "0" * 64,
+        }
+        old_budget = validation_value["budget"]
+        gpu = old_budget["estimated_gpu_hours"]
+        cpu = old_budget["estimated_cpu_hours"]
+        validation_value["budget"] = {
+            "estimated_gpu_hours": gpu,
+            "estimated_cpu_hours": cpu,
+            "estimated_storage_gb": 0.0,
+            "actual_output_storage_gb": None,
+            "hard_limits": {
+                "gpu_hours": None,
+                "cpu_hours": None,
+                "storage_gb": None,
+            },
+            "committed_before": {
+                "gpu_hours": 0.0,
+                "cpu_hours": 0.0,
+                "storage_gb": 0.0,
+            },
+            "requested": {
+                "gpu_hours": gpu,
+                "cpu_hours": cpu,
+                "storage_gb": 0.0,
+            },
+            "committed_after": {
+                "gpu_hours": gpu,
+                "cpu_hours": cpu,
+                "storage_gb": 0.0,
+            },
+            "violations": [],
+        }
+        validation_value["failure"] = None
+    elif (
+        isinstance(original_run_version, int)
+        and not isinstance(original_run_version, bool)
+        and original_run_version == 1
+    ):
+        v1_messages = _run_v1_shape_messages(value)
+        if v1_messages:
+            return [
+                ValidationIssue("ERROR", str(path), message)
+                for message in v1_messages
+            ]
+        # V1 manifests are immutable historical records. Validate a transient
+        # V3-shaped view instead of rewriting disk; their synthetic scope stays
+        # deliberately Evidence-ineligible.
+        validation_value = copy.deepcopy(value)
+        validation_value["schema_version"] = 3
         execution = validation_value.get("execution")
         if isinstance(execution, dict):
             execution.setdefault("cwd_relative", ".")
@@ -233,89 +424,181 @@ def object_schema_issues(
             formalization.setdefault("declared_changed_paths", changed_paths)
             formalization.setdefault("actual_changed_paths", [])
             formalization.setdefault("artifacts_unchanged_during_run", False)
-        validation_value.setdefault(
-            "change_scope",
-            {
-                "repository_profile": {
-                    "path": "<legacy-v1-unattested>",
+        brief = validation_value.get("brief")
+        if isinstance(brief, dict):
+            brief.setdefault(
+                "snapshot",
+                {
+                    "path": f"<legacy-v{original_run_version}-unattested-brief>",
+                    "size": 0,
+                    "sha256": str(brief.get("sha256") or "0" * 64),
+                },
+            )
+            brief.setdefault(
+                "approval_snapshot",
+                {
+                    "path": f"<legacy-v{original_run_version}-unattested-approval>",
                     "size": 0,
                     "sha256": "0" * 64,
                 },
-                "changeset": None,
-                "validation": None,
-                "before": {
-                    "schema_version": 1,
-                    "study_id": str(value.get("study_id") or "SC-0000"),
-                    "outcome": "ADVISORY",
-                    "git": {},
+            )
+        budget = validation_value.setdefault("budget", {})
+        if isinstance(budget, dict):
+            gpu = budget.setdefault("estimated_gpu_hours", 0.0)
+            cpu = budget.setdefault("estimated_cpu_hours", 0.0)
+            storage = budget.setdefault("estimated_storage_gb", 0.0)
+            budget.setdefault("actual_output_storage_gb", None)
+            budget.setdefault(
+                "hard_limits",
+                {"gpu_hours": None, "cpu_hours": None, "storage_gb": None},
+            )
+            budget.setdefault(
+                "committed_before",
+                {"gpu_hours": 0.0, "cpu_hours": 0.0, "storage_gb": 0.0},
+            )
+            budget.setdefault(
+                "requested",
+                {
+                    "gpu_hours": gpu,
+                    "cpu_hours": cpu,
+                    "storage_gb": storage,
+                },
+            )
+            budget.setdefault(
+                "committed_after",
+                {
+                    "gpu_hours": gpu,
+                    "cpu_hours": cpu,
+                    "storage_gb": storage,
+                },
+            )
+            budget.setdefault("violations", [])
+        validation_value.setdefault("failure", None)
+        if original_run_version == 1:
+            validation_value.setdefault(
+                "change_scope",
+                {
+                    "repository_profile": {
+                        "path": "<legacy-v1-unattested>",
+                        "size": 0,
+                        "sha256": "0" * 64,
+                    },
                     "changeset": None,
                     "validation": None,
-                    "changed_paths": [],
-                    "violations": [],
-                    "advisories": ["legacy V1 Run has no attested repository change scope"],
+                    "before": {
+                        "schema_version": 1,
+                        "study_id": str(value.get("study_id") or "SC-0000"),
+                        "outcome": "ADVISORY",
+                        "git": {},
+                        "changeset": None,
+                        "validation": None,
+                        "changed_paths": [],
+                        "violations": [],
+                        "advisories": [
+                            "legacy V1 Run has no attested repository change scope"
+                        ],
+                    },
+                    "after": {
+                        "schema_version": 1,
+                        "study_id": str(value.get("study_id") or "SC-0000"),
+                        "outcome": "ADVISORY",
+                        "git": {},
+                        "changeset": None,
+                        "validation": None,
+                        "changed_paths": [],
+                        "violations": [],
+                        "advisories": [
+                            "legacy V1 Run has no attested repository change scope"
+                        ],
+                    },
+                    "evidence_eligible": False,
                 },
-                "after": {
-                    "schema_version": 1,
-                    "study_id": str(value.get("study_id") or "SC-0000"),
-                    "outcome": "ADVISORY",
-                    "git": {},
-                    "changeset": None,
-                    "validation": None,
-                    "changed_paths": [],
-                    "violations": [],
-                    "advisories": ["legacy V1 Run has no attested repository change scope"],
-                },
-                "evidence_eligible": False,
-            },
-        )
-        legacy_scope = validation_value.get("change_scope")
-        if isinstance(legacy_scope, dict):
-            legacy_scope.setdefault("validation", None)
-            for stage in ("before", "after"):
-                check = legacy_scope.get(stage)
-                if isinstance(check, dict):
-                    check.setdefault("validation", None)
+            )
+            legacy_scope = validation_value.get("change_scope")
+            if isinstance(legacy_scope, dict):
+                legacy_scope.setdefault("validation", None)
+                for stage in ("before", "after"):
+                    check = legacy_scope.get(stage)
+                    if isinstance(check, dict):
+                        check.setdefault("validation", None)
     return [
         ValidationIssue("ERROR", str(path), message)
         for message in validate_schema_instance(validation_value, schema)
     ]
 
 
-def parse_brief_metadata(text: str) -> dict[str, Any]:
-    match = re.search(
+def parse_brief_metadata(
+    text: str, *, allow_legacy_hard_budget: bool = False
+) -> dict[str, Any]:
+    if (
+        text.count("STUDYCTL-METADATA-BEGIN") != 1
+        or text.count("STUDYCTL-METADATA-END") != 1
+    ):
+        raise ValidationError("Brief must contain exactly one STUDYCTL-METADATA block")
+    matches = list(re.finditer(
         r"<!--\s*STUDYCTL-METADATA-BEGIN\s*(\{.*?\})\s*STUDYCTL-METADATA-END\s*-->",
         text,
         flags=re.DOTALL,
-    )
-    if not match:
+    ))
+    if len(matches) != 1:
         raise ValidationError("Brief is missing the STUDYCTL-METADATA block")
+    match = matches[0]
+    def reject_constant(value: str) -> None:
+        raise ValidationError(f"non-finite Brief metadata number is not allowed: {value}")
+
+    def reject_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValidationError(f"duplicate Brief metadata key: {key!r}")
+            result[key] = item
+        return result
+
     try:
-        value = json.loads(match.group(1))
+        value = json.loads(
+            match.group(1),
+            object_pairs_hook=reject_duplicate_pairs,
+            parse_constant=reject_constant,
+        )
     except json.JSONDecodeError as exc:
         raise ValidationError(f"Brief metadata is invalid JSON: {exc}") from exc
     if not isinstance(value, dict) or not isinstance(value.get("brief_version"), int):
         raise ValidationError("Brief metadata must contain integer brief_version")
+    if isinstance(value.get("brief_version"), bool):
+        raise ValidationError("Brief metadata brief_version must be an integer, not boolean")
+    if "hard_budget" in value and not allow_legacy_hard_budget:
+        raise ValidationError(
+            "Brief hard_budget must appear only in the visible STUDYCTL-HARD-BUDGET block"
+        )
     return value
 
 
-def brief_content_issues(paths: StudyPaths) -> list[ValidationIssue]:
+def brief_text_issues(path: Path, text: str) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
+    for heading in REQUIRED_BRIEF_HEADINGS:
+        if re.search(rf"^##\s+{re.escape(heading)}\s*$", text, flags=re.MULTILINE) is None:
+            issues.append(ValidationIssue("ERROR", str(path), f"missing heading: {heading}"))
+    if "[REPLACE:" in text or "[REPLACE]" in text:
+        issues.append(ValidationIssue("ERROR", str(path), "Brief still contains replacement placeholders"))
+    try:
+        metadata = parse_brief_metadata(text)
+        if metadata["brief_version"] < 1:
+            issues.append(ValidationIssue("ERROR", str(path), "brief_version must be at least 1"))
+    except ValidationError as exc:
+        issues.append(ValidationIssue("ERROR", str(path), str(exc)))
+    try:
+        parse_brief_hard_budget(text)
+    except ValidationError as exc:
+        issues.append(ValidationIssue("ERROR", str(path), str(exc)))
+    return issues
+
+
+def brief_content_issues(paths: StudyPaths) -> list[ValidationIssue]:
     try:
         text = paths.brief.read_text(encoding="utf-8")
     except OSError as exc:
         return [ValidationIssue("ERROR", str(paths.brief), f"cannot read Brief: {exc}")]
-    for heading in REQUIRED_BRIEF_HEADINGS:
-        if re.search(rf"^##\s+{re.escape(heading)}\s*$", text, flags=re.MULTILINE) is None:
-            issues.append(ValidationIssue("ERROR", str(paths.brief), f"missing heading: {heading}"))
-    if "[REPLACE:" in text or "[REPLACE]" in text:
-        issues.append(ValidationIssue("ERROR", str(paths.brief), "Brief still contains replacement placeholders"))
-    try:
-        metadata = parse_brief_metadata(text)
-        if metadata["brief_version"] < 1:
-            issues.append(ValidationIssue("ERROR", str(paths.brief), "brief_version must be at least 1"))
-    except ValidationError as exc:
-        issues.append(ValidationIssue("ERROR", str(paths.brief), str(exc)))
-    return issues
+    return brief_text_issues(paths.brief, text)
 
 
 def protected_artifact_snapshot(paths: StudyPaths) -> dict[str, Any]:
@@ -381,6 +664,143 @@ def run_manifest_paths(paths: StudyPaths) -> list[Path]:
     return sorted(paths.runs.glob("RUN-*/manifest.json"))
 
 
+def run_registry_structure_issues(paths: StudyPaths) -> list[ValidationIssue]:
+    """Detect allocated Run directories that are absent from manifest scans."""
+
+    issues: list[ValidationIssue] = []
+    if not paths.runs.is_dir():
+        return issues
+    for entry in sorted(paths.runs.iterdir(), key=lambda item: item.name):
+        if re.fullmatch(
+            r"\.RUN-[0-9]{6}\..+\.registration\.tmp",
+            entry.name,
+        ):
+            issues.append(
+                ValidationIssue(
+                    "ERROR",
+                    str(entry),
+                    "unfinished Run registration staging directory is present",
+                )
+            )
+            continue
+        if entry.name.startswith(".ledger.json.") and entry.name.endswith(".tmp"):
+            issues.append(
+                ValidationIssue(
+                    "ERROR",
+                    str(entry),
+                    "unfinished Run-ledger temporary file is present",
+                )
+            )
+            continue
+        if entry.name == ".registry.lock":
+            if entry.is_symlink() or not entry.is_file():
+                issues.append(
+                    ValidationIssue(
+                        "ERROR",
+                        str(entry),
+                        "Run registry lock must be a regular file",
+                    )
+                )
+            continue
+        if not entry.name.startswith("RUN-"):
+            continue
+        if ID_PATTERNS["run"].fullmatch(entry.name) is None:
+            issues.append(
+                ValidationIssue("ERROR", str(entry), "malformed Run directory name")
+            )
+            continue
+        if entry.is_symlink() or not entry.is_dir():
+            issues.append(
+                ValidationIssue(
+                    "ERROR", str(entry), "Run registry entry must be a directory"
+                )
+            )
+            continue
+        manifest_path = entry / "manifest.json"
+        if manifest_path.is_symlink() or not manifest_path.is_file():
+            issues.append(
+                ValidationIssue(
+                    "ERROR",
+                    str(entry),
+                    "Run directory is missing a regular manifest.json",
+                )
+            )
+        for child in entry.iterdir():
+            if child.name.startswith(".manifest.json.") and child.name.endswith(
+                ".tmp"
+            ):
+                issues.append(
+                    ValidationIssue(
+                        "ERROR",
+                        str(child),
+                        "unfinished Run Manifest temporary file is present",
+                    )
+                )
+    return issues
+
+
+def run_ledger_issues(
+    paths: StudyPaths,
+    runs: dict[str, tuple[Path, dict[str, Any]]],
+) -> list[ValidationIssue]:
+    path = ledger_path(paths)
+    try:
+        ledger_temps = sorted(
+            paths.study.glob(".RUNS.ledger.json.*.tmp")
+        )
+        if ledger_temps:
+            return [
+                ValidationIssue(
+                    "ERROR",
+                    str(item),
+                    "unfinished Run-ledger temporary file is present",
+                )
+                for item in ledger_temps
+            ]
+        current = load_ledger(paths)
+        if current is None:
+            if any(
+                manifest.get("schema_version") == 3
+                for _, manifest in runs.values()
+            ):
+                return [
+                    ValidationIssue(
+                        "ERROR",
+                        str(path),
+                        "Run ledger is missing for current V3 Run history",
+                    )
+                ]
+            if runs:
+                return [
+                    ValidationIssue(
+                        "WARNING",
+                        str(path),
+                        "legacy Run history has not yet been indexed into the durable ledger",
+                    )
+                ]
+            return [
+                ValidationIssue(
+                    "ERROR",
+                    str(path),
+                    "Run ledger is missing; Run identity and budget history cannot be verified",
+                )
+            ]
+        reconciled = bootstrap_or_reconcile_ledger(
+            paths, runs, write=False
+        )
+        if reconciled != current:
+            return [
+                ValidationIssue(
+                    "ERROR",
+                    str(path),
+                    "Run ledger is stale relative to visible immutable Manifests",
+                )
+            ]
+        return []
+    except (ValidationError, WorkflowError, OSError, ValueError) as exc:
+        return [ValidationIssue("ERROR", str(path), str(exc))]
+
+
 def evidence_paths(paths: StudyPaths) -> list[Path]:
     if not paths.evidence.is_dir():
         return []
@@ -407,21 +827,111 @@ def evidence_index(paths: StudyPaths) -> dict[tuple[str, int], tuple[Path, dict[
 
 
 def run_index(paths: StudyPaths) -> dict[str, tuple[Path, dict[str, Any]]]:
+    structure_errors = errors_only(run_registry_structure_issues(paths))
+    if structure_errors:
+        details = "\n".join(issue.render() for issue in structure_errors)
+        raise ValidationError(f"Run registry structure is invalid:\n{details}")
     index: dict[str, tuple[Path, dict[str, Any]]] = {}
     for path in run_manifest_paths(paths):
         value = load_json(path)
         if not isinstance(value, dict):
             raise ValidationError(f"Run manifest is not an object: {path}")
-        run_id = str(value.get("run_id"))
+        schema_errors = errors_only(
+            object_schema_issues(paths.root, "run", path, value)
+        )
+        if schema_errors:
+            details = "\n".join(issue.render() for issue in schema_errors)
+            raise ValidationError(f"Run manifest schema is invalid:\n{details}")
+        run_id = str(value.get("run_id", ""))
+        require_id("run", run_id)
+        if value.get("study_id") != paths.study_id:
+            raise ValidationError(
+                f"Run {run_id} study_id does not match Study directory"
+            )
+        if path.parent.name != run_id:
+            raise ValidationError(
+                f"Run {run_id} identity does not match directory {path.parent.name}"
+            )
+        if value.get("schema_version") in {1, 2, 3}:
+            # Budget registration is a hard authorization boundary. Validate
+            # its reservation and terminal digest before any caller can use
+            # this index to admit a later Run.
+            manifest_budget_commitment(value)
         if run_id in index:
             raise ValidationError(f"duplicate Run ID: {run_id}")
         index[run_id] = (path, value)
+    _, ownership_conflicts = run_output_ownership(paths.root, index)
+    if ownership_conflicts:
+        output_path, first_run, _, second_run, _ = ownership_conflicts[0]
+        try:
+            display_path = output_path.relative_to(paths.root.absolute()).as_posix()
+        except ValueError:
+            display_path = str(output_path)
+        raise ValidationError(
+            f"Run output path {display_path} is claimed by multiple Runs: "
+            f"{first_run}, {second_run}"
+        )
     return index
 
 
-def _resolve_recorded_path(root: Path, raw: str) -> Path:
+def _resolve_recorded_path(
+    root: Path, raw: str | os.PathLike[str]
+) -> Path:
     path = Path(raw)
     return path if path.is_absolute() else root / path
+
+
+def normalized_run_output_key(
+    root: Path, raw: str | os.PathLike[str]
+) -> Path:
+    """Return a lexical ownership key without following output symlinks."""
+
+    return Path(os.path.abspath(os.fspath(_resolve_recorded_path(root, raw))))
+
+
+def run_output_ownership(
+    root: Path,
+    runs: dict[str, tuple[Path, dict[str, Any]]],
+) -> tuple[
+    dict[Path, tuple[str, Path]],
+    list[tuple[Path, str, Path, str, Path]],
+]:
+    """Index declared output paths and report duplicate Run ownership.
+
+    Every declaration reserves its lexical path, including declarations that
+    were absent at terminal sealing or belong to failed/incomplete Runs.  The
+    key deliberately avoids ``resolve()`` so a later-created symlink cannot
+    change which path was reserved.
+    """
+
+    owners: dict[Path, tuple[str, Path]] = {}
+    conflicts: list[tuple[Path, str, Path, str, Path]] = []
+    for run_id, (manifest_path, manifest) in sorted(runs.items()):
+        outputs = manifest.get("outputs")
+        if not isinstance(outputs, list):
+            continue
+        for record in outputs:
+            if not isinstance(record, dict):
+                continue
+            raw = record.get("path")
+            if not isinstance(raw, str) or not raw:
+                continue
+            key = normalized_run_output_key(root, raw)
+            previous = owners.get(key)
+            if previous is None:
+                owners[key] = (run_id, manifest_path)
+                continue
+            previous_run_id, previous_manifest_path = previous
+            conflicts.append(
+                (
+                    key,
+                    previous_run_id,
+                    previous_manifest_path,
+                    run_id,
+                    manifest_path,
+                )
+            )
+    return owners, conflicts
 
 
 def _has_symlink_component(path: Path) -> bool:
@@ -478,6 +988,180 @@ def _recorded_regular_file_issue(
     return issues
 
 
+def _run_brief_authority_issues(
+    paths: StudyPaths,
+    manifest: dict[str, Any],
+    *,
+    for_evidence: bool,
+) -> list[ValidationIssue]:
+    """Verify the immutable Brief and approval that authorized a V3 Run."""
+
+    if manifest.get("schema_version") != 3:
+        return []
+    issues: list[ValidationIssue] = []
+    run_id = str(manifest.get("run_id") or "<unknown Run>")
+    brief = manifest.get("brief")
+    if not isinstance(brief, dict):
+        return [ValidationIssue("ERROR", run_id, "Run Brief authority is invalid")]
+
+    missing_level = (
+        "WARNING"
+        if manifest.get("status") == "incomplete" and not for_evidence
+        else "ERROR"
+    )
+    resolved: dict[str, Path] = {}
+    for key, label in (
+        ("snapshot", "Run Brief snapshot"),
+        ("approval_snapshot", "Run Brief-approval snapshot"),
+    ):
+        record = brief.get(key)
+        if not isinstance(record, dict):
+            issues.append(
+                ValidationIssue("ERROR", run_id, f"{label} record is invalid")
+            )
+            continue
+        record_issues = _recorded_regular_file_issue(
+            paths.root,
+            record,
+            label=label,
+            missing_level=missing_level,
+        )
+        issues.extend(record_issues)
+        if not record_issues:
+            resolved[key] = _resolve_recorded_path(
+                paths.root, str(record["path"])
+            )
+
+    snapshot_record = brief.get("snapshot")
+    if (
+        isinstance(snapshot_record, dict)
+        and snapshot_record.get("sha256") != brief.get("sha256")
+    ):
+        issues.append(
+            ValidationIssue(
+                "ERROR",
+                run_id,
+                "Run Brief snapshot hash does not match brief.sha256",
+            )
+        )
+
+    if set(resolved) != {"snapshot", "approval_snapshot"}:
+        return issues
+
+    try:
+        snapshot_text = resolved["snapshot"].read_text(encoding="utf-8")
+        snapshot_limits = parse_brief_hard_budget(snapshot_text)
+        approval = load_json(resolved["approval_snapshot"])
+    except (OSError, UnicodeDecodeError, ValidationError) as exc:
+        issues.append(
+            ValidationIssue(
+                "ERROR", run_id, f"cannot verify Run Brief authority: {exc}"
+            )
+        )
+        return issues
+
+    budget = manifest.get("budget")
+    if not isinstance(budget, dict) or budget.get("hard_limits") != snapshot_limits:
+        issues.append(
+            ValidationIssue(
+                "ERROR",
+                run_id,
+                "Run hard limits do not match its immutable Brief snapshot",
+            )
+        )
+    if not isinstance(approval, dict):
+        issues.append(
+            ValidationIssue("ERROR", run_id, "Run Brief approval is not an object")
+        )
+        return issues
+    approval_schema_issues = object_schema_issues(
+        paths.root,
+        "brief_approval",
+        resolved["approval_snapshot"],
+        approval,
+    )
+    issues.extend(approval_schema_issues)
+    if errors_only(approval_schema_issues):
+        return issues
+    if approval.get("approval_sha256") != record_digest(
+        approval, "approval_sha256"
+    ):
+        issues.append(
+            ValidationIssue(
+                "ERROR", run_id, "Run Brief approval digest is invalid"
+            )
+        )
+    if approval.get("approval_sha256") != brief.get("approval_sha256"):
+        issues.append(
+            ValidationIssue(
+                "ERROR",
+                run_id,
+                "Run Brief approval does not match brief.approval_sha256",
+            )
+        )
+    approved_brief = approval.get("brief")
+    if not isinstance(approved_brief, dict) or (
+        approved_brief.get("sha256") != brief.get("sha256")
+        or approved_brief.get("path") != brief.get("path")
+    ):
+        issues.append(
+            ValidationIssue(
+                "ERROR",
+                run_id,
+                "Run Brief approval does not authorize the recorded Brief",
+            )
+        )
+    if approval.get("study_id") != manifest.get("study_id"):
+        issues.append(
+            ValidationIssue(
+                "ERROR",
+                run_id,
+                "Run Brief approval belongs to a different Study",
+            )
+        )
+    protected = approval.get("protected_artifacts")
+    formal = manifest.get("formal_artifacts")
+    if isinstance(protected, dict) and isinstance(formal, list):
+        for key, filename in (
+            ("evaluator", "EVALUATOR.json"),
+            ("dataset_split", "DATASET_SPLIT.json"),
+            ("acceptance_criteria", "ACCEPTANCE_CRITERIA.json"),
+        ):
+            matches = [
+                record
+                for record in formal
+                if isinstance(record, dict)
+                and str(record.get("path", "")).endswith(
+                    "/formal-artifacts/" + filename
+                )
+            ]
+            approved_record = protected.get(key)
+            if approved_record is None:
+                if matches:
+                    issues.append(
+                        ValidationIssue(
+                            "ERROR",
+                            run_id,
+                            f"Run captured unapproved protected artifact {filename}",
+                        )
+                    )
+                continue
+            expected_hash = (
+                approved_record.get("sha256")
+                if isinstance(approved_record, dict)
+                else None
+            )
+            if len(matches) != 1 or matches[0].get("sha256") != expected_hash:
+                issues.append(
+                    ValidationIssue(
+                        "ERROR",
+                        run_id,
+                        f"Run protected-artifact snapshot does not match approval: {filename}",
+                    )
+                )
+    return issues
+
+
 def run_dependency_integrity_issues(
     paths: StudyPaths,
     manifest: dict[str, Any],
@@ -504,14 +1188,22 @@ def run_dependency_integrity_issues(
     elif (
         not isinstance(schema_version, int)
         or isinstance(schema_version, bool)
-        or schema_version != 2
+        or schema_version not in {2, 3}
     ):
         issues.append(
             ValidationIssue("ERROR", run_id, f"unsupported Run schema_version: {schema_version!r}")
         )
 
+    issues.extend(
+        _run_brief_authority_issues(
+            paths,
+            manifest,
+            for_evidence=for_evidence,
+        )
+    )
+
     change_scope = manifest.get("change_scope")
-    if isinstance(change_scope, dict) and schema_version == 2:
+    if isinstance(change_scope, dict) and schema_version in {2, 3}:
         for key, required in (
             ("repository_profile", True),
             ("changeset", False),
@@ -652,8 +1344,78 @@ def run_dependency_integrity_issues(
     return issues
 
 
+def retained_run_output_budget_issues(
+    paths: StudyPaths,
+    manifest: dict[str, Any],
+) -> list[ValidationIssue]:
+    """Detect mutable/drifted retained outputs before admitting another Run.
+
+    Missing files remain conservatively charged by the ledger and therefore do
+    not lower the budget.  If a recorded output still exists, however, it must
+    remain the same read-only regular file; otherwise its recorded byte charge
+    is no longer a trustworthy upper bound on retained storage.
+    """
+
+    issues: list[ValidationIssue] = []
+    run_id = str(manifest.get("run_id") or "<unknown Run>")
+    outputs = manifest.get("outputs")
+    if not isinstance(outputs, list):
+        return issues
+    for index, record in enumerate(outputs):
+        if not isinstance(record, dict):
+            continue
+        recorded_present = record.get("present") is True
+        raw = record.get("path")
+        label = f"{run_id} output[{index}]"
+        if not isinstance(raw, str) or not raw:
+            issues.append(ValidationIssue("ERROR", label, "recorded output path is missing"))
+            continue
+        path = _resolve_recorded_path(paths.root, raw)
+        if _has_symlink_component(path):
+            issues.append(
+                ValidationIssue("ERROR", raw, f"retained {label} uses a symbolic-link path")
+            )
+            continue
+        try:
+            metadata = path.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            # Deletion never refunds the immutable ledger commitment.  A
+            # future recreation will be checked before the next admission.
+            continue
+        except OSError as exc:
+            issues.append(ValidationIssue("ERROR", raw, f"cannot inspect retained {label}: {exc}"))
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            issues.append(ValidationIssue("ERROR", raw, f"retained {label} is not a regular file"))
+            continue
+        if not recorded_present:
+            issues.append(
+                ValidationIssue(
+                    "ERROR",
+                    raw,
+                    f"retained {label} exists but was absent or unverifiable when the Run was sealed",
+                )
+            )
+            continue
+        if metadata.st_mode & 0o222:
+            issues.append(ValidationIssue("ERROR", raw, f"retained {label} is writable"))
+        if metadata.st_size != record.get("size"):
+            issues.append(ValidationIssue("ERROR", raw, f"retained {label} size changed"))
+            continue
+        try:
+            digest = sha256_file(path)
+        except OSError as exc:
+            issues.append(ValidationIssue("ERROR", raw, f"cannot hash retained {label}: {exc}"))
+            continue
+        if digest != record.get("sha256"):
+            issues.append(ValidationIssue("ERROR", raw, f"retained {label} content changed"))
+    return issues
+
+
 def sealed_run_evidence_eligible(manifest: dict[str, Any]) -> bool:
-    if manifest.get("schema_version") != 2:
+    if manifest.get("schema_version") not in {2, 3}:
+        return False
+    if manifest.get("status") not in {"succeeded", "failed", "interrupted"}:
         return False
     from .workspace import change_state_evidence_eligible
 
@@ -696,7 +1458,7 @@ def _changed_cohort_fields(manifests: list[dict[str, Any]]) -> list[str]:
 
 
 def _run_issues(paths: StudyPaths) -> tuple[list[ValidationIssue], dict[str, tuple[Path, dict[str, Any]]]]:
-    issues: list[ValidationIssue] = []
+    issues: list[ValidationIssue] = run_registry_structure_issues(paths)
     runs: dict[str, tuple[Path, dict[str, Any]]] = {}
     cohort_ids: dict[str, str] = {}
     for path in run_manifest_paths(paths):
@@ -704,7 +1466,10 @@ def _run_issues(paths: StudyPaths) -> tuple[list[ValidationIssue], dict[str, tup
             manifest = load_json(path)
             if not isinstance(manifest, dict):
                 raise ValidationError("manifest must be an object")
-            issues.extend(object_schema_issues(paths.root, "run", path, manifest))
+            schema_validation = object_schema_issues(
+                paths.root, "run", path, manifest
+            )
+            issues.extend(schema_validation)
             run_id = str(manifest.get("run_id", ""))
             require_id("run", run_id)
             if manifest.get("study_id") != paths.study_id:
@@ -715,11 +1480,93 @@ def _run_issues(paths: StudyPaths) -> tuple[list[ValidationIssue], dict[str, tup
                 issues.append(ValidationIssue("ERROR", str(path), "run_id does not match directory"))
             if run_id in runs:
                 issues.append(ValidationIssue("ERROR", str(path), f"duplicate Run ID {run_id}"))
+            if errors_only(schema_validation):
+                # Schema errors already identify the malformed record. Do not
+                # dereference invalid nested values or expose the record to
+                # Evidence validation as if it were usable.
+                continue
             runs[run_id] = (path, manifest)
             status = manifest.get("status")
+            integrity = manifest.get("integrity", {})
             if status == "running":
                 issues.append(ValidationIssue("ERROR", str(path), "Run is unsealed/running"))
-            integrity = manifest.get("integrity", {})
+                execution = manifest.get("execution", {})
+                if any(
+                    execution.get(key) is not None
+                    for key in ("ended_at", "duration_seconds", "exit_code")
+                ):
+                    issues.append(
+                        ValidationIssue(
+                            "ERROR",
+                            str(path),
+                            "running Run has terminal execution fields",
+                        )
+                    )
+                if any(
+                    integrity.get(key) is not None
+                    for key in ("sealed_at", "manifest_sha256")
+                ):
+                    issues.append(
+                        ValidationIssue(
+                            "ERROR", str(path), "running Run has terminal integrity"
+                        )
+                    )
+                if manifest.get("failure") is not None:
+                    issues.append(
+                        ValidationIssue(
+                            "ERROR", str(path), "running Run cannot record terminal failure"
+                        )
+                    )
+                if manifest.get("change_scope", {}).get("evidence_eligible") is not False:
+                    issues.append(
+                        ValidationIssue(
+                            "ERROR", str(path), "running Run must be Evidence-ineligible"
+                        )
+                    )
+            elif status == "incomplete":
+                if not isinstance(manifest.get("failure"), dict):
+                    issues.append(
+                        ValidationIssue(
+                            "ERROR",
+                            str(path),
+                            "incomplete Run must record its failure phase",
+                        )
+                    )
+                issues.append(
+                    ValidationIssue(
+                        "WARNING",
+                        str(path),
+                        "Run was sealed incomplete and cannot support Evidence",
+                    )
+                )
+            if status != "running":
+                execution = manifest.get("execution", {})
+                if execution.get("ended_at") is None or execution.get(
+                    "duration_seconds"
+                ) is None:
+                    issues.append(
+                        ValidationIssue(
+                            "ERROR",
+                            str(path),
+                            "terminal Run is missing completion timing",
+                        )
+                    )
+                if integrity.get("sealed_at") is None or integrity.get(
+                    "manifest_sha256"
+                ) is None:
+                    issues.append(
+                        ValidationIssue(
+                            "ERROR", str(path), "terminal Run is not sealed"
+                        )
+                    )
+            if status == "succeeded" and manifest.get("execution", {}).get(
+                "exit_code"
+            ) != 0:
+                issues.append(
+                    ValidationIssue(
+                        "ERROR", str(path), "succeeded Run must have exit_code 0"
+                    )
+                )
             digest = nested_record_digest(manifest, "integrity", "manifest_sha256")
             if status != "running" and integrity.get("manifest_sha256") != digest:
                 issues.append(ValidationIssue("ERROR", str(path), "manifest_sha256 does not match record"))
@@ -738,7 +1585,7 @@ def _run_issues(paths: StudyPaths) -> tuple[list[ValidationIssue], dict[str, tup
                     )
                 )
             change_scope = manifest.get("change_scope", {})
-            if manifest.get("schema_version") == 2:
+            if manifest.get("schema_version") in {2, 3}:
                 expected_eligibility = sealed_run_evidence_eligible(manifest)
                 if change_scope.get("evidence_eligible") is not expected_eligibility:
                     issues.append(
@@ -756,6 +1603,44 @@ def _run_issues(paths: StudyPaths) -> tuple[list[ValidationIssue], dict[str, tup
                         "Run is not eligible for formal Evidence because its change scope is unverifiable or blocked",
                     )
                 )
+            budget = manifest.get("budget", {})
+            if manifest.get("schema_version") == 3 and isinstance(budget, dict):
+                try:
+                    manifest_budget_commitment(manifest)
+                    expected_budget = budget_projection(
+                        budget.get("hard_limits", {}),
+                        budget.get("committed_before", {}),
+                        budget.get("requested", {}),
+                    )
+                except ValidationError as exc:
+                    issues.append(ValidationIssue("ERROR", str(path), str(exc)))
+                else:
+                    if budget.get("committed_after") != expected_budget[
+                        "committed_after"
+                    ]:
+                        issues.append(
+                            ValidationIssue(
+                                "ERROR",
+                                str(path),
+                                "Run budget committed_after is inconsistent",
+                            )
+                        )
+                    if budget.get("violations") != expected_budget["violations"]:
+                        issues.append(
+                            ValidationIssue(
+                                "ERROR",
+                                str(path),
+                                "Run budget violations are inconsistent",
+                            )
+                        )
+                    if expected_budget["violations"] and status != "incomplete":
+                        issues.append(
+                            ValidationIssue(
+                                "ERROR",
+                                str(path),
+                                "hard-budget violation requires incomplete status",
+                            )
+                        )
             cohort = manifest.get("cohort", {})
             fields = cohort.get("fields", {})
             expected_fingerprint = sha256_json(fields)
@@ -770,15 +1655,32 @@ def _run_issues(paths: StudyPaths) -> tuple[list[ValidationIssue], dict[str, tup
                             "ERROR", str(path), f"Cohort {cohort_id} has more than one fingerprint"
                         )
                     )
-            issues.extend(
-                run_dependency_integrity_issues(
-                    paths,
-                    manifest,
-                    for_evidence=False,
+            if status != "running":
+                issues.extend(
+                    run_dependency_integrity_issues(
+                        paths,
+                        manifest,
+                        for_evidence=False,
+                    )
                 )
-            )
         except (ValidationError, OSError, ValueError) as exc:
             issues.append(ValidationIssue("ERROR", str(path), str(exc)))
+    _, ownership_conflicts = run_output_ownership(paths.root, runs)
+    for output_path, first_run, first_manifest, second_run, second_manifest in (
+        ownership_conflicts
+    ):
+        try:
+            display_path = output_path.relative_to(paths.root.absolute()).as_posix()
+        except ValueError:
+            display_path = str(output_path)
+        issues.append(
+            ValidationIssue(
+                "ERROR",
+                str(second_manifest),
+                f"Run output path {display_path} is claimed by multiple Runs: "
+                f"{first_run} ({first_manifest}), {second_run} ({second_manifest})",
+            )
+        )
     return issues, runs
 
 
@@ -821,8 +1723,18 @@ def _evidence_issues(
                 referenced_manifests.append(manifest)
                 if run_ref.get("manifest_sha256") != manifest.get("integrity", {}).get("manifest_sha256"):
                     issues.append(ValidationIssue("ERROR", str(path), f"Run manifest hash mismatch: {run_id}"))
-                if manifest.get("status") == "running":
-                    issues.append(ValidationIssue("ERROR", str(path), f"Evidence references running Run: {run_id}"))
+                if manifest.get("status") not in {
+                    "succeeded",
+                    "failed",
+                    "interrupted",
+                }:
+                    issues.append(
+                        ValidationIssue(
+                            "ERROR",
+                            str(path),
+                            f"Evidence references non-terminal or incomplete Run: {run_id}",
+                        )
+                    )
                 actual_fingerprints.add(manifest.get("cohort", {}).get("fingerprint_sha256"))
                 if item.get("status") == "finalized" and any(
                     record.get("changed_during_run") for record in manifest.get("inputs", [])
@@ -1145,10 +2057,17 @@ def _checkpoint_issues(
                         )
                         continue
                     digest = manifest.get("integrity", {}).get("manifest_sha256")
-                    if manifest.get("status") not in {"failed", "interrupted"}:
+                    if manifest.get("status") not in {
+                        "failed",
+                        "interrupted",
+                        "incomplete",
+                    }:
                         issues.append(
                             ValidationIssue(
-                                "ERROR", str(path), f"representative Run is not failed/interrupted: {run_id}"
+                                "ERROR",
+                                str(path),
+                                "representative Run is not failed/interrupted/incomplete: "
+                                f"{run_id}",
                             )
                         )
                     if digest != nested_record_digest(
@@ -1365,6 +2284,7 @@ def validate_study(paths: StudyPaths) -> list[ValidationIssue]:
     issues.extend(brief_approval_issues(paths))
     run_issues, runs = _run_issues(paths)
     issues.extend(run_issues)
+    issues.extend(run_ledger_issues(paths, runs))
     evidence_issues, evidence = _evidence_issues(paths, runs)
     issues.extend(evidence_issues)
     claim_issues, _ = _claims_issues(paths, evidence)

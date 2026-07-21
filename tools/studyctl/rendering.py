@@ -4,13 +4,24 @@ from pathlib import Path
 import re
 from typing import Any, Iterable
 
+from .budget import (
+    budget_projection,
+    budget_totals_from_manifests,
+    format_budget_violation,
+    parse_brief_hard_budget,
+)
 from .formalization import artifact_ready, collect_formalization_debt, load_policy
 from .hashing import atomic_write_bytes, load_json, sha256_file
 from .models import StudyPaths, ValidationError, WorkflowError
+from .run_ledger import (
+    bootstrap_or_reconcile_ledger,
+    ledger_commitment_totals,
+    ledger_path,
+    load_ledger,
+)
 from .validation import (
     brief_approval_issues,
     evidence_index,
-    parse_brief_metadata,
     run_index,
     validate_study,
 )
@@ -114,20 +125,113 @@ def _latest_checkpoint(paths: StudyPaths) -> dict[str, Any] | None:
 
 
 def _budget_state(paths: StudyPaths, runs: dict[str, tuple[Path, dict[str, Any]]]) -> dict[str, Any]:
-    gpu = sum(float(item.get("budget", {}).get("estimated_gpu_hours", 0.0)) for _, item in runs.values())
-    cpu = sum(float(item.get("budget", {}).get("estimated_cpu_hours", 0.0)) for _, item in runs.values())
+    """Project resource charges without hiding the authority used.
+
+    Current Studies charge from the durable Run ledger.  In particular, a
+    missing Run directory must make validation fail without making already
+    reserved/consumed budget disappear from STATUS.  Pre-ledger V1/V2 history
+    may still be displayed from immutable Manifests, but that lower-assurance
+    fallback is explicitly labelled and is never presented as ledger-backed.
+    """
+
+    committed: dict[str, float] | None = None
+    authority = "unavailable"
+    authority_path = ledger_path(paths).relative_to(paths.root).as_posix()
+    authority_error: str | None = None
+    authority_warning: str | None = None
+    try:
+        ledger = load_ledger(paths)
+    except (ValidationError, WorkflowError, OSError, ValueError) as exc:
+        authority_error = f"durable Run ledger is invalid: {exc}"
+    else:
+        if ledger is not None:
+            committed = ledger_commitment_totals(ledger)
+            authority = "durable Run ledger (authoritative)"
+            try:
+                reconciled = bootstrap_or_reconcile_ledger(
+                    paths,
+                    runs,
+                    write=False,
+                )
+                if reconciled != ledger:
+                    # A terminal Manifest may have reached durable storage
+                    # immediately before the corresponding ledger update.
+                    # Show the conservative reconciled charge while keeping
+                    # STATUS invalid until that transition is persisted.
+                    committed = ledger_commitment_totals(reconciled)
+                    authority_error = (
+                        "durable Run ledger is stale relative to visible immutable "
+                        "Manifests"
+                    )
+            except (ValidationError, WorkflowError, OSError, ValueError) as exc:
+                authority_error = str(exc)
+        elif runs and all(
+            manifest.get("schema_version") in {1, 2}
+            for _, manifest in runs.values()
+        ):
+            committed = budget_totals_from_manifests(
+                item for _, item in runs.values()
+            )
+            authority = "legacy Manifest fallback (unindexed, lower assurance)"
+            authority_warning = (
+                "durable Run ledger is absent; migrate the intact legacy Run "
+                "history before treating budget history as authoritative"
+            )
+        else:
+            authority_error = (
+                "durable Run ledger is missing; resource charges are unavailable"
+            )
+
     hard_budget: dict[str, Any] = {}
+    projection: dict[str, Any] | None = None
     if paths.brief.is_file():
         try:
-            metadata = parse_brief_metadata(paths.brief.read_text(encoding="utf-8"))
-            hard_budget = metadata.get("hard_budget", {})
-        except (OSError, ValidationError):
-            pass
+            hard_budget = parse_brief_hard_budget(
+                paths.brief.read_text(encoding="utf-8")
+            )
+        except (OSError, ValidationError) as exc:
+            message = f"visible Brief hard budget is invalid: {exc}"
+            authority_error = (
+                f"{authority_error}; {message}" if authority_error else message
+            )
+    if committed is not None and hard_budget:
+        projection = budget_projection(
+            hard_budget,
+            committed,
+            {"gpu_hours": 0.0, "cpu_hours": 0.0, "storage_gb": 0.0},
+        )
+        if projection["violations"]:
+            message = "current approved hard budget is already exceeded: " + "; ".join(
+                format_budget_violation(item)
+                for item in projection["violations"]
+            )
+            authority_error = (
+                f"{authority_error}; {message}" if authority_error else message
+            )
     return {
-        "estimated_gpu_hours_recorded": gpu,
-        "estimated_cpu_hours_recorded": cpu,
+        "estimated_gpu_hours_recorded": (
+            committed["gpu_hours"] if committed is not None else None
+        ),
+        "estimated_cpu_hours_recorded": (
+            committed["cpu_hours"] if committed is not None else None
+        ),
+        "charged_storage_gb_recorded": (
+            committed["storage_gb"] if committed is not None else None
+        ),
         "hard_budget": hard_budget,
+        "projection": projection,
+        "violations": projection["violations"] if projection else [],
+        "authority": authority,
+        "authority_path": authority_path,
+        "authority_error": authority_error,
+        "authority_warning": authority_warning,
     }
+
+
+def _format_budget_charge(value: Any) -> str:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "unavailable"
+    return f"{float(value):.6g}"
 
 
 def _append_items(lines: list[str], items: Iterable[str], empty: str = "None recorded.") -> None:
@@ -224,7 +328,12 @@ def render_status(paths: StudyPaths) -> Path:
         )
         for issue in authority_warnings:
             lines.append(f"- {issue.render()}")
-    elif authority_errors or evidence_load_error or run_load_error:
+    elif (
+        authority_errors
+        or evidence_load_error
+        or run_load_error
+        or budget["authority_error"]
+    ):
         lines.append("**INVALID — scientific Evidence/Claim summaries below are not trusted where their source chain failed.**")
         for issue in authority_errors:
             lines.append(f"- {issue.render()}")
@@ -234,6 +343,8 @@ def render_status(paths: StudyPaths) -> Path:
             lines.append(f"- Evidence index error: {evidence_load_error}")
         if run_load_error:
             lines.append(f"- Run index error: {run_load_error}")
+        if budget["authority_error"]:
+            lines.append(f"- Budget authority error: {budget['authority_error']}")
     elif authority_warnings:
         lines.append(
             "**PASS WITH WARNINGS — authoritative records are structurally valid, "
@@ -328,9 +439,25 @@ def render_status(paths: StudyPaths) -> Path:
             "",
             "## Budget",
             "",
-            f"- Recorded estimated GPU hours: {budget['estimated_gpu_hours_recorded']:.6g}",
-            f"- Recorded estimated CPU hours: {budget['estimated_cpu_hours_recorded']:.6g}",
-            f"- Hard budget from Brief metadata: `{budget['hard_budget']}`",
+            f"- Charge authority: **{budget['authority']}**",
+            f"- Authority path: `{budget['authority_path']}`",
+            "- Recorded estimated GPU hours: "
+            f"{_format_budget_charge(budget['estimated_gpu_hours_recorded'])}",
+            "- Recorded estimated CPU hours: "
+            f"{_format_budget_charge(budget['estimated_cpu_hours_recorded'])}",
+            "- Recorded charged storage (decimal GB): "
+            f"{_format_budget_charge(budget['charged_storage_gb_recorded'])}",
+            f"- Hard budget from visible Brief block: `{budget['hard_budget']}`",
+            (
+                f"- Authority validation: **INVALID** — {budget['authority_error']}"
+                if budget["authority_error"]
+                else (
+                    "- Authority validation: **LEGACY FALLBACK** — "
+                    f"{budget['authority_warning']}"
+                    if budget["authority_warning"]
+                    else "- Authority validation: current and internally consistent"
+                )
+            ),
             "",
             "## Latest Checkpoint",
             "",
@@ -351,6 +478,10 @@ def render_status(paths: StudyPaths) -> Path:
         attention.append("Resolve blocking formalization debt before review.")
     if (authority_errors and not awaiting_initial_approval) or evidence_load_error or run_load_error:
         attention.append("Repair deterministic validation errors before relying on Claims or Evidence summaries.")
+    if budget["authority_error"]:
+        attention.append(
+            "Resolve the hard-budget or Run-ledger authority error before further execution."
+        )
     if authority_warnings:
         attention.append("Review deterministic validation warnings before claiming reproducibility.")
     if change_scope.get("outcome") in {"BLOCKED", "INVALID"}:
