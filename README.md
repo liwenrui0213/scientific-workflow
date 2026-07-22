@@ -22,7 +22,7 @@
 - **Just-in-time alignment**：Agent 先检查仓库并起草；只有歧义会改变研究目标、受保护条件、硬预算或立即执行的高成本操作，且没有安全可逆默认值时才询问人。
 - **Default informal**：低成本、可逆探索默认放在 Study 的 `work/active/`，不预先形式化整个研究过程。
 - **Progressive formalization**：只在科学语义、共享依赖、计算成本、可复现性或审查要求上升时创建最小必要的 `METHOD`、`PROTOCOL`、`EVALUATOR` 或 `PLAN`。
-- **Claim-to-Evidence**：Claim 引用已定稿 Evidence；Evidence 引用可复现、不可变的 Runs。
+- **Claim-to-Evidence**：Claim 引用已定稿 Evidence；Evidence 引用可复现、不可变的 Runs，并显式说明观察如何支持 Claim、依赖哪些辅助假设、有哪些竞争解释以及什么结果会推翻当前判断。
 - **Default exploratory, confirm on promotion**：所有普通 Run 默认是探索性的；只有准备把结果提升为高强度 Claim 时，才冻结一个很小的确认记录并运行新的确认性 Runs。
 - **Finite active context**：历史可以持续增长，但默认只加载有界的 `ACTIVE_CONTEXT.json` selector；Evidence、Frontier、Checkpoint 和 Compaction 负责保持当前工作集有限。
 - **Human authority**：人批准 Brief，并分别裁决实现是否可接受、证据支持什么科学结论。
@@ -294,6 +294,10 @@ Manifest 版本；V1–V3 永久按 exploratory 解释。
 旧 Evidence 历史则显式运行
 `python -m tools.studyctl migrate-evidence-sequence SC-NNNN`；它会检查连续版本
 和 Checkpoint 水位，并明确标注迁移前删除历史无法由本地文件证明。
+Evidence schema V2 进一步要求一个最小 `inference` 论证区块。已经定稿的 V1
+Evidence 仍按冻结的 V1 schema 保留；它不会被自动改写，也不会因此获得 V2
+论证完整性。尚未定稿的 V1 草稿应先改为 schema V2 并补齐该区块，再执行
+`evidence-finalize`。
 旧 Checkpoint 链同样需要显式运行
 `python -m tools.studyctl migrate-checkpoint-sequence SC-NNNN`；它只接受从
 `CHECKPOINT-000001` 开始的完整连续链，并记录迁移前尾部删除无法由本地文件证明。

@@ -28,7 +28,10 @@ or deciding which questions require human review.
    inputs, outputs, logs, governance snapshots, and formal snapshots. Check the
    base anchor, native validation, protected conditions, evaluator and split,
    mathematical mapping, baselines, Cohorts, uncertainty, contradictions, and
-   formalization debt. For a high-strength Claim, inspect the frozen
+   formalization debt. For every current Evidence version, challenge its
+   observation-to-Claim bridge, auxiliary assumptions, competing explanations,
+   and stated falsification conditions against the actual Runs and addressed
+   Claim. For a high-strength Claim, inspect the frozen
    Confirmation Record and the complete confirmation-attempt inventory: verify
    temporal ordering, Claim/candidate/protocol/evaluator hashes, held-out
    freshness, planned-slot coverage, failed attempts, and exclusions.

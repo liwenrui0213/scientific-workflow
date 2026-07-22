@@ -724,6 +724,7 @@ class CoreWorkflowTests(WorkflowTestCase):
         second["scope"] = "Only the related-Evidence validation fixture."
         second["uncertainty"] = "No sampling uncertainty is asserted."
         second["limitations"] = ["This is not a scientific result."]
+        self.fill_evidence_inference(second)
         second["assessment"] = "inconclusive"
         second["related_evidence"]["supporting"] = [
             {
@@ -779,6 +780,7 @@ class CoreWorkflowTests(WorkflowTestCase):
         draft["result"] = {"alpha": 4, "beta": 4}
         draft["scope"] = "Only the two explicitly recorded Cohorts."
         draft["uncertainty"] = "No sampling uncertainty in this deterministic fixture."
+        self.fill_evidence_inference(draft)
         draft["assessment"] = "supports"
         atomic_write_json(draft_path, draft)
 

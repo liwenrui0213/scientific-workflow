@@ -26,7 +26,7 @@ from .hashing import (
 )
 from .locking import serialized_study_authority
 from .models import (
-    SCHEMA_VERSION,
+    EVIDENCE_SCHEMA_VERSION,
     StudyPaths,
     ValidationError,
     WorkflowError,
@@ -738,7 +738,7 @@ def create_evidence_draft(
         version = max((number for number, _, _ in versions), default=0) + 1
         timestamp = utc_now()
         draft: dict[str, Any] = {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": EVIDENCE_SCHEMA_VERSION,
             "study_id": paths.study_id,
             "evidence_id": evidence_id,
             "version": version,
@@ -764,6 +764,12 @@ def create_evidence_draft(
             "scope": None,
             "uncertainty": None,
             "limitations": [],
+            "inference": {
+                "observation_to_claim": None,
+                "auxiliary_assumptions": [],
+                "competing_explanations": [],
+                "falsification_conditions": [],
+            },
             "assessment": None,
             "related_evidence": {
                 "supporting": [],
@@ -870,6 +876,17 @@ def _require_nonblank(name: str, value: Any) -> None:
         raise ValidationError(f"finalized Evidence requires explicit {name}")
 
 
+def _require_nonempty_inference_list(name: str, value: Any) -> None:
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(not isinstance(item, str) or not item.strip() for item in value)
+    ):
+        raise ValidationError(
+            f"finalized Evidence requires at least one explicit inference.{name} entry"
+        )
+
+
 def _require_evidence_formalization(
     paths: StudyPaths,
     item: dict[str, Any] | None = None,
@@ -918,6 +935,19 @@ def _validate_final_content(
     _require_nonblank("scope", item.get("scope"))
     _require_nonblank("uncertainty", item.get("uncertainty"))
     _require_nonblank("assessment", item.get("assessment"))
+    inference = item.get("inference")
+    if not isinstance(inference, dict):
+        raise ValidationError("finalized Evidence requires an explicit inference object")
+    _require_nonblank(
+        "inference.observation_to_claim",
+        inference.get("observation_to_claim"),
+    )
+    for field in (
+        "auxiliary_assumptions",
+        "competing_explanations",
+        "falsification_conditions",
+    ):
+        _require_nonempty_inference_list(field, inference.get(field))
     comparison = analysis.get("comparison", {})
     if len(fingerprints) > 1:
         if comparison.get("mode") != "compatible_cohorts":

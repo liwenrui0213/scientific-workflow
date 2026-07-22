@@ -147,6 +147,7 @@ class ConfirmatoryEvidenceTests(WorkflowTestCase):
         draft["scope"] = "the exact deterministic fixture"
         draft["uncertainty"] = "No sampling uncertainty."
         draft["limitations"] = ["No broader generalization is claimed."]
+        self.fill_evidence_inference(draft)
         draft["assessment"] = "supports"
         atomic_write_json(draft_path, draft)
         return draft

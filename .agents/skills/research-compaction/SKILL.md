@@ -27,10 +27,11 @@ Frontier.
 ## Workflow
 
 1. Update draft or new-version Evidence and Claims without inventing results.
-   Preserve decisive support, all contradictions, unique anomalies, and
-   representative failed Runs or failed-direction records. Evidence basis is
-   immutable and Claim basis is recomputed from its supporting Evidence;
-   compaction cannot relabel exploratory or mixed support as confirmatory. Mark no-longer-current
+   Preserve decisive support, contradictions, anomalies, and representative
+   failures. Evidence basis is immutable; preserve its inference argument
+   without rewriting finalized history. Claim basis is
+   recomputed from its supporting Evidence; compaction cannot relabel
+   exploratory or mixed support as confirmatory. Mark no-longer-current
    Claims `retired`, or mark them `superseded` with a new active Claim ID. The
    new Checkpoint seals these lifecycle decisions; never reactivate them after
    that boundary.

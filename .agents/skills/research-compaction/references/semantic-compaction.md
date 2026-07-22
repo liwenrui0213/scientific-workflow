@@ -13,6 +13,12 @@ Treat Evidence as decisive when it materially changes at least one of:
 - the next high-value experiment;
 - a protected risk or human decision.
 
+Preserve each Evidence version's observation-to-Claim bridge, auxiliary
+assumptions, competing explanations, and falsification conditions. A new
+Evidence version may strengthen that argument, but compaction must not rewrite
+a finalized record, erase an alternative explanation, or weaken the conditions
+that would overturn its assessment merely to simplify the active view.
+
 Retain all contradictory finalized Evidence even when it is statistically weak
 or inconvenient. Label its limitations; do not erase it by averaging it into a
 positive aggregate.

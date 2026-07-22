@@ -21,6 +21,14 @@ At every link, check both identity and meaning. Matching IDs and hashes show
 which object was used; they do not prove that a mathematical derivation,
 implementation, comparison, or interpretation is scientifically valid.
 
+For every Evidence record, separate the observed result from its inference.
+Check whether the observation-to-Claim bridge actually follows under the stated
+auxiliary assumptions, whether a listed competing explanation fits the same
+observations, and whether the falsification conditions are concrete enough to
+change the current assessment. Flag a bridge that merely restates the result or
+Claim, assumptions that hide a protected condition, alternatives dismissed
+without a discriminating check, or conditions that are impossible to fail.
+
 ## Severity
 
 - **critical:** Evidence or a human decision could rely on corrupted,

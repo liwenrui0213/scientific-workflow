@@ -57,6 +57,7 @@ class BoundedProjectionTests(WorkflowTestCase):
         draft["result"] = {"bounded_detail": marker}
         draft["scope"] = "Only the deterministic fixture."
         draft["uncertainty"] = "No sampling uncertainty is claimed."
+        self.fill_evidence_inference(draft)
         draft["assessment"] = "inconclusive"
         atomic_write_json(draft_path, draft)
         finalized = load_json(finalize_evidence(paths, draft_path))
@@ -294,6 +295,15 @@ class BoundedProjectionTests(WorkflowTestCase):
         )
         self.assertEqual(source["assessment"], "inconclusive")
         self.assertEqual(source["object"]["record_sha256"], finalized["record_sha256"])
+        self.assertEqual(
+            source["object"]["inference"],
+            {
+                "observation_to_claim_present": True,
+                "auxiliary_assumption_count": 1,
+                "competing_explanation_count": 1,
+                "falsification_condition_count": 1,
+            },
+        )
         self.assertNotIn("result", source["object"])
         self.assertNotIn("scope", source["object"])
         run_source = packet["other_run_sources"][0]

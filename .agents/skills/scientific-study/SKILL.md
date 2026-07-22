@@ -68,8 +68,10 @@ rendering.
    `numerically_supported`, freeze a minimal Confirmation Record for the Claim,
    candidate, protocol, evaluator, held-out conditions, analysis, and slots;
    execute new confirmatory Runs; then finalize Evidence with analysis, result,
-   scope, uncertainty, limitations, assessment, its applicable Run roles, and any Cohort
-   compatibility justification. Do not confirm routine exploration.
+   scope, uncertainty, limitations, assessment, and a minimal inference argument
+   covering the observation-to-Claim bridge, auxiliary assumptions, competing
+   explanations, and falsification conditions, plus its applicable Run roles and
+   any Cohort compatibility justification. Do not confirm routine exploration.
 7. Update Claims only with finalized `{evidence_id, version, sha256}` refs and
    preserve contradictions. Current Claims use lifecycle `active`. Remove one
    from the Frontier only by marking it `retired`, or create a replacement ID

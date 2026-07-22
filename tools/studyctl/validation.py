@@ -35,6 +35,7 @@ from .models import (
     CHECKPOINT_SCHEMA_VERSION,
     CLAIMS_SCHEMA_VERSION,
     CLAIM_STATES,
+    EVIDENCE_SCHEMA_VERSION,
     ID_PATTERNS,
     StudyPaths,
     ValidationError,
@@ -75,6 +76,10 @@ SCHEMA_FILES = {
 }
 
 VERSIONED_SCHEMA_FILES = {
+    "evidence": {
+        1: "evidence-v1.schema.json",
+        EVIDENCE_SCHEMA_VERSION: SCHEMA_FILES["evidence"],
+    },
     "claims": {
         1: "claims-v1.schema.json",
         CLAIMS_SCHEMA_VERSION: SCHEMA_FILES["claims"],
@@ -2085,6 +2090,48 @@ def _evidence_issues(
                 ):
                     if field_value is None or field_value == "":
                         issues.append(ValidationIssue("ERROR", str(path), f"finalized Evidence requires {field_path}"))
+                if item.get("schema_version") == EVIDENCE_SCHEMA_VERSION:
+                    inference = item.get("inference")
+                    if not isinstance(inference, dict):
+                        issues.append(
+                            ValidationIssue(
+                                "ERROR",
+                                str(path),
+                                "finalized Evidence requires an explicit inference object",
+                            )
+                        )
+                    else:
+                        bridge = inference.get("observation_to_claim")
+                        if not isinstance(bridge, str) or not bridge.strip():
+                            issues.append(
+                                ValidationIssue(
+                                    "ERROR",
+                                    str(path),
+                                    "finalized Evidence requires inference.observation_to_claim",
+                                )
+                            )
+                        for field in (
+                            "auxiliary_assumptions",
+                            "competing_explanations",
+                            "falsification_conditions",
+                        ):
+                            values = inference.get(field)
+                            if (
+                                not isinstance(values, list)
+                                or not values
+                                or any(
+                                    not isinstance(value, str) or not value.strip()
+                                    for value in values
+                                )
+                            ):
+                                issues.append(
+                                    ValidationIssue(
+                                        "ERROR",
+                                        str(path),
+                                        "finalized Evidence requires at least one explicit "
+                                        f"inference.{field} entry",
+                                    )
+                                )
                 if item.get("record_sha256") != record_digest(item, "record_sha256"):
                     issues.append(ValidationIssue("ERROR", str(path), "Evidence record_sha256 does not match"))
             elif item.get("record_sha256") is not None:

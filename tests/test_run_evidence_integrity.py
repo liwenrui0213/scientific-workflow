@@ -60,6 +60,7 @@ class RunEvidenceIntegrityTests(WorkflowTestCase):
         item["scope"] = "the deterministic fixture"
         item["uncertainty"] = "No sampling uncertainty."
         item["limitations"] = ["No broader scientific generalization is claimed."]
+        self.fill_evidence_inference(item)
         item["assessment"] = "supports"
         atomic_write_json(draft, item)
         return draft

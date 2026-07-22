@@ -62,9 +62,11 @@ be described as fresh held-out support.
 
 Promote Runs into Evidence when they answer a named question with eligible,
 reproducible observations and an explicit analysis, scope, uncertainty, and
-limitations. Do not promote every Run merely because it completed, and do not
-leave a result that changes an active Claim or important boundary only in raw
-logs.
+limitations. State how the observations bear on the exact Claim, the auxiliary
+assumptions required by that inference, live competing explanations, and
+concrete conditions that would overturn the assessment. Do not promote every
+Run merely because it completed, and do not leave a result that changes an
+active Claim or important boundary only in raw logs.
 
 ## Separate correctness questions
 

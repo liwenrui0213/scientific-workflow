@@ -129,7 +129,16 @@ def _evidence_source_index(
             if source is None:
                 continue
             path, item = source
+            inference = item.get("inference")
+            if not isinstance(inference, dict):
+                inference = {}
+
+            def _inference_count(field: str) -> int:
+                values = inference.get(field)
+                return len(values) if isinstance(values, list) else 0
+
             summary = {
+                "schema_version": item.get("schema_version"),
                 "evidence_id": key[0],
                 "version": key[1],
                 "status": item.get("status"),
@@ -142,6 +151,20 @@ def _evidence_source_index(
                     "claim_ids", []
                 ),
                 "run_count": len(item.get("runs", [])),
+                "inference": {
+                    "observation_to_claim_present": bool(
+                        str(inference.get("observation_to_claim") or "").strip()
+                    ),
+                    "auxiliary_assumption_count": _inference_count(
+                        "auxiliary_assumptions"
+                    ),
+                    "competing_explanation_count": _inference_count(
+                        "competing_explanations"
+                    ),
+                    "falsification_condition_count": _inference_count(
+                        "falsification_conditions"
+                    ),
+                },
             }
             records.append(
                 {
@@ -431,6 +454,12 @@ def create_review_packet(paths: StudyPaths, base_ref: str | None = None) -> Path
         deviations.append(
             f"authoritative Study validation failed with {len(validation_errors)} error(s); no Evidence was labeled decisive"
         )
+    for source in evidence_sources:
+        if source.get("object", {}).get("schema_version") == 1:
+            deviations.append(
+                f"active Evidence {source['evidence_id']} v{source['version']} uses "
+                "legacy schema V1 without the required V2 inference argument"
+            )
     if not git.get("available"):
         deviations.append(str(git.get("deviation") or "Git diff unavailable"))
     if change_scope.get("outcome") != "PASS":

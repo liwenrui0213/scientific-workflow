@@ -18,7 +18,7 @@ The scientific interpretation chain is:
 Work -> Run -> Evidence -> Claim -> human Verdict
 ```
 
-`work/active/` is a mutable scratch space. A Run records what actually executed under fixed code, inputs, configuration, environment and Cohort fields. Evidence states an explicit analysis of one or more Runs, including scope, uncertainty, limitations and contradictions. A Claim may reference only a finalized, hash-pinned Evidence version. A Verdict separately judges implementation and scientific Claims.
+`work/active/` is a mutable scratch space. A Run records what actually executed under fixed code, inputs, configuration, environment and Cohort fields. Evidence states an explicit analysis of one or more Runs, including scope, uncertainty, limitations and contradictions. It also records a small inference argument: let \(O\) denote the reported observations, \(C\) the addressed Claim, and \(A\) the declared auxiliary assumptions. The Evidence must explain why \(O\), conditional on \(A\), changes support for \(C\); list live competing explanations; and state observations or failures that would overturn its assessment. This is not a proof that \(C\) is true. A Claim may reference only a finalized, hash-pinned Evidence version. A Verdict separately judges implementation and scientific Claims.
 
 Runs also have an epistemic role. Every ordinary and legacy Run is
 `exploratory`: it may discover a hypothesis, narrow a candidate, or support an
@@ -528,7 +528,7 @@ python -m tools.studyctl evidence-new SC-0001 \
   --run RUN-000002
 ```
 
-Edit the reported draft. Explicitly fill its question, Run roles, analysis method, result, scope, uncertainty, limitations and assessment. For multiple Cohort fingerprints, list changed fields and a compatibility justification. Seal it with:
+Edit the reported draft. Explicitly fill its question, Run roles, analysis method, result, scope, uncertainty, limitations and assessment. Also complete `inference.observation_to_claim`, `inference.auxiliary_assumptions`, `inference.competing_explanations`, and `inference.falsification_conditions`; each list needs at least one substantive entry before finalization. For multiple Cohort fingerprints, list changed fields and a compatibility justification. Seal it with:
 
 ```bash
 python -m tools.studyctl evidence-finalize SC-0001 \
@@ -536,6 +536,18 @@ python -m tools.studyctl evidence-finalize SC-0001 \
 ```
 
 Update `CLAIMS.json` with the finalized `{evidence_id, version, sha256}` reference. Do not omit contradictory Evidence.
+
+Evidence schema V2 enforces this argument without introducing a separate
+artifact type. A result may be exact while its interpretation still depends on
+an implementation mapping, measurement validity, model assumptions, or an
+exclusion of alternative mechanisms. The reasoning bridge must therefore
+connect the actual observations to the exact addressed Claim rather than merely
+repeat either one. Auxiliary assumptions state what must hold for that bridge;
+competing explanations state other mechanisms consistent with the observations;
+falsification conditions identify concrete future observations, integrity
+failures, or discriminating checks that would make the current assessment no
+longer defensible. Finalized schema V1 Evidence remains immutable historical
+Evidence and is not retroactively upgraded.
 
 Set the Claim's `evidence_basis` to the basis computed from its supporting
 Evidence. `under_test` and scoped `partially_supported` may rely on exploratory

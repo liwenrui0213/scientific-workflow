@@ -204,12 +204,30 @@ class WorkflowTestCase(unittest.TestCase):
         item["scope"] = "the exact fixture command and recorded Cohort fields"
         item["uncertainty"] = "No sampling uncertainty; execution provenance remains in the Run."
         item["limitations"] = ["This fixture does not establish a broader scientific result."]
+        self.fill_evidence_inference(item)
         item["assessment"] = assessment
         if compatibility_justification is not None:
             item["analysis"]["comparison"]["compatibility_justification"] = compatibility_justification
         atomic_write_json(draft_path, item)
         finalize_evidence(paths, draft_path)
         return load_json(draft_path)
+
+    def fill_evidence_inference(self, item: dict[str, Any]) -> None:
+        item["inference"] = {
+            "observation_to_claim": (
+                "The exact recorded value four satisfies the addressed Claim within "
+                "the explicitly stated deterministic fixture scope."
+            ),
+            "auxiliary_assumptions": [
+                "The immutable Run record accurately identifies the executed exact-integer computation."
+            ],
+            "competing_explanations": [
+                "A fixture or provenance error could produce the value four without supporting a broader Claim."
+            ],
+            "falsification_conditions": [
+                "A hash-stable rerun yielding a value other than four would overturn this assessment."
+            ],
+        }
 
     def support_claim(self, paths: StudyPaths, evidence: dict[str, Any]) -> None:
         claims = load_json(paths.claims)

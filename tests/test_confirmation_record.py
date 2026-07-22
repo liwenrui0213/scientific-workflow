@@ -318,6 +318,7 @@ class ConfirmationRecordTests(WorkflowTestCase):
         evidence_draft["scope"] = "the single frozen deterministic slot"
         evidence_draft["uncertainty"] = "No sampling uncertainty."
         evidence_draft["limitations"] = ["Only one deterministic candidate is tested."]
+        self.fill_evidence_inference(evidence_draft)
         evidence_draft["assessment"] = "supports"
         atomic_write_json(evidence_draft_path, evidence_draft)
         finalize_evidence(self.paths, evidence_draft_path)
@@ -521,6 +522,7 @@ class ConfirmationRecordTests(WorkflowTestCase):
         draft["scope"] = "the frozen candidate and registered exact protocol"
         draft["uncertainty"] = "No sampling uncertainty."
         draft["limitations"] = ["Later candidate versions are outside this Evidence."]
+        self.fill_evidence_inference(draft)
         draft["assessment"] = "supports"
         atomic_write_json(draft_path, draft)
 
