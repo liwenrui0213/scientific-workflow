@@ -47,7 +47,7 @@ The durable behavior lives in **protocol sources**:
 | `AGENTS.md` | Small, always-applicable repository invariants and authority boundaries |
 | Repository profile, policy, schemas, and templates | Repository adaptation, formalization thresholds, valid record shapes, and human-facing starting points |
 | `studyctl`, Git state, hashes, and immutable snapshots | Deterministic state transitions, actual-diff scope, provenance, integrity, and eligibility checks |
-| Human approval and independent review | Scientific intent, protected-condition changes, implementation acceptance, and final interpretation |
+| Human authorization and independent review | Scientific intent, protected-condition changes, implementation acceptance, and final interpretation; a write-enabled Agent may record an explicitly authorized Verdict |
 
 This separation keeps routine prompts and research context small while making
 important constraints testable. Increasing a Skill's length does not strengthen
@@ -97,8 +97,8 @@ Put a rule in the lowest layer that can check it reliably:
 - use Git and CHANGESET/VALIDATION records for host-code scope and native test
   proof;
 - use `studyctl` for formalization, Run sealing, Evidence finalization,
-  compaction, and human-only state transitions;
-- use the hook only for early denial of obvious Agent-side gate violations;
+  compaction, human-only Brief approval, and explicitly authorized Verdict recording;
+- use the hook only for early denial of obvious Agent-side gate violations and malformed Agent-initiated Verdict commands;
 - use independent review and human judgment for mathematical fidelity,
   experimental fairness, information value, uncertainty, and Claim scope.
 
@@ -114,7 +114,7 @@ whether the Agent actually follows the routing contract. Scenarios should test
 observable behavior, for example whether the Agent:
 
 - drafts before asking and aligns only when no safe reversible default exists;
-- stops at a protected or human-only boundary instead of rationalizing a bypass;
+- stops at a protected boundary, and at a Verdict boundary either follows an explicit human decision or asks once instead of inventing acceptance;
 - preserves contradictory Evidence and representative failures during
   compaction; and
 - follows source artifacts during review instead of trusting generated views.
@@ -710,13 +710,55 @@ The default review base comes from the repository profile; use `--base-ref` only
 python -m tools.studyctl review-render SC-0001 --file /path/to/review.json
 ```
 
-After reviewing both structured findings and sources, a human prepares a Verdict from `scientific-workflow/templates/VERDICT.json` and records it interactively:
+After reviewing both structured findings and sources, a separate trusted
+write-enabled Agent presents an exact decision summary containing:
+
+- the Study and selected Claim IDs;
+- the implementation decision, rationale, and conditions;
+- the scientific decision, accepted or rejected scope, rationale, and
+  conditions.
+
+The Agent may record the Verdict only when the user's current instruction
+explicitly supplies these decisions or explicitly adopts that immediately
+preceding complete summary. A generic `continue`, `finish`, `looks good`, a
+passing review, silence, or the Agent's own recommendation is insufficient. If
+a material field remains ambiguous, the Agent asks one bounded alignment batch.
+Once the instruction is explicit, the Agent creates the version-2
+decision-only input below the profile's Git-ignored `object_root` and invokes:
 
 ```bash
-python -m tools.studyctl verdict SC-0001 --file /path/to/verdict.json
+python -m tools.studyctl verdict SC-0001 \
+  --agent-initiated \
+  --file <decision-input.json>
 ```
 
-Implementation acceptance and scientific acceptance are independent fields. Only the human may assign `accepted_within_scope`, `rejected`, or `requires_more_evidence`.
+`studyctl` derives the Verdict ID, timestamp, reviewer identity, current
+commit, Brief/Checkpoint/Claim/Evidence hashes, recording timestamp, and
+record digest. Active Claims require a fresh Checkpoint, and the mechanical
+scope requires that Checkpoint to bind the current Brief approval and Claims.
+Every new Verdict requires a clean Git worktree so its commit identifies the
+reviewed implementation. The scope is checked again immediately before the
+immutable Verdict is written.
+
+The immutable record keeps the explicit user instruction, its canonical hash,
+and `assurance: cooperative`; the Verdict record digest binds all decisions and
+mechanical scope. This provenance makes
+the translation auditable, but it is not a cryptographic human signature and
+the project Hook does not prove that the instruction came from the user. The
+protocol relies on the Agent obeying the routing contract; deployments that
+need adversarial identity assurance require an external approval or signing
+boundary.
+
+`scientific-workflow/templates/VERDICT.json` is the Agent-facing version-2
+decision input. It contains only the explicit instruction, Claim selection,
+and decision fields; `studyctl` still generates all mechanical scope. The
+interactive `python -m tools.studyctl verdict SC-0001` form remains available
+as a manual compatibility path and performs a typed terminal confirmation.
+The historical full-record `--file` form remains readable for compatibility,
+but it is never accepted by `--agent-initiated` and cannot bypass current
+authority or clean-worktree checks. Implementation acceptance and scientific
+acceptance remain independent. The human owns the decision and final scope;
+the Agent only translates and records the authorized content.
 
 ## Recover or reproduce a Run
 

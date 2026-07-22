@@ -4,10 +4,11 @@ import copy
 from contextlib import redirect_stdout
 import io
 from pathlib import Path
+import subprocess
 import sys
 
 from tests.helpers import TTYBuffer, WorkflowTestCase
-from tools.studyctl.approval import record_verdict
+from tools.studyctl.approval import begin_brief_revision, record_verdict
 from tools.studyctl.compaction import (
     current_evidence_inventory_binding,
     finalize_compaction,
@@ -23,7 +24,7 @@ from tools.studyctl.hashing import (
     sha256_json,
 )
 from tools.studyctl.cli import main as studyctl_main
-from tools.studyctl.models import StudyPaths
+from tools.studyctl.models import StudyPaths, ValidationError, utc_now
 from tools.studyctl.rendering import render_status
 from tools.studyctl.review import create_review_packet
 from tools.studyctl.validation import errors_only, validate_study
@@ -35,7 +36,7 @@ class DemonstrationLifecycleTests(WorkflowTestCase):
     def compaction_plan(
         self,
         paths: StudyPaths,
-        evidence_ref: dict[str, object],
+        evidence_ref: dict[str, object] | None,
     ) -> Path:
         compaction_input = prepare_compaction(paths)
         prepared = load_json(compaction_input)
@@ -49,8 +50,12 @@ class DemonstrationLifecycleTests(WorkflowTestCase):
                 "compaction_input_sha256": sha256_file(compaction_input),
                 "claims_sha256": sha256_file(paths.claims),
                 "evidence_inventory": current_evidence_inventory_binding(paths),
-                "archive_work_files": ["initial-idea.md"],
-                "decisive_evidence": [evidence_ref],
+                "archive_work_files": (
+                    ["initial-idea.md"]
+                    if (paths.active_work / "initial-idea.md").is_file()
+                    else []
+                ),
+                "decisive_evidence": [] if evidence_ref is None else [evidence_ref],
                 "contradictory_evidence": [],
                 "frontier": claims["frontier"],
                 "open_questions": claims["frontier"]["open_questions"],
@@ -61,57 +66,25 @@ class DemonstrationLifecycleTests(WorkflowTestCase):
         )
         return destination
 
-    def verdict_source(
+    def verdict_decisions(
         self,
         paths: StudyPaths,
-        checkpoint: dict[str, object],
-        evidence_ref: dict[str, object],
     ) -> Path:
-        claims = load_json(paths.claims)
-        claim = claims["claims"][0]
-        destination = self.root / "demonstration-human-verdict.json"
+        destination = self.root / ".objects" / "demonstration-human-verdict.json"
         atomic_write_json(
             destination,
             {
-                "schema_version": 1,
-                "study_id": paths.study_id,
-                "verdict_id": "VERDICT-0001",
-                "created_at": "2026-07-19T00:00:00Z",
-                "reviewer": {
-                    "identity": "Independent fixture reviewer",
-                    "source": "human-authored demonstration fixture",
-                },
-                "judged_scope": {
-                    "commit": git_state(paths.root)["commit"],
-                    "brief_sha256": sha256_file(paths.brief),
-                    "checkpoint": {
-                        "checkpoint_id": checkpoint["checkpoint_id"],
-                        "sha256": checkpoint["checkpoint_sha256"],
-                    },
-                    "claims": [
-                        {
-                            "claim_id": claim["claim_id"],
-                            "sha256": sha256_json(claim),
-                        }
-                    ],
-                    "evidence": [evidence_ref],
-                },
+                "input_version": 1,
+                "claim_ids": ["CLAIM-0001"],
                 "implementation_verdict": {
                     "decision": "accepted",
                     "rationale": "The fixture completed every deterministic workflow transition.",
-                    "conditions": [],
                 },
                 "scientific_verdict": {
                     "decision": "requires_more_evidence",
                     "rationale": "A software fixture is not scientific evidence beyond its test scope.",
                     "scope": "Only the non-scientific deterministic demonstration is judged.",
-                    "conditions": [],
                 },
-                "confirmation": {
-                    "typed_text": "[FILLED BY STUDYCTL]",
-                    "confirmed_at": "[FILLED BY STUDYCTL]",
-                },
-                "verdict_sha256": None,
             },
         )
         return destination
@@ -155,9 +128,11 @@ class DemonstrationLifecycleTests(WorkflowTestCase):
         # 9. Validate and record separate implementation/scientific human decisions.
         verdict_id = "VERDICT-0001"
         verdict_stdout = TTYBuffer()
+        decisions_path = self.verdict_decisions(paths)
+        self.commit_all("freeze the reviewed demonstration state")
         verdict_path = record_verdict(
             paths,
-            self.verdict_source(paths, checkpoint, evidence_ref),
+            decisions_path,
             stdin=TTYBuffer(f"RECORD VERDICT {paths.study_id} {verdict_id}\n"),
             stdout=verdict_stdout,
         )
@@ -167,12 +142,331 @@ class DemonstrationLifecycleTests(WorkflowTestCase):
         self.assertIn("Judged commit:", confirmation_display)
         self.assertIn("CLAIM-0001", confirmation_display)
         self.assertIn("EVID-0001", confirmation_display)
+        self.assertEqual(verdict["verdict_id"], verdict_id)
+        self.assertRegex(verdict["created_at"], r"^\d{4}-\d{2}-\d{2}T.*Z$")
+        self.assertEqual(
+            verdict["reviewer"],
+            {
+                "identity": "Test Reviewer <reviewer@example.test>",
+                "source": "git_config",
+            },
+        )
+        self.assertEqual(
+            verdict["judged_scope"],
+            {
+                "commit": git_state(paths.root)["commit"],
+                "brief_sha256": sha256_file(paths.brief),
+                "checkpoint": {
+                    "checkpoint_id": checkpoint["checkpoint_id"],
+                    "sha256": checkpoint["checkpoint_sha256"],
+                },
+                "claims": [
+                    {
+                        "claim_id": "CLAIM-0001",
+                        "sha256": sha256_json(checkpoint["claims_snapshot"][0]),
+                    }
+                ],
+                "evidence": [evidence_ref],
+            },
+        )
         self.assertEqual(verdict["implementation_verdict"]["decision"], "accepted")
         self.assertEqual(
             verdict["scientific_verdict"]["decision"],
             "requires_more_evidence",
         )
         self.assertEqual(errors_only(validate_study(paths)), [])
+
+    def test_agent_initiated_verdict_cli_requires_and_records_explicit_authorization(
+        self,
+    ) -> None:
+        paths = self.initialize_approved_with_claim()
+        checkpoint = load_json(
+            finalize_compaction(paths, self.compaction_plan(paths, None))
+        )
+        self.commit_all("freeze the Agent-initiated Verdict scope")
+        decision_path = self.root / ".objects" / "agent-verdict-decisions.json"
+        instruction = (
+            "Record the implementation and scientific Verdict below for SC-0001 "
+            "without asking me to assemble its mechanical hashes."
+        )
+        valid_input = {
+            "input_version": 2,
+            "authorization": {
+                "source": "explicit_user_instruction",
+                "instruction": instruction,
+            },
+            "claim_ids": ["CLAIM-0001"],
+            "implementation_verdict": {
+                "decision": "accepted",
+                "rationale": "The reviewed deterministic implementation is acceptable.",
+            },
+            "scientific_verdict": {
+                "decision": "requires_more_evidence",
+                "rationale": "The fixture does not establish a scientific conclusion.",
+                "scope": "Only the deterministic fixture is judged.",
+            },
+        }
+
+        def invoke(payload: dict[str, object]) -> subprocess.CompletedProcess[str]:
+            atomic_write_json(decision_path, payload)
+            return subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "tools.studyctl",
+                    "--root",
+                    str(self.root),
+                    "verdict",
+                    paths.study_id,
+                    "--agent-initiated",
+                    "--file",
+                    str(decision_path),
+                ],
+                cwd=Path(__file__).resolve().parents[1],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+        missing_authorization = copy.deepcopy(valid_input)
+        missing_authorization.pop("authorization")
+        malformed_authorization = copy.deepcopy(valid_input)
+        malformed_authorization["authorization"] = {
+            "source": "agent_inference",
+            "instruction": instruction,
+        }
+        for label, payload, expected_error in (
+            (
+                "missing authorization",
+                missing_authorization,
+                "plus authorization",
+            ),
+            (
+                "malformed authorization",
+                malformed_authorization,
+                "explicit_user_instruction",
+            ),
+        ):
+            with self.subTest(label=label):
+                result = invoke(payload)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn(expected_error, result.stderr)
+                self.assertFalse(paths.verdict.exists())
+
+        result = invoke(valid_input)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "")
+        verdict = load_json(paths.verdict)
+        self.assertEqual(
+            verdict["authorization"],
+            {
+                "mode": "agent_initiated",
+                "source": "explicit_user_instruction",
+                "assurance": "cooperative",
+                "instruction": instruction,
+                "instruction_sha256": sha256_json(instruction),
+            },
+        )
+        self.assertEqual(
+            verdict["confirmation"],
+            {
+                "mode": "agent_initiated",
+                "recorded_at": verdict["confirmation"]["recorded_at"],
+            },
+        )
+        self.assertRegex(
+            verdict["confirmation"]["recorded_at"],
+            r"^\d{4}-\d{2}-\d{2}T.*Z$",
+        )
+        self.assertNotIn("typed_text", verdict["confirmation"])
+        self.assertNotIn("confirmed_at", verdict["confirmation"])
+        self.assertEqual(
+            verdict["judged_scope"]["checkpoint"],
+            {
+                "checkpoint_id": checkpoint["checkpoint_id"],
+                "sha256": checkpoint["checkpoint_sha256"],
+            },
+        )
+        self.assertEqual(
+            verdict["judged_scope"]["claims"],
+            [
+                {
+                    "claim_id": "CLAIM-0001",
+                    "sha256": sha256_json(checkpoint["claims_snapshot"][0]),
+                }
+            ],
+        )
+        self.assertEqual(
+            verdict["confirmation"]["mode"],
+            "agent_initiated",
+        )
+        self.assertEqual(
+            verdict["verdict_sha256"],
+            record_digest(verdict, "verdict_sha256"),
+        )
+        self.assertEqual(paths.verdict.stat().st_mode & 0o777, 0o444)
+        self.assertIn("Authorization: explicit user instruction", result.stdout)
+        self.assertIn(str(paths.verdict), result.stdout)
+        self.assertEqual(errors_only(validate_study(paths)), [])
+
+    def test_auto_scoped_verdict_rejects_a_checkpoint_stale_to_claims(self) -> None:
+        paths = self.initialize_approved_with_claim()
+        finalize_compaction(paths, self.compaction_plan(paths, None))
+        decisions_path = self.verdict_decisions(paths)
+
+        claims = load_json(paths.claims)
+        claims["frontier"]["summary"] = "The Claim changed after the Checkpoint."
+        claims["revision"] += 1
+        claims["updated_at"] = utc_now()
+        atomic_write_json(paths.claims, claims)
+        self.commit_all("freeze Claims state that is stale to the Checkpoint")
+
+        with self.assertRaisesRegex(
+            ValidationError,
+            "latest Checkpoint does not bind the current CLAIMS.json; compact before Verdict",
+        ):
+            record_verdict(
+                paths,
+                decisions_path,
+                stdin=TTYBuffer(),
+                stdout=TTYBuffer(),
+            )
+
+        self.assertFalse(paths.verdict.exists())
+
+    def test_auto_scoped_verdict_rejects_a_checkpoint_from_an_old_brief(self) -> None:
+        paths = self.initialize_approved_with_claim()
+        finalize_compaction(paths, self.compaction_plan(paths, None))
+        begin_brief_revision(paths)
+        revised = paths.brief.read_text(encoding="utf-8").replace(
+            "[REPLACE: Review and update every affected section for Brief version 2.]",
+            "This revision preserves the fixture Claim under a new human authority version.",
+        )
+        paths.brief.write_text(revised, encoding="utf-8")
+        self.approve(paths)
+
+        with self.assertRaisesRegex(
+            ValidationError,
+            "latest Checkpoint does not bind the current Brief approval; compact before Verdict",
+        ):
+            record_verdict(
+                paths,
+                self.verdict_decisions(paths),
+                stdin=TTYBuffer(),
+                stdout=TTYBuffer(),
+            )
+
+        self.assertFalse(paths.verdict.exists())
+
+    def test_auto_scoped_verdict_rejects_a_checkpoint_from_an_old_approval(self) -> None:
+        paths = self.initialize_approved_with_claim()
+        finalize_compaction(paths, self.compaction_plan(paths, None))
+        atomic_write_json(
+            paths.formal / "EVALUATOR.json",
+            {"status": "active", "metric": "exact integer equality"},
+        )
+        self.approve(paths)
+
+        with self.assertRaisesRegex(
+            ValidationError,
+            "latest Checkpoint does not bind the current Brief approval; compact before Verdict",
+        ):
+            record_verdict(
+                paths,
+                self.verdict_decisions(paths),
+                stdin=TTYBuffer(),
+                stdout=TTYBuffer(),
+            )
+
+        self.assertFalse(paths.verdict.exists())
+
+    def test_legacy_full_verdict_cannot_bypass_checkpoint_approval_binding(self) -> None:
+        paths = self.initialize_approved_with_claim()
+        checkpoint = load_json(
+            finalize_compaction(paths, self.compaction_plan(paths, None))
+        )
+        atomic_write_json(
+            paths.formal / "EVALUATOR.json",
+            {"status": "active", "metric": "exact integer equality"},
+        )
+        self.approve(paths)
+        verdict_id = "VERDICT-0001"
+        source_path = self.root / ".objects" / "legacy-old-approval-verdict.json"
+        atomic_write_json(
+            source_path,
+            {
+                "schema_version": 1,
+                "study_id": paths.study_id,
+                "verdict_id": verdict_id,
+                "created_at": utc_now(),
+                "reviewer": {"identity": "Test Reviewer", "source": "test"},
+                "judged_scope": {
+                    "commit": git_state(paths.root)["commit"],
+                    "brief_sha256": sha256_file(paths.brief),
+                    "checkpoint": {
+                        "checkpoint_id": checkpoint["checkpoint_id"],
+                        "sha256": checkpoint["checkpoint_sha256"],
+                    },
+                    "claims": [
+                        {
+                            "claim_id": "CLAIM-0001",
+                            "sha256": sha256_json(checkpoint["claims_snapshot"][0]),
+                        }
+                    ],
+                    "evidence": [],
+                },
+                "implementation_verdict": {
+                    "decision": "accepted",
+                    "rationale": "This legacy input tests authority binding.",
+                    "conditions": [],
+                },
+                "scientific_verdict": {
+                    "decision": "requires_more_evidence",
+                    "rationale": "The stale approval must not be judged.",
+                    "scope": "Only the deterministic fixture.",
+                    "conditions": [],
+                },
+                "confirmation": {
+                    "typed_text": "[FILLED BY STUDYCTL]",
+                    "confirmed_at": "[FILLED BY STUDYCTL]",
+                },
+                "verdict_sha256": None,
+            },
+        )
+
+        with self.assertRaisesRegex(
+            ValidationError,
+            "latest Checkpoint does not bind the current Brief approval; compact before Verdict",
+        ):
+            record_verdict(
+                paths,
+                source_path,
+                stdin=TTYBuffer(f"RECORD VERDICT {paths.study_id} {verdict_id}\n"),
+                stdout=TTYBuffer(),
+            )
+
+        self.assertFalse(paths.verdict.exists())
+
+    def test_auto_scoped_verdict_rejects_a_dirty_worktree(self) -> None:
+        paths = self.initialize()
+        self.fill_brief(paths)
+        self.approve(paths)
+        self.commit_all("freeze clean Verdict fixture")
+        (self.root / "unreviewed-change.txt").write_text(
+            "This byte sequence is not represented by HEAD.\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            ValidationError,
+            "Verdict requires a clean Git worktree",
+        ):
+            record_verdict(paths, stdin=TTYBuffer(), stdout=TTYBuffer())
+
+        self.assertFalse(paths.verdict.exists())
 
     def test_documented_cli_run_order_preserves_exact_argv(self) -> None:
         paths = self.initialize_approved_with_claim()

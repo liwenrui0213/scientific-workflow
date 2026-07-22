@@ -48,6 +48,8 @@ _BRIEF_METADATA_BLOCK = re.compile(
 )
 _REPLACEMENT_PLACEHOLDER = re.compile(r"\[REPLACE(?:[^\]]*)\]")
 _VERDICT_VERSION = re.compile(r"^VERDICT\.v([0-9]+)\.json$")
+_VERDICT_ID = re.compile(r"^VERDICT-([0-9]+)$")
+_IMPLEMENTATION_VERDICTS = {"accepted", "rejected", "requires_changes"}
 _RESOURCE_BUDGET_SECTION = re.compile(
     r"^##\s+Resource Budget\s*$.*?(?=^##\s+|<!--\s*STUDYCTL-METADATA-BEGIN|\Z)",
     re.MULTILINE | re.DOTALL,
@@ -411,12 +413,12 @@ def _contains_placeholder(value: str) -> bool:
 def _validate_verdict_branches(verdict: dict[str, Any]) -> None:
     created_at = verdict.get("created_at")
     if not isinstance(created_at, str) or not created_at.strip() or _contains_placeholder(created_at):
-        raise ValidationError("Verdict created_at must be human-authored")
+        raise ValidationError("Verdict created_at must be populated")
 
     implementation = verdict.get("implementation_verdict")
     if not isinstance(implementation, dict):
         raise ValidationError("implementation_verdict must be a separate object")
-    if implementation.get("decision") not in {"accepted", "rejected", "requires_changes"}:
+    if implementation.get("decision") not in _IMPLEMENTATION_VERDICTS:
         raise ValidationError("invalid implementation verdict decision")
     implementation_rationale = implementation.get("rationale")
     if not isinstance(implementation_rationale, str) or not implementation_rationale.strip():
@@ -425,7 +427,7 @@ def _validate_verdict_branches(verdict: dict[str, Any]) -> None:
         raise ValidationError("implementation verdict rationale still contains a placeholder")
     for condition in implementation.get("conditions", []):
         if not condition.strip() or _contains_placeholder(condition):
-            raise ValidationError("implementation verdict conditions must be human-authored")
+            raise ValidationError("implementation verdict conditions must be completed")
 
     scientific = verdict.get("scientific_verdict")
     if not isinstance(scientific, dict):
@@ -440,7 +442,7 @@ def _validate_verdict_branches(verdict: dict[str, Any]) -> None:
             raise ValidationError(f"scientific verdict {field} still contains a placeholder")
     for condition in scientific.get("conditions", []):
         if not condition.strip() or _contains_placeholder(condition):
-            raise ValidationError("scientific verdict conditions must be human-authored")
+            raise ValidationError("scientific verdict conditions must be completed")
 
     reviewer = verdict.get("reviewer")
     if not isinstance(reviewer, dict):
@@ -448,7 +450,408 @@ def _validate_verdict_branches(verdict: dict[str, Any]) -> None:
     for field in ("identity", "source"):
         value = reviewer.get(field)
         if not isinstance(value, str) or not value.strip() or _contains_placeholder(value):
-            raise ValidationError(f"Verdict reviewer.{field} must be human-authored")
+            raise ValidationError(f"Verdict reviewer.{field} must be populated")
+
+    authorization = verdict.get("authorization")
+    if authorization is not None:
+        if not isinstance(authorization, dict) or set(authorization) != {
+            "mode",
+            "source",
+            "assurance",
+            "instruction",
+            "instruction_sha256",
+        }:
+            raise ValidationError("Verdict authorization has an invalid structure")
+        if authorization.get("mode") != "agent_initiated":
+            raise ValidationError("Verdict authorization mode must be agent_initiated")
+        if authorization.get("source") != "explicit_user_instruction":
+            raise ValidationError(
+                "Agent-initiated Verdict authorization must come from an explicit user instruction"
+            )
+        if authorization.get("assurance") != "cooperative":
+            raise ValidationError(
+                "Agent-initiated Verdict authorization assurance must be cooperative"
+            )
+        instruction = authorization.get("instruction")
+        if (
+            not isinstance(instruction, str)
+            or not instruction.strip()
+            or _contains_placeholder(instruction)
+        ):
+            raise ValidationError(
+                "Agent-initiated Verdict authorization requires the explicit user instruction"
+            )
+        if authorization.get("instruction_sha256") != sha256_json(instruction):
+            raise ValidationError("Verdict authorization instruction_sha256 does not match")
+
+
+def _validate_verdict_claim_decision(verdict: dict[str, Any]) -> None:
+    """Apply the Claim/scope epistemic invariant to every Verdict input path."""
+
+    scope = verdict.get("judged_scope")
+    scientific = verdict.get("scientific_verdict")
+    if not isinstance(scope, dict) or not isinstance(scientific, dict):
+        return
+    claims = scope.get("claims")
+    if isinstance(claims, list) and not claims and scientific.get("decision") != "requires_more_evidence":
+        raise ValidationError(
+            "a Verdict without selected Claims must use scientific decision "
+            "requires_more_evidence"
+        )
+
+
+def _next_verdict_id(paths: StudyPaths) -> str:
+    """Allocate a human-readable Verdict ID without asking the human to manage it."""
+
+    highest = 0
+    for path in sorted(paths.study.glob("VERDICT*.json")):
+        try:
+            existing = load_json(path)
+        except ValidationError as exc:
+            raise ValidationError(f"cannot allocate Verdict ID while {path} is invalid: {exc}") from exc
+        if not isinstance(existing, dict):
+            raise ValidationError(f"cannot allocate Verdict ID from non-object Verdict: {path}")
+        raw_id = existing.get("verdict_id")
+        match = _VERDICT_ID.fullmatch(str(raw_id))
+        if match is None:
+            raise ValidationError(f"cannot allocate Verdict ID from invalid identity {raw_id!r}: {path}")
+        highest = max(highest, int(match.group(1)))
+    return f"VERDICT-{highest + 1:04d}"
+
+
+def _checkpoint_claims(paths: StudyPaths) -> list[dict[str, Any]]:
+    latest = _latest_checkpoint(paths)
+    if latest is None:
+        return []
+    claims = latest.get("claims_snapshot")
+    if not isinstance(claims, list) or any(not isinstance(item, dict) for item in claims):
+        raise ValidationError("latest Checkpoint has an invalid claims_snapshot")
+    return claims
+
+
+def _prompt_line(
+    stdin: TextIO,
+    stdout: TextIO,
+    prompt: str,
+    *,
+    allow_empty: bool = False,
+) -> str:
+    print(prompt, end="", file=stdout)
+    stdout.flush()
+    value = stdin.readline().rstrip("\r\n").strip()
+    if not value and not allow_empty:
+        raise HumanGateError(f"a non-empty response is required for: {prompt.rstrip()}")
+    return value
+
+
+def _prompt_decision(
+    stdin: TextIO,
+    stdout: TextIO,
+    label: str,
+    allowed: set[str],
+) -> str:
+    rendered = "/".join(sorted(allowed))
+    decision = _prompt_line(stdin, stdout, f"{label} decision [{rendered}]: ")
+    if decision not in allowed:
+        raise HumanGateError(f"invalid {label.lower()} decision: {decision!r}")
+    return decision
+
+
+def _parse_claim_selection(raw: str, available: list[dict[str, Any]]) -> list[str]:
+    available_ids = [str(item.get("claim_id")) for item in available]
+    if not available_ids:
+        if raw and raw.lower() not in {"none", "no"}:
+            raise HumanGateError("no Checkpoint Claims are available for scientific judgment")
+        return []
+    if not raw or raw.lower() == "all":
+        return available_ids
+    if raw.lower() in {"none", "no"}:
+        return []
+    selected = [item for item in re.split(r"[\s,]+", raw) if item]
+    if len(selected) != len(set(selected)):
+        raise HumanGateError("Claim selection contains a duplicate ID")
+    unknown = [claim_id for claim_id in selected if claim_id not in available_ids]
+    if unknown:
+        raise HumanGateError("Claim selection contains unavailable IDs: " + ", ".join(unknown))
+    return selected
+
+
+def _interactive_verdict_choices(
+    paths: StudyPaths,
+    stdin: TextIO,
+    stdout: TextIO,
+) -> dict[str, Any]:
+    # Fail before asking for human judgment when the mechanical scope is stale.
+    _current_judged_scope(paths, [])
+    available = _checkpoint_claims(paths)
+    if available:
+        print("Claims frozen by the latest Checkpoint:", file=stdout)
+        for claim in available:
+            statement = str(claim.get("statement", "")).strip()
+            preview = statement if len(statement) <= 160 else statement[:157] + "..."
+            print(f"- {claim.get('claim_id')}: {preview}", file=stdout)
+        raw_claims = _prompt_line(
+            stdin,
+            stdout,
+            "Claim IDs to judge [all; comma-separated; or none]: ",
+            allow_empty=True,
+        )
+    else:
+        print(
+            "No Checkpoint Claims are available; this can record an implementation-only Verdict.",
+            file=stdout,
+        )
+        raw_claims = "none"
+    claim_ids = _parse_claim_selection(raw_claims, available)
+    implementation_decision = _prompt_decision(
+        stdin, stdout, "Implementation", _IMPLEMENTATION_VERDICTS
+    )
+    implementation_rationale = _prompt_line(
+        stdin, stdout, "Implementation rationale: "
+    )
+    scientific_decision = _prompt_decision(
+        stdin, stdout, "Scientific", HUMAN_SCIENTIFIC_VERDICTS
+    )
+    scientific_rationale = _prompt_line(stdin, stdout, "Scientific rationale: ")
+    scientific_scope = _prompt_line(
+        stdin,
+        stdout,
+        "Scientific scope accepted or rejected by this decision: ",
+    )
+    return {
+        "input_version": 1,
+        "claim_ids": claim_ids,
+        "implementation_verdict": {
+            "decision": implementation_decision,
+            "rationale": implementation_rationale,
+            "conditions": [],
+        },
+        "scientific_verdict": {
+            "decision": scientific_decision,
+            "rationale": scientific_rationale,
+            "scope": scientific_scope,
+            "conditions": [],
+        },
+    }
+
+
+def _validate_verdict_choices(
+    choices: dict[str, Any],
+    *,
+    agent_initiated: bool,
+) -> None:
+    required = {
+        "input_version",
+        "claim_ids",
+        "implementation_verdict",
+        "scientific_verdict",
+    }
+    expected_version = 2 if agent_initiated else 1
+    if agent_initiated:
+        required.add("authorization")
+    if set(choices) != required or choices.get("input_version") != expected_version:
+        raise ValidationError(
+            "Verdict decision input must contain exactly "
+            f"input_version={expected_version}, claim_ids, implementation_verdict, and "
+            "scientific_verdict"
+            + (", plus authorization" if agent_initiated else "")
+        )
+    if agent_initiated:
+        authorization = choices.get("authorization")
+        if not isinstance(authorization, dict) or set(authorization) != {
+            "source",
+            "instruction",
+        }:
+            raise ValidationError(
+                "Agent-initiated Verdict input authorization must contain exactly "
+                "source and instruction"
+            )
+        if authorization.get("source") != "explicit_user_instruction":
+            raise ValidationError(
+                "Agent-initiated Verdict input must cite explicit_user_instruction"
+            )
+        instruction = authorization.get("instruction")
+        if (
+            not isinstance(instruction, str)
+            or not instruction.strip()
+            or _contains_placeholder(instruction)
+        ):
+            raise ValidationError(
+                "Agent-initiated Verdict input requires a non-placeholder user instruction"
+            )
+    claim_ids = choices.get("claim_ids")
+    if not isinstance(claim_ids, list) or any(not isinstance(item, str) for item in claim_ids):
+        raise ValidationError("Verdict decision input claim_ids must be an array of strings")
+    if len(claim_ids) != len(set(claim_ids)):
+        raise ValidationError("Verdict decision input repeats a Claim ID")
+    for label, allowed in (
+        ("implementation_verdict", _IMPLEMENTATION_VERDICTS),
+        ("scientific_verdict", HUMAN_SCIENTIFIC_VERDICTS),
+    ):
+        branch = choices.get(label)
+        required_branch = {"decision", "rationale"}
+        if label == "scientific_verdict":
+            required_branch.add("scope")
+        allowed_branch = required_branch | {"conditions"}
+        if (
+            not isinstance(branch, dict)
+            or not required_branch.issubset(branch)
+            or not set(branch).issubset(allowed_branch)
+        ):
+            raise ValidationError(
+                f"{label} must contain decision and rationale"
+                + (", plus the authorized scope" if label == "scientific_verdict" else "")
+                + "; conditions are optional"
+            )
+        if branch.get("decision") not in allowed:
+            raise ValidationError(f"invalid {label} decision")
+        rationale = branch.get("rationale")
+        if not isinstance(rationale, str) or not rationale.strip() or _contains_placeholder(rationale):
+            raise ValidationError(f"{label} requires a completed rationale")
+        if label == "scientific_verdict":
+            scope = branch.get("scope")
+            if not isinstance(scope, str) or not scope.strip() or _contains_placeholder(scope):
+                raise ValidationError("scientific_verdict requires an authorized scope")
+        conditions = branch.get("conditions", [])
+        if not isinstance(conditions, list) or any(
+            not isinstance(item, str) or not item.strip() or _contains_placeholder(item)
+            for item in conditions
+        ):
+            raise ValidationError(f"{label}.conditions must contain completed strings")
+
+
+def _current_verdict_authority(
+    paths: StudyPaths,
+) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any]]:
+    """Validate authority that every new Verdict format must share."""
+
+    _raise_validation_issues(
+        "Verdict requires a fresh approved Brief",
+        brief_content_issues(paths) + brief_approval_issues(paths),
+    )
+    approval = _load_existing_approval(paths)
+    latest = _latest_checkpoint(paths)
+    if latest is not None and latest.get("brief") != {
+        "sha256": approval["brief"]["sha256"],
+        "approval_sha256": approval["approval_sha256"],
+    }:
+        raise ValidationError(
+            "latest Checkpoint does not bind the current Brief approval; compact before Verdict"
+        )
+    repository = git_state(paths.root)
+    if repository.get("available") and repository.get("dirty"):
+        raise ValidationError(
+            "Verdict requires a clean Git worktree; commit the reviewed state first"
+        )
+    return approval, latest, repository
+
+
+def _current_judged_scope(paths: StudyPaths, claim_ids: list[str]) -> dict[str, Any]:
+    """Bind human choices to the exact current authority and Evidence graph."""
+
+    _, latest, repository = _current_verdict_authority(paths)
+    current_claims = load_json(paths.claims)
+    if not isinstance(current_claims, dict):
+        raise ValidationError("CLAIMS.json must contain an object")
+    current_active = [
+        item
+        for item in current_claims.get("claims", [])
+        if isinstance(item, dict) and item.get("lifecycle", "active") == "active"
+    ]
+    if latest is None and current_active:
+        raise ValidationError(
+            "active Claims require a fresh Checkpoint before a scientific Verdict"
+        )
+    if latest is not None and latest.get("claims_file_sha256") != sha256_file(paths.claims):
+        raise ValidationError(
+            "latest Checkpoint does not bind the current CLAIMS.json; compact before Verdict"
+        )
+    checkpoint_claims = _checkpoint_claims(paths)
+    by_id = {str(item.get("claim_id")): item for item in checkpoint_claims}
+    unknown = [claim_id for claim_id in claim_ids if claim_id not in by_id]
+    if unknown:
+        raise ValidationError(
+            "selected Claims are not frozen by the latest Checkpoint: " + ", ".join(unknown)
+        )
+    claim_refs = [
+        {"claim_id": claim_id, "sha256": sha256_json(by_id[claim_id])}
+        for claim_id in claim_ids
+    ]
+    evidence_refs: list[dict[str, Any]] = []
+    seen_evidence: set[tuple[str, int]] = set()
+    for claim_id in claim_ids:
+        claim = by_id[claim_id]
+        for field in ("supporting_evidence", "contradictory_evidence", "other_evidence"):
+            refs = claim.get(field, [])
+            if not isinstance(refs, list):
+                raise ValidationError(f"Checkpoint Claim {claim_id} has invalid {field}")
+            for ref in refs:
+                if not isinstance(ref, dict):
+                    raise ValidationError(f"Checkpoint Claim {claim_id} has an invalid Evidence ref")
+                key = (str(ref.get("evidence_id")), int(ref.get("version", 0)))
+                if key not in seen_evidence:
+                    evidence_refs.append(dict(ref))
+                    seen_evidence.add(key)
+    checkpoint_ref = None
+    if latest is not None:
+        checkpoint_ref = {
+            "checkpoint_id": latest["checkpoint_id"],
+            "sha256": latest["checkpoint_sha256"],
+        }
+    return {
+        "commit": repository.get("commit"),
+        "brief_sha256": sha256_file(paths.brief),
+        "checkpoint": checkpoint_ref,
+        "claims": claim_refs,
+        "evidence": evidence_refs,
+    }
+
+
+def _build_generated_verdict(
+    paths: StudyPaths,
+    choices: dict[str, Any],
+    *,
+    agent_initiated: bool = False,
+) -> dict[str, Any]:
+    _validate_verdict_choices(choices, agent_initiated=agent_initiated)
+    claim_ids = list(choices["claim_ids"])
+    scientific_decision = choices["scientific_verdict"]["decision"]
+    if not claim_ids and scientific_decision != "requires_more_evidence":
+        raise ValidationError(
+            "a Verdict without selected Claims must use scientific decision "
+            "requires_more_evidence"
+        )
+    verdict = {
+        "schema_version": SCHEMA_VERSION,
+        "study_id": paths.study_id,
+        "verdict_id": _next_verdict_id(paths),
+        "created_at": utc_now(),
+        "reviewer": reviewer_identity(paths.root),
+        "judged_scope": _current_judged_scope(paths, claim_ids),
+        "implementation_verdict": {
+            **choices["implementation_verdict"],
+            "conditions": list(choices["implementation_verdict"].get("conditions", [])),
+        },
+        "scientific_verdict": {
+            **choices["scientific_verdict"],
+            "conditions": list(choices["scientific_verdict"].get("conditions", [])),
+        },
+        "confirmation": {
+            "typed_text": "[FILLED BY STUDYCTL]",
+            "confirmed_at": "[FILLED BY STUDYCTL]",
+        },
+        "verdict_sha256": None,
+    }
+    if agent_initiated:
+        instruction = choices["authorization"]["instruction"].strip()
+        verdict["authorization"] = {
+            "mode": "agent_initiated",
+            "source": "explicit_user_instruction",
+            "assurance": "cooperative",
+            "instruction": instruction,
+            "instruction_sha256": sha256_json(instruction),
+        }
+    return verdict
 
 
 def _validate_claim_references(paths: StudyPaths, refs: Any) -> None:
@@ -563,10 +966,7 @@ def _validate_checkpoint_reference(paths: StudyPaths, ref: Any) -> None:
 
 
 def _validate_current_verdict_scope(paths: StudyPaths, verdict: dict[str, Any]) -> None:
-    _raise_validation_issues(
-        "Verdict requires a fresh approved Brief",
-        brief_content_issues(paths) + brief_approval_issues(paths),
-    )
+    _current_verdict_authority(paths)
     scope = verdict.get("judged_scope")
     if not isinstance(scope, dict):
         raise ValidationError("judged_scope must be an object")
@@ -608,17 +1008,55 @@ def _reject_duplicate_verdict_id(paths: StudyPaths, verdict_id: str) -> None:
 @serialized_study_authority
 def record_verdict(
     paths: StudyPaths,
-    source_path: Path,
+    source_path: Path | None = None,
     stdin: TextIO = sys.stdin,
     stdout: TextIO = sys.stdout,
+    *,
+    agent_initiated: bool = False,
 ) -> Path:
-    """Validate and immutably record a separately reasoned human Verdict."""
+    """Record human-owned decisions in a mechanically scoped immutable Verdict.
 
-    _require_human_tty(stdin, stdout)
-    source = source_path.resolve()
-    verdict = load_json(source)
-    if not isinstance(verdict, dict):
-        raise ValidationError("Verdict source must contain a JSON object")
+    Interactive mode collects and confirms the decisions directly. Agent-initiated
+    mode accepts only a version-2 decision input that preserves the explicit user
+    instruction authorizing those decisions; it cannot import a complete Verdict.
+    """
+
+    if agent_initiated:
+        if source_path is None:
+            raise HumanGateError(
+                "agent-initiated Verdict requires a decision-only --file with explicit user authorization"
+            )
+    else:
+        _require_human_tty(stdin, stdout)
+    generated_claim_ids: list[str] | None = None
+    if source_path is None:
+        choices = _interactive_verdict_choices(paths, stdin, stdout)
+        verdict = _build_generated_verdict(paths, choices)
+        generated_claim_ids = list(choices["claim_ids"])
+        source = paths.verdict
+    else:
+        source = source_path.resolve()
+        supplied = load_json(source)
+        if not isinstance(supplied, dict):
+            raise ValidationError("Verdict source must contain a JSON object")
+        if "input_version" in supplied:
+            verdict = _build_generated_verdict(
+                paths,
+                supplied,
+                agent_initiated=agent_initiated,
+            )
+            generated_claim_ids = list(supplied["claim_ids"])
+        else:
+            if agent_initiated:
+                raise HumanGateError(
+                    "agent-initiated Verdict accepts only decision input, not a complete Verdict record"
+                )
+            # Compatibility path for previously prepared full Verdict sources.
+            verdict = supplied
+    if not agent_initiated and verdict.get("authorization") is not None:
+        raise ValidationError(
+            "Verdict authorization is reserved for --agent-initiated decision input"
+        )
     _raise_validation_issues(
         "Verdict source does not match the Verdict schema",
         object_schema_issues(paths.root, "verdict", source, verdict),
@@ -629,6 +1067,7 @@ def record_verdict(
     if verdict.get("verdict_sha256") is not None:
         raise ValidationError("unrecorded Verdict source must have verdict_sha256 null")
     _validate_verdict_branches(verdict)
+    _validate_verdict_claim_decision(verdict)
     _validate_current_verdict_scope(paths, verdict)
     _reject_duplicate_verdict_id(paths, verdict_id)
     destination = _next_verdict_path(paths)
@@ -640,27 +1079,68 @@ def record_verdict(
     print(f"Verdict ID: {verdict_id}", file=stdout)
     print(f"Judged commit: {scope['commit'] or 'unavailable'}", file=stdout)
     print(f"Judged Brief SHA-256: {scope['brief_sha256']}", file=stdout)
+    checkpoint = scope["checkpoint"]
+    checkpoint_id = checkpoint["checkpoint_id"] if checkpoint else "none"
+    print(f"Judged Checkpoint: {checkpoint_id}", file=stdout)
+    claim_ids = [ref["claim_id"] for ref in scope["claims"]]
+    evidence_ids = [
+        f"{ref['evidence_id']}@v{ref['version']}" for ref in scope["evidence"]
+    ]
+    claim_preview = claim_ids[:24]
+    claim_suffix = f", +{len(claim_ids) - 24} more" if len(claim_ids) > 24 else ""
     print(
-        "Judged Claims: "
-        + json.dumps(scope["claims"], ensure_ascii=False, sort_keys=True),
+        f"Judged Claims ({len(claim_ids)}): {', '.join(claim_preview) or 'none'}{claim_suffix}",
         file=stdout,
     )
+    evidence_preview = evidence_ids[:24]
+    evidence_suffix = (
+        f", +{len(evidence_ids) - 24} more" if len(evidence_ids) > 24 else ""
+    )
     print(
-        "Judged Evidence: "
-        + json.dumps(scope["evidence"], ensure_ascii=False, sort_keys=True),
+        f"Judged Evidence ({len(evidence_ids)}): "
+        f"{', '.join(evidence_preview) or 'none'}{evidence_suffix}",
         file=stdout,
     )
+    print(f"Mechanical scope SHA-256: {sha256_json(scope)}", file=stdout)
     print(f"Implementation verdict: {implementation['decision']}", file=stdout)
     print(f"Scientific verdict: {scientific['decision']}", file=stdout)
-    phrase = f"RECORD VERDICT {paths.study_id} {verdict_id}"
-    _confirmation(stdin, stdout, phrase)
+    print(f"Scientific scope: {scientific['scope']}", file=stdout)
+    print(
+        "Reviewer: " + json.dumps(verdict["reviewer"], ensure_ascii=False, sort_keys=True),
+        file=stdout,
+    )
+    if agent_initiated:
+        authorization = verdict["authorization"]
+        print(
+            "Authorization: explicit user instruction (SHA-256 "
+            f"{authorization['instruction_sha256']})",
+            file=stdout,
+        )
+    else:
+        phrase = f"RECORD VERDICT {paths.study_id} {verdict_id}"
+        _confirmation(stdin, stdout, phrase)
 
     # Recheck every mutable scope anchor after the human has confirmed it.
     _validate_current_verdict_scope(paths, verdict)
+    if generated_claim_ids is not None:
+        regenerated_scope = _current_judged_scope(paths, generated_claim_ids)
+        if regenerated_scope != scope:
+            raise WorkflowError(
+                "Verdict scope changed during confirmation; no Verdict was recorded"
+            )
     if destination.exists():
         raise WorkflowError(f"refusing to overwrite existing Verdict: {destination}")
-    confirmed_at = utc_now()
-    verdict["confirmation"] = {"typed_text": phrase, "confirmed_at": confirmed_at}
+    recorded_at = utc_now()
+    if agent_initiated:
+        verdict["confirmation"] = {
+            "mode": "agent_initiated",
+            "recorded_at": recorded_at,
+        }
+    else:
+        verdict["confirmation"] = {
+            "typed_text": phrase,
+            "confirmed_at": recorded_at,
+        }
     verdict["verdict_sha256"] = record_digest(verdict, "verdict_sha256")
     _raise_validation_issues(
         "confirmed Verdict does not match the Verdict schema",

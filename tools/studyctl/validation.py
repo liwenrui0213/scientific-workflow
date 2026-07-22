@@ -3180,13 +3180,62 @@ def _verdict_issues(
                     ValidationIssue("ERROR", str(path), f"duplicate Verdict ID: {verdict_id}")
                 )
             verdict_ids.add(verdict_id)
-            confirmation = item.get("confirmation", {})
-            expected_phrase = f"RECORD VERDICT {paths.study_id} {verdict_id}"
-            if confirmation.get("typed_text") != expected_phrase:
-                issues.append(
-                    ValidationIssue("ERROR", str(path), "Verdict confirmation phrase is invalid")
-                )
+            raw_confirmation = item.get("confirmation", {})
+            confirmation = raw_confirmation if isinstance(raw_confirmation, dict) else {}
+            authorization = item.get("authorization")
+            if authorization is None:
+                expected_phrase = f"RECORD VERDICT {paths.study_id} {verdict_id}"
+                if confirmation.get("typed_text") != expected_phrase:
+                    issues.append(
+                        ValidationIssue(
+                            "ERROR", str(path), "Verdict confirmation phrase is invalid"
+                        )
+                    )
+            else:
+                if not isinstance(authorization, dict):
+                    issues.append(
+                        ValidationIssue(
+                            "ERROR", str(path), "Verdict authorization must be an object"
+                        )
+                    )
+                    authorization = {}
+                instruction = authorization.get("instruction")
+                if (
+                    not isinstance(instruction, str)
+                    or authorization.get("instruction_sha256") != sha256_json(instruction)
+                ):
+                    issues.append(
+                        ValidationIssue(
+                            "ERROR",
+                            str(path),
+                            "Verdict authorization instruction hash is invalid",
+                        )
+                    )
+                if confirmation.get("mode") != "agent_initiated":
+                    issues.append(
+                        ValidationIssue(
+                            "ERROR",
+                            str(path),
+                            "Agent-initiated Verdict recording mode is invalid",
+                        )
+                    )
             scope = item.get("judged_scope", {})
+            if (
+                isinstance(scope, dict)
+                and isinstance(scope.get("claims"), list)
+                and not scope["claims"]
+                and isinstance(item.get("scientific_verdict"), dict)
+                and item["scientific_verdict"].get("decision")
+                != "requires_more_evidence"
+            ):
+                issues.append(
+                    ValidationIssue(
+                        "ERROR",
+                        str(path),
+                        "Verdict without selected Claims must use scientific decision "
+                        "requires_more_evidence",
+                    )
+                )
             if scope.get("brief_sha256") not in known_brief_hashes:
                 issues.append(
                     ValidationIssue(

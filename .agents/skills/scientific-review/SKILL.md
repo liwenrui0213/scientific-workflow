@@ -65,6 +65,10 @@ or deciding which questions require human review.
 Return the structured review JSON outside the repository. Hand it to a separate
 trusted write-enabled caller, which may run `studyctl review-render`; the rendered
 Markdown remains non-authoritative. Surface critical human questions explicitly
-and leave the final implementation and scientific Verdict to the human. If
+and leave the final implementation and scientific decisions to the human. The
+read-only reviewer must not record the Verdict. A separate write-enabled Agent
+may prepare and invoke the decision-only Agent path only after the human explicitly
+selects the decisions and scope or adopts an immediately preceding exact summary;
+`studyctl` derives mechanical scope and hashes. If
 material findings require correction, hand them back to `scientific-study`; the
 reviewer does not implement its own recommendations.

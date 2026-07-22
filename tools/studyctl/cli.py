@@ -279,9 +279,23 @@ def build_parser() -> argparse.ArgumentParser:
     review_render.add_argument("study_id")
     review_render.add_argument("--file", required=True)
 
-    verdict = subparsers.add_parser("verdict", help="record a human implementation and scientific Verdict")
+    verdict = subparsers.add_parser(
+        "verdict",
+        help="record human-owned decisions in an auto-scoped Verdict",
+    )
     verdict.add_argument("study_id")
-    verdict.add_argument("--file", required=True)
+    verdict.add_argument(
+        "--file",
+        help="optional prewritten human decision input; scope and hashes are generated",
+    )
+    verdict.add_argument(
+        "--agent-initiated",
+        action="store_true",
+        help=(
+            "record a version-2 decision input authorized by an explicit user instruction; "
+            "requires --file and does not require a terminal confirmation"
+        ),
+    )
 
     gc = subparsers.add_parser(
         "gc", help="report safe object-deletion candidates; this command is always dry-run"
@@ -525,7 +539,8 @@ def dispatch(args: argparse.Namespace) -> int:
     if name == "verdict":
         from .approval import record_verdict
 
-        print(record_verdict(paths, Path(args.file)))
+        source = Path(args.file) if args.file else None
+        print(record_verdict(paths, source, agent_initiated=args.agent_initiated))
         return 0
     if name == "gc":
         if not args.dry_run:

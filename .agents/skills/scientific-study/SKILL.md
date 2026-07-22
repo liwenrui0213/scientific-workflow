@@ -105,8 +105,11 @@ rendering.
 
 ## Output and handoff
 
-Leave valid active records, explicit open questions, and a small Frontier.
-Invoke `research-compaction` at pressure or when history obscures the current
-state. Invoke `scientific-review` only with a prepared review packet for a
-fresh read-only reviewer. Stop for human action only at a protected boundary,
-hard-budget decision, unresolved material ambiguity, or final Verdict.
+Keep records, questions, and Frontier. Use `research-compaction`
+under pressure and `scientific-review` from a packet in a read-only
+session. For Verdict, show Claims and decisions with rationale, scope, and conditions.
+Explicit human selection or adoption authorizes version-2 input under profile
+`object_root` and `studyctl
+verdict <STUDY_ID> --agent-initiated --file <PATH>`; otherwise ask once. Silence,
+completion, review success, or Agent recommendation is not acceptance.
+The human decides; a write-enabled Agent records; `studyctl` binds hashes.

@@ -51,18 +51,56 @@ class HookPolicyTests(WorkflowTestCase):
             "tool_input": {"file_path": path, "content": "replacement\n"},
         }
 
-    def test_human_only_approval_and_verdict_commands_are_blocked(self) -> None:
-        commands = (
-            "python -m tools.studyctl approve-brief SC-0001",
-            "python -m tools.studyctl verdict SC-0001 --file proposed-verdict.json",
+    def test_human_only_approval_and_ordinary_verdict_commands_are_blocked(self) -> None:
+        self.assertEqual(
+            HOOK_POLICY.decide(
+                self.bash_event("python -m tools.studyctl approve-brief SC-0001")
+            ),
+            "Codex must not invoke the human-only approve-brief command.",
         )
-        for command in commands:
+        for command in (
+            "python -m tools.studyctl verdict SC-0001",
+            "python -m tools.studyctl verdict SC-0001 --file proposed-verdict.json",
+            "python -m tools.studyctl verdict SC-0001 --agent-initiated",
+        ):
             with self.subTest(command=command):
-                reason = HOOK_POLICY.decide(self.bash_event(command))
                 self.assertEqual(
-                    reason,
-                    "Codex must not invoke the human-only approve-brief or verdict command.",
+                    HOOK_POLICY.decide(self.bash_event(command)),
+                    (
+                        "Codex may record a Verdict only with --agent-initiated, --file, "
+                        "and an explicit user instruction captured by the decision input."
+                    ),
                 )
+
+    def test_hook_allows_only_exact_agent_initiated_verdict_command(self) -> None:
+        allowed = (
+            "python -m tools.studyctl verdict SC-0001 "
+            "--file .objects/verdict-decisions.json --agent-initiated"
+        )
+        self.assertIsNone(HOOK_POLICY.decide(self.bash_event(allowed)))
+
+        denied = (
+            "python -m tools.studyctl verdict SC-0001 --file --agent-initiated",
+            allowed + " --force",
+            "echo " + allowed,
+            allowed + "; echo bypass",
+            allowed + " && echo bypass",
+            allowed + " | tee leaked.txt",
+            allowed + " > verdict.log",
+            allowed + " < decisions.json",
+            allowed + " `echo bypass`",
+            allowed + " $(echo bypass)",
+            allowed + "\necho bypass",
+            "/tmp/studyctl verdict SC-0001 --file decisions.json --agent-initiated",
+            "/tmp/python -m tools.studyctl verdict SC-0001 --file decisions.json --agent-initiated",
+        )
+        expected = (
+            "Codex may record a Verdict only with --agent-initiated, --file, "
+            "and an explicit user instruction captured by the decision input."
+        )
+        for command in denied:
+            with self.subTest(command=command):
+                self.assertEqual(HOOK_POLICY.decide(self.bash_event(command)), expected)
 
     def test_checkpoint_and_sequence_authority_are_blocked_from_direct_edits(self) -> None:
         paths = self.initialize()

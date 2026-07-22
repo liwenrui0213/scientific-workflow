@@ -9,9 +9,8 @@ import unittest
 from tests.helpers import REPOSITORY_ROOT, TTYBuffer, WorkflowTestCase, completed_process
 from tools.studyctl.approval import record_verdict
 from tools.studyctl.approval import begin_brief_revision
-from tools.studyctl.git_state import git_state
-from tools.studyctl.hashing import atomic_write_json, load_json, sha256_file
-from tools.studyctl.models import StudyPaths, WorkflowError, utc_now
+from tools.studyctl.hashing import atomic_write_json, load_json
+from tools.studyctl.models import StudyPaths, WorkflowError
 from tools.studyctl.study_routing import classify_study_dirs, resolve_study
 
 
@@ -53,43 +52,24 @@ class StudyRoutingTests(WorkflowTestCase):
             for path in root.rglob("*")
         }
 
-    def record_empty_scope_verdict(self, paths: StudyPaths) -> None:
+    def record_implementation_only_verdict(self, paths: StudyPaths) -> None:
         verdict_id = "VERDICT-0001"
         source = {
-            "schema_version": 1,
-            "study_id": paths.study_id,
-            "verdict_id": verdict_id,
-            "created_at": utc_now(),
-            "reviewer": {
-                "identity": "Independent Routing Test Reviewer",
-                "source": "human_authored_test_fixture",
-            },
-            "judged_scope": {
-                "commit": git_state(paths.root)["commit"],
-                "brief_sha256": sha256_file(paths.brief),
-                "checkpoint": None,
-                "claims": [],
-                "evidence": [],
-            },
+            "input_version": 1,
+            "claim_ids": [],
             "implementation_verdict": {
                 "decision": "accepted",
                 "rationale": "The routing fixture satisfies its implementation scope.",
-                "conditions": [],
             },
             "scientific_verdict": {
                 "decision": "requires_more_evidence",
                 "rationale": "The fixture does not establish a scientific conclusion.",
                 "scope": "Only the deterministic routing fixture is judged.",
-                "conditions": [],
             },
-            "confirmation": {
-                "typed_text": "[FILLED BY STUDYCTL]",
-                "confirmed_at": "[FILLED BY STUDYCTL]",
-            },
-            "verdict_sha256": None,
         }
-        source_path = self.root / "routing-verdict-source.json"
+        source_path = self.root / "routing-verdict-decisions.json"
         atomic_write_json(source_path, source)
+        self.commit_all("freeze routing Verdict input")
         phrase = f"RECORD VERDICT {paths.study_id} {verdict_id}"
         record_verdict(
             paths,
@@ -164,12 +144,18 @@ class StudyRoutingTests(WorkflowTestCase):
         self.assertEqual(self.study_tree_snapshot(), before)
 
     def test_valid_verdict_does_not_remove_approved_study_from_resolution(self) -> None:
-        paths = self.approved_study("SC-2003")
-        self.record_empty_scope_verdict(paths)
+        paths = self.initialize("SC-2003")
+        self.fill_brief(paths)
+        self.approve(paths)
+        self.record_implementation_only_verdict(paths)
 
         selected = resolve_study(self.root)
 
         self.assertTrue(paths.verdict.is_file())
+        verdict = load_json(paths.verdict)
+        self.assertEqual(verdict["judged_scope"]["checkpoint"], None)
+        self.assertEqual(verdict["judged_scope"]["claims"], [])
+        self.assertEqual(verdict["judged_scope"]["evidence"], [])
         self.assertEqual((selected.study_id, selected.phase), ("SC-2003", "approved"))
 
     def test_legacy_claims_require_same_study_migration_not_replacement(self) -> None:

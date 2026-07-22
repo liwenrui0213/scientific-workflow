@@ -1,33 +1,19 @@
 {
-  "schema_version": 1,
-  "study_id": "{{STUDY_ID}}",
-  "verdict_id": "VERDICT-0001",
-  "created_at": "{{TIMESTAMP}}",
-  "reviewer": {
-    "identity": "[REPLACE]",
-    "source": "human_authored"
+  "input_version": 2,
+  "authorization": {
+    "source": "explicit_user_instruction",
+    "instruction": "[REPLACE WITH THE USER'S EXPLICIT VERDICT INSTRUCTION]"
   },
-  "judged_scope": {
-    "commit": null,
-    "brief_sha256": "{{BRIEF_SHA256}}",
-    "checkpoint": null,
-    "claims": [],
-    "evidence": []
-  },
+  "claim_ids": [
+    "CLAIM-0001"
+  ],
   "implementation_verdict": {
     "decision": "requires_changes",
-    "rationale": "[REPLACE]",
-    "conditions": []
+    "rationale": "[REPLACE]"
   },
   "scientific_verdict": {
     "decision": "requires_more_evidence",
     "rationale": "[REPLACE]",
-    "scope": "[REPLACE]",
-    "conditions": []
-  },
-  "confirmation": {
-    "typed_text": "[FILLED BY STUDYCTL]",
-    "confirmed_at": "[FILLED BY STUDYCTL]"
-  },
-  "verdict_sha256": null
+    "scope": "[REPLACE]"
+  }
 }

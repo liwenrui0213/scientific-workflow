@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import re
+import shlex
 import sys
 from typing import Any
 
@@ -20,9 +21,78 @@ _MUTATION = re.compile(
     re.IGNORECASE,
 )
 _HUMAN_COMMAND = re.compile(
-    r"(?:studyctl|tools\.studyctl).*\b(?:approve-brief|verdict)\b",
+    r"(?:studyctl|tools\.studyctl).*\bapprove-brief\b",
     re.IGNORECASE | re.DOTALL,
 )
+_VERDICT_COMMAND = re.compile(
+    r"(?:studyctl|tools\.studyctl).*\bverdict\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_SHELL_CONTROL = re.compile(r"[;&|><`$()\r\n]")
+
+
+def _is_narrow_agent_verdict(payload: str) -> bool:
+    """Accept only the cooperative, decision-only Agent initiation surface."""
+
+    if _VERDICT_COMMAND.search(payload) is None or _SHELL_CONTROL.search(payload):
+        return False
+    try:
+        argv = shlex.split(payload)
+    except ValueError:
+        return False
+    if not argv:
+        return False
+    # Do not trust only an executable basename here: an attacker-controlled
+    # /tmp/studyctl or /tmp/python must not inherit this narrow exception.
+    # Repository instructions use the module entry point, so allow only the
+    # literal PATH-resolved interpreter names and the exact module invocation.
+    if argv[0] not in {"python", "python3"}:
+        return False
+    if argv[1:3] != ["-m", "tools.studyctl"]:
+        return False
+    args = argv[3:]
+
+    if args[:1] == ["--root"]:
+        if len(args) < 2 or not args[1] or args[1].startswith("--"):
+            return False
+        args = args[2:]
+    elif args[:1] and args[0].startswith("--root="):
+        if not args[0].partition("=")[2]:
+            return False
+        args = args[1:]
+
+    if len(args) < 4 or args[0] != "verdict" or not re.fullmatch(
+        r"SC-[0-9]{4,}", args[1], re.IGNORECASE
+    ):
+        return False
+    tail = args[2:]
+    saw_agent = False
+    saw_file = False
+    index = 0
+    while index < len(tail):
+        token = tail[index]
+        if token == "--agent-initiated" and not saw_agent:
+            saw_agent = True
+            index += 1
+            continue
+        if token == "--file" and not saw_file:
+            if (
+                index + 1 >= len(tail)
+                or not tail[index + 1]
+                or tail[index + 1].startswith("--")
+            ):
+                return False
+            saw_file = True
+            index += 2
+            continue
+        if token.startswith("--file=") and not saw_file and token.partition("=")[2]:
+            saw_file = True
+            index += 1
+            continue
+        return False
+    return saw_agent and saw_file
+
+
 def _deny(reason: str) -> dict[str, Any]:
     return {
         "hookSpecificOutput": {
@@ -182,7 +252,12 @@ def decide(event: dict[str, Any]) -> str | None:
     )
     if tool_name == "Bash" or "bash" in tool_name.lower():
         if _HUMAN_COMMAND.search(payload):
-            return "Codex must not invoke the human-only approve-brief or verdict command."
+            return "Codex must not invoke the human-only approve-brief command."
+        if _VERDICT_COMMAND.search(payload) and not _is_narrow_agent_verdict(payload):
+            return (
+                "Codex may record a Verdict only with --agent-initiated, --file, "
+                "and an explicit user instruction captured by the decision input."
+            )
         if not _MUTATION.search(payload):
             return None
         lowered = payload.lower()

@@ -70,6 +70,8 @@ class CoreWorkflowTests(WorkflowTestCase):
         atomic_write_json(paths.claims, claims)
 
     def valid_verdict_source(self, paths: object, verdict_id: str) -> dict[str, object]:
+        """Return a legacy full-source Verdict for compatibility-boundary tests."""
+
         return {
             "schema_version": 1,
             "study_id": paths.study_id,
@@ -103,6 +105,62 @@ class CoreWorkflowTests(WorkflowTestCase):
             },
             "verdict_sha256": None,
         }
+
+    def verdict_decisions(
+        self,
+        *,
+        claim_ids: list[str] | None = None,
+    ) -> dict[str, object]:
+        return {
+            "input_version": 1,
+            "claim_ids": list(claim_ids or []),
+            "implementation_verdict": {
+                "decision": "accepted",
+                "rationale": "The implementation satisfies the tested workflow invariants.",
+            },
+            "scientific_verdict": {
+                "decision": "requires_more_evidence",
+                "rationale": "The fixture establishes workflow behavior, not a scientific conclusion.",
+                "scope": "Only the deterministic workflow fixture is judged.",
+            },
+        }
+
+    def agent_verdict_decisions(
+        self,
+        *,
+        instruction: str = "Record the implementation-only Verdict with the decisions below.",
+        claim_ids: list[str] | None = None,
+    ) -> dict[str, object]:
+        return {
+            "input_version": 2,
+            "authorization": {
+                "source": "explicit_user_instruction",
+                "instruction": instruction,
+            },
+            "claim_ids": list(claim_ids or []),
+            "implementation_verdict": {
+                "decision": "accepted",
+                "rationale": "The implementation satisfies the tested workflow invariants.",
+            },
+            "scientific_verdict": {
+                "decision": "requires_more_evidence",
+                "rationale": "The fixture establishes workflow behavior, not a scientific conclusion.",
+                "scope": "Only the deterministic workflow fixture is judged.",
+            },
+        }
+
+    def interactive_verdict_input(self, paths: object, verdict_id: str) -> str:
+        return "\n".join(
+            (
+                "accepted",
+                "The implementation satisfies the tested workflow invariants.",
+                "requires_more_evidence",
+                "The fixture establishes workflow behavior, not a scientific conclusion.",
+                "Only the deterministic workflow fixture is judged.",
+                f"RECORD VERDICT {paths.study_id} {verdict_id}",
+                "",
+            )
+        )
 
     def test_init_creates_draft_study_without_false_approval_or_verdict(self) -> None:
         study_id = "SC-1200"
@@ -208,27 +266,46 @@ class CoreWorkflowTests(WorkflowTestCase):
         self.fill_brief(paths)
         self.approve(paths)
         verdict_id = "VERDICT-0001"
-        source_path = self.root / "verdict-source.json"
-        atomic_write_json(source_path, self.valid_verdict_source(paths, verdict_id))
         phrase = f"RECORD VERDICT {paths.study_id} {verdict_id}"
+        responses = self.interactive_verdict_input(paths, verdict_id)
 
         with self.assertRaisesRegex(HumanGateError, "requires an interactive TTY"):
             record_verdict(
                 paths,
-                source_path,
-                stdin=io.StringIO(phrase + "\n"),
+                stdin=io.StringIO(responses),
                 stdout=io.StringIO(),
             )
         self.assertFalse(paths.verdict.exists())
+        self.commit_all("prepare clean implementation-only Verdict scope")
 
         destination = record_verdict(
             paths,
-            source_path,
-            stdin=TTYBuffer(phrase + "\n"),
+            stdin=TTYBuffer(responses),
             stdout=TTYBuffer(),
         )
         recorded = load_json(destination)
         self.assertEqual(destination, paths.verdict)
+        self.assertEqual(recorded["verdict_id"], verdict_id)
+        self.assertRegex(recorded["created_at"], r"^\d{4}-\d{2}-\d{2}T.*Z$")
+        self.assertEqual(
+            recorded["reviewer"],
+            {
+                "identity": "Test Reviewer <reviewer@example.test>",
+                "source": "git_config",
+            },
+        )
+        self.assertEqual(
+            recorded["judged_scope"],
+            {
+                "commit": git_state(paths.root)["commit"],
+                "brief_sha256": sha256_file(paths.brief),
+                "checkpoint": None,
+                "claims": [],
+                "evidence": [],
+            },
+        )
+        self.assertEqual(recorded["implementation_verdict"]["conditions"], [])
+        self.assertEqual(recorded["scientific_verdict"]["conditions"], [])
         self.assertEqual(recorded["confirmation"]["typed_text"], phrase)
         self.assertNotIn("[FILLED BY STUDYCTL]", recorded["confirmation"]["confirmed_at"])
         self.assertEqual(
@@ -236,14 +313,313 @@ class CoreWorkflowTests(WorkflowTestCase):
             record_digest(recorded, "verdict_sha256"),
         )
         self.assertEqual(destination.stat().st_mode & 0o777, 0o444)
-        self.assertIsNone(load_json(source_path)["verdict_sha256"])
+
+    def test_agent_initiated_v2_decisions_record_non_tty_authorization(self) -> None:
+        paths = self.initialize()
+        self.fill_brief(paths)
+        self.approve(paths)
+        self.commit_all("freeze Agent-initiated Verdict fixture")
+        instruction = "Record this Verdict for me using the decisions I supplied."
+        decisions = self.agent_verdict_decisions(instruction=instruction)
+        decisions_path = self.root / ".objects" / "agent-verdict-decisions.json"
+        atomic_write_json(decisions_path, decisions)
+        stdout = io.StringIO()
+
+        destination = record_verdict(
+            paths,
+            decisions_path,
+            stdin=io.StringIO(),
+            stdout=stdout,
+            agent_initiated=True,
+        )
+
+        recorded = load_json(destination)
+        authorization = recorded["authorization"]
+        self.assertEqual(recorded["verdict_id"], "VERDICT-0001")
+        self.assertRegex(recorded["created_at"], r"^\d{4}-\d{2}-\d{2}T.*Z$")
+        self.assertEqual(
+            recorded["reviewer"],
+            {
+                "identity": "Test Reviewer <reviewer@example.test>",
+                "source": "git_config",
+            },
+        )
+        self.assertEqual(
+            recorded["judged_scope"],
+            {
+                "commit": git_state(paths.root)["commit"],
+                "brief_sha256": sha256_file(paths.brief),
+                "checkpoint": None,
+                "claims": [],
+                "evidence": [],
+            },
+        )
+        self.assertEqual(
+            authorization,
+            {
+                "mode": "agent_initiated",
+                "source": "explicit_user_instruction",
+                "assurance": "cooperative",
+                "instruction": instruction,
+                "instruction_sha256": sha256_json(instruction),
+            },
+        )
+        self.assertEqual(set(recorded["confirmation"]), {"mode", "recorded_at"})
+        self.assertEqual(recorded["confirmation"]["mode"], "agent_initiated")
+        self.assertRegex(
+            recorded["confirmation"]["recorded_at"],
+            r"^\d{4}-\d{2}-\d{2}T.*Z$",
+        )
+        self.assertNotIn("typed_text", recorded["confirmation"])
+        self.assertNotIn("confirmed_at", recorded["confirmation"])
+        self.assertEqual(
+            recorded["verdict_sha256"],
+            record_digest(recorded, "verdict_sha256"),
+        )
+        self.assertEqual(destination.stat().st_mode & 0o777, 0o444)
+        self.assertIn("Authorization: explicit user instruction", stdout.getvalue())
+        self.assertEqual(self.error_messages(paths), [])
+
+    def test_agent_initiated_verdict_rejects_missing_or_unauthorized_inputs(self) -> None:
+        paths = self.initialize()
+        self.fill_brief(paths)
+        self.approve(paths)
+        self.commit_all("freeze rejected Agent-initiated Verdict fixtures")
+        cases: list[tuple[str, Path | None, type[Exception], str]] = []
+
+        v1_path = self.root / ".objects" / "agent-verdict-v1.json"
+        atomic_write_json(v1_path, self.verdict_decisions())
+        cases.append(
+            (
+                "version 1 input without authorization",
+                v1_path,
+                ValidationError,
+                "input_version=2",
+            )
+        )
+
+        legacy_path = self.root / ".objects" / "agent-verdict-legacy-full.json"
+        atomic_write_json(
+            legacy_path,
+            self.valid_verdict_source(paths, "VERDICT-0001"),
+        )
+        cases.append(
+            (
+                "legacy full Verdict source",
+                legacy_path,
+                HumanGateError,
+                "accepts only decision input",
+            )
+        )
+        cases.insert(
+            0,
+            (
+                "missing decision file",
+                None,
+                HumanGateError,
+                "requires a decision-only --file",
+            ),
+        )
+
+        for label, source_path, error_type, message in cases:
+            with self.subTest(label=label), self.assertRaisesRegex(error_type, message):
+                record_verdict(
+                    paths,
+                    source_path,
+                    stdin=io.StringIO(),
+                    stdout=io.StringIO(),
+                    agent_initiated=True,
+                )
+
+        self.assertEqual(list(paths.study.glob("VERDICT*.json")), [])
+
+    def test_manual_legacy_verdict_rejects_agent_authorization_branch(self) -> None:
+        paths = self.initialize()
+        self.fill_brief(paths)
+        self.approve(paths)
+        self.commit_all("freeze manual Verdict mode-pairing fixture")
+        source = self.valid_verdict_source(paths, "VERDICT-0001")
+        instruction = "Record this decision on my behalf."
+        source["authorization"] = {
+            "mode": "agent_initiated",
+            "source": "explicit_user_instruction",
+            "assurance": "cooperative",
+            "instruction": instruction,
+            "instruction_sha256": sha256_json(instruction),
+        }
+        source_path = self.root / ".objects" / "manual-with-agent-authorization.json"
+        atomic_write_json(source_path, source)
+
+        with self.assertRaisesRegex(
+            ValidationError,
+            "authorization is reserved for --agent-initiated",
+        ):
+            record_verdict(
+                paths,
+                source_path,
+                stdin=TTYBuffer(),
+                stdout=TTYBuffer(),
+            )
+
+        self.assertEqual(list(paths.study.glob("VERDICT*.json")), [])
+
+    def test_every_verdict_without_claims_requires_more_evidence(self) -> None:
+        paths = self.initialize()
+        self.fill_brief(paths)
+        self.approve(paths)
+        self.commit_all("freeze empty-Claim Verdict invariant fixture")
+        source = self.valid_verdict_source(paths, "VERDICT-0001")
+        source["scientific_verdict"]["decision"] = "accepted_within_scope"
+        source_path = self.root / ".objects" / "empty-claim-accepted-verdict.json"
+        atomic_write_json(source_path, source)
+
+        with self.assertRaisesRegex(
+            ValidationError,
+            "without selected Claims must use scientific decision requires_more_evidence",
+        ):
+            record_verdict(
+                paths,
+                source_path,
+                stdin=TTYBuffer(),
+                stdout=TTYBuffer(),
+            )
+
+        self.assertEqual(list(paths.study.glob("VERDICT*.json")), [])
+
+        source["confirmation"] = {
+            "typed_text": "RECORD VERDICT SC-0001 VERDICT-0001",
+            "confirmed_at": utc_now(),
+        }
+        source["verdict_sha256"] = record_digest(source, "verdict_sha256")
+        atomic_write_json(paths.verdict, source, mode=0o444)
+        self.assertIn(
+            "Verdict without selected Claims must use scientific decision requires_more_evidence",
+            self.error_messages(paths),
+        )
+
+    def test_validation_rejects_tampered_agent_verdict_authorization(self) -> None:
+        paths = self.initialize()
+        self.fill_brief(paths)
+        self.approve(paths)
+        self.commit_all("freeze Agent Verdict provenance fixture")
+        decisions = self.agent_verdict_decisions(
+            instruction="Record the exact authorized Verdict decisions."
+        )
+        decisions_path = self.root / ".objects" / "agent-verdict-provenance.json"
+        atomic_write_json(decisions_path, decisions)
+        verdict_path = record_verdict(
+            paths,
+            decisions_path,
+            stdin=io.StringIO(),
+            stdout=io.StringIO(),
+            agent_initiated=True,
+        )
+        tampered = load_json(verdict_path)
+        tampered["authorization"]["instruction"] = "A different instruction."
+        tampered["verdict_sha256"] = record_digest(tampered, "verdict_sha256")
+        atomic_write_json(verdict_path, tampered, mode=0o444)
+
+        self.assertIn(
+            "Verdict authorization instruction hash is invalid",
+            self.error_messages(paths),
+        )
+
+    def test_auto_scoped_verdict_requires_a_checkpoint_for_active_claims(self) -> None:
+        paths = self.initialize_approved_with_claim()
+        self.commit_all("freeze no-Checkpoint Verdict fixture")
+        decisions_path = self.root / ".objects" / "verdict-decisions.json"
+        atomic_write_json(
+            decisions_path,
+            self.verdict_decisions(claim_ids=["CLAIM-0001"]),
+        )
+
+        with self.assertRaisesRegex(
+            ValidationError,
+            "active Claims require a fresh Checkpoint before a scientific Verdict",
+        ):
+            record_verdict(
+                paths,
+                decisions_path,
+                stdin=TTYBuffer(),
+                stdout=TTYBuffer(),
+            )
+
+        self.assertFalse(paths.verdict.exists())
+
+    def test_auto_scoped_verdict_rejects_confirmation_time_scope_drift(self) -> None:
+        paths = self.initialize()
+        self.fill_brief(paths)
+        self.approve(paths)
+        verdict_id = "VERDICT-0001"
+        responses = self.interactive_verdict_input(paths, verdict_id)
+        self.commit_all("prepare clean Verdict scope drift fixture")
+
+        from tools.studyctl import approval as approval_module
+
+        actual_scope = approval_module._current_judged_scope
+        calls = 0
+
+        def scope_with_late_drift(paths_arg: object, claim_ids: list[str]) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            scope = actual_scope(paths_arg, claim_ids)
+            if calls == 3:
+                scope = copy.deepcopy(scope)
+                scope["commit"] = "0" * 40
+            return scope
+
+        with patch(
+            "tools.studyctl.approval._current_judged_scope",
+            side_effect=scope_with_late_drift,
+        ), self.assertRaisesRegex(
+            WorkflowError,
+            "Verdict scope changed during confirmation; no Verdict was recorded",
+        ):
+            record_verdict(
+                paths,
+                stdin=TTYBuffer(responses),
+                stdout=TTYBuffer(),
+            )
+
+        self.assertEqual(calls, 3)
+        self.assertFalse(paths.verdict.exists())
+
+    def test_legacy_full_verdict_cannot_bypass_clean_worktree_binding(self) -> None:
+        paths = self.initialize()
+        self.fill_brief(paths)
+        self.approve(paths)
+        self.commit_all("freeze legacy clean-worktree Verdict fixture")
+        verdict_id = "VERDICT-0001"
+        source_path = self.root / ".objects" / "legacy-dirty-verdict.json"
+        atomic_write_json(
+            source_path,
+            self.valid_verdict_source(paths, verdict_id),
+        )
+        (self.root / "unreviewed-legacy-change.txt").write_text(
+            "This change is absent from the judged commit.\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            ValidationError,
+            "Verdict requires a clean Git worktree",
+        ):
+            record_verdict(
+                paths,
+                source_path,
+                stdin=TTYBuffer(f"RECORD VERDICT {paths.study_id} {verdict_id}\n"),
+                stdout=TTYBuffer(),
+            )
+
+        self.assertFalse(paths.verdict.exists())
 
     def test_verdict_claim_scope_requires_a_hash_pinned_reference(self) -> None:
         paths = self.initialize_approved_with_claim()
+        self.commit_all("freeze legacy Verdict compatibility fixture")
         verdict_id = "VERDICT-0001"
         source = self.valid_verdict_source(paths, verdict_id)
         source["judged_scope"]["claims"] = [{"claim_id": "CLAIM-0001"}]
-        source_path = self.root / "unhashed-claim-verdict.json"
+        source_path = self.root / ".objects" / "unhashed-claim-verdict.json"
         atomic_write_json(source_path, source)
 
         with self.assertRaisesRegex(
@@ -286,10 +662,11 @@ class CoreWorkflowTests(WorkflowTestCase):
             "version": evidence["version"],
             "sha256": evidence["record_sha256"],
         }
+        self.commit_all("freeze legacy Evidence Verdict fixture")
         verdict_id = "VERDICT-0001"
         source = self.valid_verdict_source(paths, verdict_id)
         source["judged_scope"]["evidence"] = [evidence_ref]
-        source_path = self.root / "evidence-scoped-verdict.json"
+        source_path = self.root / ".objects" / "evidence-scoped-verdict.json"
         atomic_write_json(source_path, source)
         verdict_path = record_verdict(
             paths,

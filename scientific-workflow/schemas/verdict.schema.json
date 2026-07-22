@@ -22,6 +22,20 @@
       },
       "additionalProperties": false
     },
+    "authorization": {
+      "type": "object",
+      "required": [
+        "mode", "source", "assurance", "instruction", "instruction_sha256"
+      ],
+      "properties": {
+        "mode": {"const": "agent_initiated"},
+        "source": {"const": "explicit_user_instruction"},
+        "assurance": {"const": "cooperative"},
+        "instruction": {"type": "string", "minLength": 1},
+        "instruction_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
     "judged_scope": {
       "type": "object",
       "required": ["commit", "brief_sha256", "checkpoint", "claims", "evidence"],
@@ -61,13 +75,26 @@
       "additionalProperties": false
     },
     "confirmation": {
-      "type": "object",
-      "required": ["typed_text", "confirmed_at"],
-      "properties": {
-        "typed_text": {"type": "string", "minLength": 1},
-        "confirmed_at": {"type": "string", "minLength": 1}
-      },
-      "additionalProperties": false
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["typed_text", "confirmed_at"],
+          "properties": {
+            "typed_text": {"type": "string", "minLength": 1},
+            "confirmed_at": {"type": "string", "minLength": 1}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["mode", "recorded_at"],
+          "properties": {
+            "mode": {"const": "agent_initiated"},
+            "recorded_at": {"type": "string", "minLength": 1}
+          },
+          "additionalProperties": false
+        }
+      ]
     },
     "verdict_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"}
   },
