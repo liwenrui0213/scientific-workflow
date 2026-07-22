@@ -288,9 +288,20 @@ class HardBudgetAndRunLifecycleTests(WorkflowTestCase):
 
         first = self._run(paths, gpu_hours=0.4)
         second = self._run(paths, gpu_hours=0.6)
+        self.assertEqual(first["schema_version"], 4)
+        self.assertEqual(second["schema_version"], 4)
         self.assertEqual(first["status"], "succeeded")
         self.assertEqual(second["status"], "succeeded")
         self.assertEqual(second["budget"]["committed_after"]["gpu_hours"], 1.0)
+        ledger = load_json(paths.study / "RUNS.ledger.json")
+        self.assertEqual(
+            ledger["runs"]["RUN-000001"]["commitment"]["gpu_hours"],
+            0.4,
+        )
+        self.assertEqual(
+            ledger["runs"]["RUN-000002"]["commitment"]["gpu_hours"],
+            0.6,
+        )
 
         with self.assertRaisesRegex(
             ValidationError, "hard gpu hours budget exceeded"

@@ -28,7 +28,10 @@ or deciding which questions require human review.
    inputs, outputs, logs, governance snapshots, and formal snapshots. Check the
    base anchor, native validation, protected conditions, evaluator and split,
    mathematical mapping, baselines, Cohorts, uncertainty, contradictions, and
-   formalization debt.
+   formalization debt. For a high-strength Claim, inspect the frozen
+   Confirmation Record and the complete confirmation-attempt inventory: verify
+   temporal ordering, Claim/candidate/protocol/evaluator hashes, held-out
+   freshness, planned-slot coverage, failed attempts, and exclusions.
 3. Perform the smallest independent checks needed to test high-risk assertions;
    distinguish a verified defect from a risk or unanswered question.
 4. Produce structured JSON matching `review.schema.json`. Give every material
@@ -50,6 +53,9 @@ or deciding which questions require human review.
   stop.
 - Do not equate implementation acceptance, numerical agreement, or absence of a
   discovered counterexample with scientific acceptance.
+- Treat legacy or unbound Runs as exploratory. Reject post-hoc relabeling,
+  cherry-picked confirmation slots, concealed attempts, or mixed Evidence that
+  does not distinguish its exploratory and confirmatory components.
 
 ## Output and handoff
 

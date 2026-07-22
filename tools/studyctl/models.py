@@ -19,6 +19,7 @@ ID_PATTERNS = {
     "run": re.compile(r"^RUN-[0-9]{6}$"),
     "evidence": re.compile(r"^EVID-[0-9]{4,}$"),
     "claim": re.compile(r"^CLAIM-[0-9]{4,}$"),
+    "confirmation": re.compile(r"^CONF-[0-9]{4,}$"),
     "cohort": re.compile(r"^COHORT-[0-9]{3,}$"),
     "checkpoint": re.compile(r"^CHECKPOINT-[0-9]{6}$"),
     "verdict": re.compile(r"^VERDICT-[0-9]{4,}$"),
@@ -150,6 +151,12 @@ class StudyPaths:
         return self._safe_study_path(Path("formal"), label="formal directory")
 
     @property
+    def confirmations(self) -> Path:
+        return self._safe_study_path(
+            Path("formal/confirmations"), label="confirmation directory"
+        )
+
+    @property
     def work(self) -> Path:
         return self._safe_study_path(Path("work"), label="work directory")
 
@@ -226,8 +233,6 @@ class StudyPaths:
         for directory in (
             self.formal,
             self.work,
-            self.active_work,
-            self.archived_work,
             self.runs,
             self.evidence,
             self.failed_directions,
@@ -237,6 +242,20 @@ class StudyPaths:
         ):
             if directory.exists() and not directory.is_dir():
                 raise ValidationError(f"managed Study directory is not a directory: {directory}")
+        # Resolve nested managed directories only after their parents have
+        # been proved to be directories.  Eager property evaluation would
+        # otherwise turn a clear parent-type violation into an incidental
+        # ENOTDIR while inspecting the child path.
+        nested_directories: list[Path] = []
+        if self.formal.is_dir():
+            nested_directories.append(self.confirmations)
+        if self.work.is_dir():
+            nested_directories.extend((self.active_work, self.archived_work))
+        for directory in nested_directories:
+            if directory.exists() and not directory.is_dir():
+                raise ValidationError(
+                    f"managed Study directory is not a directory: {directory}"
+                )
         for artifact in (
             self.brief,
             self.brief_approval,

@@ -126,6 +126,7 @@ class WorkflowTestCase(unittest.TestCase):
             "statement": "The deterministic result equals four.",
             "scope": "the fixture command and recorded environment",
             "state": "proposed",
+            "evidence_basis": "none",
             "supporting_evidence": [],
             "contradictory_evidence": [],
             "other_evidence": [],
@@ -213,7 +214,23 @@ class WorkflowTestCase(unittest.TestCase):
     def support_claim(self, paths: StudyPaths, evidence: dict[str, Any]) -> None:
         claims = load_json(paths.claims)
         claim = claims["claims"][0]
-        claim["state"] = "numerically_supported"
+        evidence_basis = evidence.get("evidence_basis", {})
+        basis = evidence_basis.get("mode", "exploratory")
+        held_out = evidence_basis.get("held_out", {})
+        strong_confirmation = basis in {"confirmatory", "mixed"} and (
+            (
+                held_out.get("status") == "held_out"
+                and held_out.get("freshness") == "fresh"
+            )
+            or (
+                held_out.get("status") == "not_applicable"
+                and held_out.get("freshness") == "not_applicable"
+            )
+        )
+        claim["state"] = (
+            "numerically_supported" if strong_confirmation else "partially_supported"
+        )
+        claim["evidence_basis"] = basis
         claim["supporting_evidence"] = [
             {
                 "evidence_id": evidence["evidence_id"],

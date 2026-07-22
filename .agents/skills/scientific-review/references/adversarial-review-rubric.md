@@ -49,6 +49,11 @@ Choose probes relevant to the Claim:
 - test an ablation or negative control implied by the claimed mechanism;
 - inspect seed selection, excluded Runs, stopping decisions, and contradictory
   Evidence for selection bias;
+- for confirmatory Evidence, compare the frozen time, Claim/candidate/protocol/
+  evaluator bindings, held-out history, planned slots, and analysis rule with
+  every workflow-visible attempt; treat a truncated attempt index as a prompt
+  to inspect its bound source inventory, not as proof that omitted attempts do
+  not exist;
 - check whether Cohort differences invalidate aggregation;
 - distinguish maximum error, norm, RMS, mean, variance, confidence interval, and
   effect size according to their actual mathematical definitions;
@@ -65,6 +70,14 @@ precision, dataset, model version, discretization, and uncertainty conditions to
 which its Evidence applies. Flag extrapolation beyond those conditions. When
 Evidence is mixed, prefer a narrower supported Claim over a global average that
 hides a failure region.
+
+Treat the repository's held-out freshness as a workflow-observed property, not
+proof that nobody accessed the condition elsewhere. Distinguish exploratory,
+confirmatory, and mixed support. Treat `not_applicable` as a scientific judgment:
+reject boilerplate or an explanation that does not show why no independent
+condition can meaningfully exist, and surface that judgment to the human. A post-result label, an incomplete planned-slot
+set, an omitted eligible attempt, or a drifted analysis rule cannot provide
+confirmatory support.
 
 ## Required finding quality
 

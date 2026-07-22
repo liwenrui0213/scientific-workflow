@@ -183,6 +183,19 @@ class HookPolicyTests(WorkflowTestCase):
                 "Validation proofs may be written only by studyctl validate-changes.",
             ),
             (
+                self.patch_event(
+                    "Add",
+                    f"studies/{paths.study_id}/formal/confirmations/CONF-0001.json",
+                ),
+                "Frozen Confirmation Records may be written only by studyctl confirmation-finalize.",
+            ),
+            (
+                self.bash_event(
+                    f"rm studies/{paths.study_id}/formal/confirmations/CONF-0001.json"
+                ),
+                "Frozen Confirmation Records may be written only by studyctl confirmation-finalize.",
+            ),
+            (
                 self.direct_file_event(
                     "Edit",
                     f"studies/{paths.study_id}/evidence/EVID-0009.v0001.json".lower(),

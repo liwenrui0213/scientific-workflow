@@ -35,6 +35,7 @@
         "statement": {"type": "string", "minLength": 1, "maxLength": 4096},
         "scope": {"type": ["string", "null"], "maxLength": 4096},
         "state": {"enum": ["proposed", "under_test", "partially_supported", "numerically_supported", "contradicted", "inconclusive"]},
+        "evidence_basis": {"enum": ["none", "exploratory", "confirmatory", "mixed"]},
         "lifecycle": {"enum": ["active", "retired", "superseded"]},
         "superseded_by": {"type": ["string", "null"], "pattern": "^CLAIM-[0-9]{4,}$", "maxLength": 64},
         "supporting_evidence": {"type": "array", "maxItems": 64, "uniqueItems": true, "items": {"$ref": "#/$defs/evidence_ref"}},

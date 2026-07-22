@@ -1,0 +1,249 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/scientific-workflow/confirmation.schema.json",
+  "title": "Finalized frozen confirmatory Run registration",
+  "x-maxCanonicalBytes": 65536,
+  "type": "object",
+  "required": [
+    "schema_version",
+    "study_id",
+    "confirmation_id",
+    "status",
+    "claims",
+    "candidates",
+    "formal_artifacts",
+    "held_out",
+    "analysis_plan",
+    "run_slots",
+    "created_at",
+    "frozen_at",
+    "record_sha256"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "study_id": {"type": "string", "pattern": "^SC-[0-9]{4,}$", "maxLength": 64},
+    "confirmation_id": {"type": "string", "pattern": "^CONF-[0-9]{4,}$", "maxLength": 64},
+    "status": {"const": "finalized"},
+    "claims": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "items": {"$ref": "#/$defs/claim_binding"}
+    },
+    "candidates": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 16,
+      "items": {"$ref": "#/$defs/candidate"}
+    },
+    "formal_artifacts": {
+      "type": "object",
+      "required": ["protocol", "evaluator"],
+      "properties": {
+        "protocol": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/file_binding"}
+          ]
+        },
+        "evaluator": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/file_binding"}
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "held_out": {"$ref": "#/$defs/held_out"},
+    "analysis_plan": {"$ref": "#/$defs/analysis_plan"},
+    "run_slots": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 128,
+      "items": {"$ref": "#/$defs/run_slot"}
+    },
+    "created_at": {"type": "string", "minLength": 1, "maxLength": 64},
+    "frozen_at": {"type": "string", "minLength": 1, "maxLength": 64},
+    "record_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "$defs": {
+    "file_binding": {
+      "type": "object",
+      "required": ["path", "size", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "size": {"type": "integer", "minimum": 0},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "tracked_code_state": {
+      "type": "object",
+      "required": ["available", "commit", "diff_sha256"],
+      "properties": {
+        "available": {"type": "boolean"},
+        "commit": {"type": ["string", "null"], "maxLength": 256},
+        "diff_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "claim_binding": {
+      "type": "object",
+      "required": ["claim_id", "statement", "scope", "spec_sha256"],
+      "properties": {
+        "claim_id": {"type": "string", "pattern": "^CLAIM-[0-9]{4,}$", "maxLength": 64},
+        "statement": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "scope": {"type": ["string", "null"], "maxLength": 4096},
+        "spec_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "candidate": {
+      "type": "object",
+      "required": ["candidate_id", "description", "paths", "bindings", "code_state"],
+      "properties": {
+        "candidate_id": {"type": "string", "pattern": "^CAND-[0-9]{3,}$", "maxLength": 64},
+        "description": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "paths": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "maxLength": 4096}
+        },
+        "bindings": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {"$ref": "#/$defs/file_binding"}
+        },
+        "code_state": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/tracked_code_state"}
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "held_out": {
+      "type": "object",
+      "required": [
+        "status",
+        "description",
+        "paths",
+        "bindings",
+        "workflow_observed_prior_run_count",
+        "workflow_observed_run_high_water_mark",
+        "freshness"
+      ],
+      "properties": {
+        "status": {"enum": ["held_out", "not_held_out", "not_applicable"]},
+        "description": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "paths": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "maxLength": 4096}
+        },
+        "bindings": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {"$ref": "#/$defs/file_binding"}
+        },
+        "workflow_observed_prior_run_count": {"type": "integer", "minimum": 0},
+        "workflow_observed_run_high_water_mark": {"type": "integer", "minimum": 0},
+        "freshness": {"enum": ["fresh", "reused", "unknown", "not_applicable"]}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"status": {"const": "held_out"}}},
+          "then": {
+            "properties": {
+              "paths": {"minItems": 1},
+              "bindings": {"minItems": 1},
+              "freshness": {"enum": ["fresh", "reused"]}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"status": {"const": "not_held_out"}}},
+          "then": {
+            "properties": {"freshness": {"enum": ["unknown", "reused"]}}
+          }
+        },
+        {
+          "if": {"properties": {"status": {"const": "not_applicable"}}},
+          "then": {
+            "properties": {
+              "paths": {"maxItems": 0},
+              "bindings": {"maxItems": 0},
+              "workflow_observed_prior_run_count": {"const": 0},
+              "freshness": {"const": "not_applicable"}
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "analysis_plan": {
+      "type": "object",
+      "required": ["method", "primary_outcomes", "decision_rule", "stopping_rule", "exclusion_rule"],
+      "properties": {
+        "method": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "primary_outcomes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "maxLength": 1024}
+        },
+        "decision_rule": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "stopping_rule": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "exclusion_rule": {"type": "string", "minLength": 1, "maxLength": 4096}
+      },
+      "additionalProperties": false
+    },
+    "run_slot": {
+      "type": "object",
+      "required": [
+        "slot_id",
+        "candidate_id",
+        "argv",
+        "seed",
+        "hardware_class",
+        "precision",
+        "cohort_fields",
+        "input_paths",
+        "input_bindings"
+      ],
+      "properties": {
+        "slot_id": {"type": "string", "pattern": "^SLOT-[0-9]{3,}$", "maxLength": 64},
+        "candidate_id": {"type": "string", "pattern": "^CAND-[0-9]{3,}$", "maxLength": 64},
+        "argv": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "maxLength": 16384}
+        },
+        "seed": {"type": ["integer", "string", "null"], "maxLength": 1024},
+        "hardware_class": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "precision": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "cohort_fields": {"type": "object"},
+        "input_paths": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "maxLength": 4096}
+        },
+        "input_bindings": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {"$ref": "#/$defs/file_binding"}
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

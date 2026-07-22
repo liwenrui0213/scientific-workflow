@@ -9,6 +9,7 @@
     "run_id",
     "purpose",
     "status",
+    "epistemic_role",
     "execution",
     "git",
     "code_state",
@@ -26,11 +27,37 @@
     "integrity"
   ],
   "properties": {
-    "schema_version": {"const": 3},
+    "schema_version": {"const": 4},
     "study_id": {"type": "string", "pattern": "^SC-[0-9]{4,}$"},
     "run_id": {"type": "string", "pattern": "^RUN-[0-9]{6}$"},
     "purpose": {"type": "string", "minLength": 1},
     "status": {"enum": ["succeeded", "failed", "interrupted", "incomplete", "running"]},
+    "epistemic_role": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["mode", "confirmation_id", "confirmation_sha256", "slot_id"],
+          "properties": {
+            "mode": {"const": "exploratory"},
+            "confirmation_id": {"type": "null"},
+            "confirmation_sha256": {"type": "null"},
+            "slot_id": {"type": "null"}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["mode", "confirmation_id", "confirmation_sha256", "slot_id"],
+          "properties": {
+            "mode": {"const": "confirmatory"},
+            "confirmation_id": {"type": "string", "pattern": "^CONF-[0-9]{4,}$", "maxLength": 64},
+            "confirmation_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "slot_id": {"type": "string", "pattern": "^SLOT-[0-9]{3,}$", "maxLength": 64}
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
     "execution": {
       "type": "object",
       "required": [

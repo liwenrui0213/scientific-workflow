@@ -26,7 +26,7 @@ from tools.studyctl.hashing import (
     sha256_json,
 )
 from tools.studyctl.models import ValidationError
-from tools.studyctl.rendering import render_status
+from tools.studyctl.rendering import active_formal_artifacts, render_status
 from tools.studyctl.run_registry import execute_run
 
 
@@ -63,6 +63,24 @@ class BudgetAuthorityViewTests(WorkflowTestCase):
             storage_gb=1,
         )
         self.approve(paths)
+
+    def test_confirmation_records_are_not_active_formal_artifacts(self) -> None:
+        paths = self.initialize_approved_with_claim()
+        method = paths.formal / "METHOD.md"
+        method.write_text("# Method\n\nstatus: active\n", encoding="utf-8")
+        paths.confirmations.mkdir(parents=True, exist_ok=True)
+        confirmation = paths.confirmations / "CONF-0001.json"
+        confirmation.write_text(
+            '{"confirmation_id":"CONF-0001","status":"finalized"}\n',
+            encoding="utf-8",
+        )
+
+        records = active_formal_artifacts(paths)
+
+        self.assertEqual(
+            [record["path"] for record in records],
+            [method.relative_to(paths.root).as_posix()],
+        )
 
     def _write_compaction_plan(self, paths, prepared_path: Path) -> Path:
         prepared = load_json(prepared_path)
@@ -116,11 +134,18 @@ class BudgetAuthorityViewTests(WorkflowTestCase):
             prepared["budget_authority"]["assurance"],
             "authoritative",
         )
+        self.assertEqual(
+            prepared["run_counts_by_epistemic_role"],
+            {"exploratory": 1},
+        )
         self.assertAlmostEqual(
             prepared["budget_totals"]["estimated_cpu_hours"],
             0.75,
             delta=1e-15,
         )
+        status = render_status(paths).read_text(encoding="utf-8")
+        self.assertIn("Exploratory Runs: 1", status)
+        self.assertIn("Confirmatory Runs: 0", status)
 
         prepared_path.unlink()
         self._move_run_registry_out_of_view(paths)
@@ -301,6 +326,7 @@ class BudgetAuthorityViewTests(WorkflowTestCase):
         manifest_path = paths.runs / str(current["run_id"]) / "manifest.json"
         legacy = copy.deepcopy(current)
         legacy["schema_version"] = 1
+        legacy.pop("epistemic_role")
         legacy.pop("change_scope")
         legacy.pop("failure")
         legacy["execution"].pop("cwd_relative")

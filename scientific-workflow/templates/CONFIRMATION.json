@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "study_id": null,
+  "confirmation_id": null,
+  "status": "draft",
+  "claims": [],
+  "candidates": [
+    {
+      "candidate_id": "CAND-001",
+      "description": "",
+      "paths": []
+    }
+  ],
+  "held_out": {
+    "status": "not_held_out",
+    "description": "",
+    "paths": []
+  },
+  "analysis_plan": {
+    "method": "",
+    "primary_outcomes": [],
+    "decision_rule": "",
+    "stopping_rule": "",
+    "exclusion_rule": ""
+  },
+  "run_slots": [
+    {
+      "slot_id": "SLOT-001",
+      "candidate_id": "CAND-001",
+      "argv": [],
+      "seed": null,
+      "hardware_class": "",
+      "precision": "",
+      "cohort_fields": {},
+      "input_paths": []
+    }
+  ],
+  "created_at": null
+}

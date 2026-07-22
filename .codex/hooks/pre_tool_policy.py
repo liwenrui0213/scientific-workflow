@@ -176,6 +176,10 @@ def decide(event: dict[str, Any]) -> str | None:
     validation_pattern = _study_regex(
         study_root, r"formal/VALIDATION\.json(?:\b|$)"
     )
+    confirmation_pattern = _study_regex(
+        study_root,
+        r"formal/confirmations/CONF-[0-9]{4,}\.json(?:\b|$)",
+    )
     if tool_name == "Bash" or "bash" in tool_name.lower():
         if _HUMAN_COMMAND.search(payload):
             return "Codex must not invoke the human-only approve-brief or verdict command."
@@ -190,6 +194,8 @@ def decide(event: dict[str, Any]) -> str | None:
             return "CHANGESET records may be written only by studyctl changeset-new."
         if validation_pattern.search(lowered):
             return "Validation proofs may be written only by studyctl validate-changes."
+        if confirmation_pattern.search(lowered):
+            return "Frozen Confirmation Records may be written only by studyctl confirmation-finalize."
         if run_pattern.search(lowered):
             return "Run manifests are sealed execution records and must not be changed or removed."
         if sequence_pattern.search(lowered) or checkpoint_pattern.search(lowered):
@@ -231,6 +237,12 @@ def decide(event: dict[str, Any]) -> str | None:
             return "CHANGESET records may be written only by studyctl changeset-new."
         if validation_pattern.search(lowered):
             return "Validation proofs may be written only by studyctl validate-changes."
+        if confirmation_pattern.search(lowered) and action in {
+            "add",
+            "update",
+            "delete",
+        }:
+            return "Frozen Confirmation Records may be written only by studyctl confirmation-finalize."
         if run_pattern.search(lowered) and action in {"add", "update", "delete"}:
             return "Run manifests are sealed execution records and must not be changed or removed."
         if (

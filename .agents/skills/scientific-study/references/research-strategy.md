@@ -52,6 +52,14 @@ Select controls according to the proposed mechanism:
 Record both expected and disconfirming outcomes before an expensive Run when
 doing so prevents post-hoc reinterpretation.
 
+Keep ordinary search exploratory. Once exploration has selected a candidate
+and the next purpose is to promote a Claim to high-strength support, stop using
+the explored results as if they were an independent test. Freeze the smallest
+Confirmation Record, reserve new Run slots, and use conditions not already
+consumed by the search when the scientific setting admits a held-out test. A
+confirmation that reuses an observed condition is still auditable but must not
+be described as fresh held-out support.
+
 Promote Runs into Evidence when they answer a named question with eligible,
 reproducible observations and an explicit analysis, scope, uncertainty, and
 limitations. Do not promote every Run merely because it completed, and do not

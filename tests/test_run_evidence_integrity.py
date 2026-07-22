@@ -15,12 +15,18 @@ from tools.studyctl.hashing import (
     atomic_write_json,
     load_json,
     nested_record_digest,
+    record_digest,
     sha256_file,
     sha256_json,
 )
 from tools.studyctl.models import ValidationError, utc_now
 from tools.studyctl.run_registry import execute_run, migrate_legacy_run_ledger
-from tools.studyctl.validation import errors_only, validate_study
+from tools.studyctl.validation import (
+    effective_run_epistemic_mode,
+    errors_only,
+    object_schema_issues,
+    validate_study,
+)
 from tools.studyctl.workspace import evaluate_changes
 
 
@@ -67,17 +73,91 @@ class RunEvidenceIntegrityTests(WorkflowTestCase):
         script.write_text("print(2 + 2)\n", encoding="utf-8")
         return script
 
-    def test_v3_run_with_intact_dependencies_finalizes_evidence(self) -> None:
+    def test_v4_exploratory_run_with_intact_dependencies_finalizes_evidence(self) -> None:
         paths = self.initialize_approved_with_claim()
         manifest = self.successful_run(paths, output=".objects/result.txt")
 
         finalized_path = finalize_evidence(paths, self.populated_draft(paths, manifest))
         finalized = load_json(finalized_path)
 
-        self.assertEqual(manifest["schema_version"], 3)
+        self.assertEqual(manifest["schema_version"], 4)
+        self.assertEqual(
+            manifest["epistemic_role"],
+            {
+                "mode": "exploratory",
+                "confirmation_id": None,
+                "confirmation_sha256": None,
+                "slot_id": None,
+            },
+        )
         self.assertTrue(manifest["change_scope"]["evidence_eligible"])
         self.assertEqual(finalized["status"], "finalized")
         self.assertEqual(errors_only(validate_study(paths)), [])
+
+    def test_frozen_v3_run_projects_only_as_exploratory(self) -> None:
+        paths = self.initialize_approved_with_claim()
+        manifest = self.successful_run(paths)
+        manifest_path = paths.runs / str(manifest["run_id"]) / "manifest.json"
+        legacy = copy.deepcopy(manifest)
+        legacy["schema_version"] = 3
+        legacy.pop("epistemic_role")
+        legacy["integrity"]["manifest_sha256"] = nested_record_digest(
+            legacy,
+            "integrity",
+            "manifest_sha256",
+        )
+
+        self.assertEqual(
+            errors_only(
+                object_schema_issues(paths.root, "run", manifest_path, legacy)
+            ),
+            [],
+        )
+        self.assertEqual(effective_run_epistemic_mode(legacy), "exploratory")
+
+        # Model an intact pre-upgrade repository: the durable ledger binds the
+        # exact historical V3 bytes, so every full-Study V4 integration branch
+        # must accept the Run without manufacturing confirmatory provenance.
+        atomic_write_json(manifest_path, legacy, overwrite=True, mode=0o444)
+        ledger_path = paths.study / "RUNS.ledger.json"
+        ledger = load_json(ledger_path)
+        ledger["runs"][str(legacy["run_id"])]["manifest_sha256"] = sha256_file(
+            manifest_path
+        )
+        ledger["ledger_sha256"] = record_digest(ledger, "ledger_sha256")
+        atomic_write_json(ledger_path, ledger, overwrite=True, mode=0o444)
+        self.assertEqual(errors_only(validate_study(paths)), [])
+
+        forged = copy.deepcopy(legacy)
+        forged["epistemic_role"] = {
+            "mode": "confirmatory",
+            "confirmation_id": "CONF-0001",
+            "confirmation_sha256": "a" * 64,
+            "slot_id": "SLOT-001",
+        }
+        messages = [
+            issue.message
+            for issue in errors_only(
+                object_schema_issues(paths.root, "run", manifest_path, forged)
+            )
+        ]
+        self.assertIn(
+            "$: additional property is not allowed: 'epistemic_role'",
+            messages,
+        )
+        self.assertEqual(effective_run_epistemic_mode(forged), "exploratory")
+
+    def test_full_study_validation_replays_confirmation_integrity(self) -> None:
+        paths = self.initialize_approved_with_claim()
+        paths.confirmations.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(paths.confirmations / "CONF-0001.json", {})
+
+        messages = [issue.message for issue in errors_only(validate_study(paths))]
+
+        self.assertTrue(
+            any("Confirmation study_id does not match" in message for message in messages),
+            messages,
+        )
 
     def test_frozen_pre_budget_v2_run_remains_usable_and_charges_output_bytes(self) -> None:
         paths = self.initialize()
@@ -293,6 +373,7 @@ class RunEvidenceIntegrityTests(WorkflowTestCase):
         manifest_path = paths.runs / str(current["run_id"]) / "manifest.json"
         malformed = copy.deepcopy(current)
         malformed["schema_version"] = 2
+        malformed.pop("epistemic_role")
         malformed["brief"].pop("snapshot")
         malformed["brief"].pop("approval_snapshot")
         malformed["budget"] = {"estimated_cpu_hours": 0.0}
@@ -552,6 +633,7 @@ class RunEvidenceIntegrityTests(WorkflowTestCase):
         manifest_path = paths.runs / str(manifest["run_id"]) / "manifest.json"
         legacy = copy.deepcopy(manifest)
         legacy["schema_version"] = 1
+        legacy.pop("epistemic_role")
         legacy.pop("change_scope")
         legacy.pop("failure")
         legacy["execution"].pop("cwd_relative")

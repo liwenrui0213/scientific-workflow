@@ -179,7 +179,7 @@ def manifest_budget_commitment(manifest: dict[str, Any]) -> dict[str, float]:
     if not isinstance(budget, dict):
         raise ValidationError(f"Run {run_id} has no valid budget record")
 
-    if manifest.get("schema_version") == 3:
+    if manifest.get("schema_version") in {3, 4}:
         status = manifest.get("status")
         if status not in {
             "running",

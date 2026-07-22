@@ -22,6 +22,7 @@ from .hashing import (
 )
 from .models import SCHEMA_VERSION, StudyPaths, ValidationError
 from .rendering import render_review_markdown
+from .run_registry import confirmation_binding, effective_run_mode
 from .validation import (
     brief_approval_issues,
     checkpoint_paths,
@@ -52,6 +53,8 @@ def _claim_refs(claims: dict[str, Any], field: str) -> list[dict[str, Any]]:
 
 MAX_REVIEW_EVIDENCE_PER_ROLE = 128
 MAX_REVIEW_RUN_SOURCES = 512
+MAX_REVIEW_CONFIRMATION_RECORDS = 128
+MAX_REVIEW_CONFIRMATION_ATTEMPTS = 512
 
 
 def _bounded_refs(
@@ -131,6 +134,9 @@ def _evidence_source_index(
                 "version": key[1],
                 "status": item.get("status"),
                 "assessment": item.get("assessment"),
+                "evidence_basis": item.get("evidence_basis", {}).get(
+                    "mode", "exploratory"
+                ),
                 "record_sha256": item.get("record_sha256"),
                 "addressed_claim_ids": item.get("addresses", {}).get(
                     "claim_ids", []
@@ -146,6 +152,9 @@ def _evidence_source_index(
                     "role": role,
                     "status": item.get("status"),
                     "assessment": item.get("assessment"),
+                    "evidence_basis": item.get("evidence_basis", {}).get(
+                        "mode", "exploratory"
+                    ),
                     # Compatibility key: this is deliberately a bounded source
                     # summary, never the authoritative Evidence object.
                     "object": summary,
@@ -178,6 +187,9 @@ def _run_source_index(
                 "path": path.relative_to(paths.root).as_posix(),
                 "sha256": sha256_file(path),
                 "status": manifest.get("status"),
+                "epistemic_role": manifest.get("epistemic_role", {}).get(
+                    "mode", "exploratory"
+                ),
                 "manifest_sha256": manifest.get("integrity", {}).get(
                     "manifest_sha256"
                 ),
@@ -213,6 +225,105 @@ def _run_source_index(
         ),
     }
     return selected, inventory
+
+
+def _confirmation_source_index(
+    paths: StudyPaths,
+    runs: dict[str, tuple[Path, dict[str, Any]]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Index frozen registrations and every workflow-visible confirmatory attempt.
+
+    The selected list is bounded for reviewer context, while the inventory hash
+    commits to the complete set.  Reviewers must use the count and ``truncated``
+    flag instead of treating an omitted locator as a missing attempt.
+    """
+
+    confirmation_sources: list[dict[str, Any]] = []
+    if paths.confirmations.is_dir():
+        for path in sorted(paths.confirmations.glob("CONF-*.json")):
+            value = load_json(path)
+            if not isinstance(value, dict):
+                continue
+            claim_ids = [
+                item.get("claim_id")
+                for item in value.get("claims", [])
+                if isinstance(item, dict)
+            ]
+            slot_ids = [
+                item.get("slot_id")
+                for item in value.get("run_slots", [])
+                if isinstance(item, dict)
+            ]
+            held_out = value.get("held_out")
+            held_out_summary = (
+                {
+                    "status": held_out.get("status"),
+                    "freshness": held_out.get("freshness"),
+                    "description_preview": str(held_out.get("description", ""))[:240],
+                    "path_count": len(held_out.get("paths", [])),
+                    "bindings_sha256": sha256_json(held_out.get("bindings", [])),
+                    "workflow_observed_prior_run_count": held_out.get(
+                        "workflow_observed_prior_run_count"
+                    ),
+                }
+                if isinstance(held_out, dict)
+                else None
+            )
+            confirmation_sources.append(
+                {
+                    "confirmation_id": value.get("confirmation_id"),
+                    "status": value.get("status"),
+                    "record_sha256": value.get("record_sha256"),
+                    "path": path.relative_to(paths.root).as_posix(),
+                    "sha256": sha256_file(path),
+                    "claim_ids": claim_ids,
+                    "planned_slot_count": len(slot_ids),
+                    "planned_slot_ids_sha256": sha256_json(slot_ids),
+                    "analysis_plan_sha256": sha256_json(value.get("analysis_plan")),
+                    "held_out": held_out_summary,
+                }
+            )
+
+    attempts: list[dict[str, Any]] = []
+    for run_id, (path, manifest) in sorted(runs.items()):
+        if effective_run_mode(manifest) != "confirmatory":
+            continue
+        binding = confirmation_binding(manifest)
+        attempts.append(
+            {
+                "run_id": run_id,
+                "status": manifest.get("status"),
+                "path": path.relative_to(paths.root).as_posix(),
+                "sha256": sha256_file(path),
+                "manifest_sha256": manifest.get("integrity", {}).get(
+                    "manifest_sha256"
+                ),
+                "confirmation_id": (
+                    binding.get("confirmation_id") if binding else None
+                ),
+                "confirmation_sha256": (
+                    binding.get("confirmation_sha256") if binding else None
+                ),
+                "slot_id": binding.get("slot_id") if binding else None,
+            }
+        )
+
+    selected_sources = confirmation_sources[:MAX_REVIEW_CONFIRMATION_RECORDS]
+    selected_attempts = attempts[:MAX_REVIEW_CONFIRMATION_ATTEMPTS]
+    return selected_sources, {
+        "confirmation_record_count": len(confirmation_sources),
+        "selected_confirmation_record_count": len(selected_sources),
+        "confirmation_records_truncated": len(selected_sources)
+        != len(confirmation_sources),
+        "confirmation_records_inventory_sha256": sha256_json(
+            confirmation_sources
+        ),
+        "attempts": selected_attempts,
+        "total_attempt_count": len(attempts),
+        "selected_attempt_count": len(selected_attempts),
+        "truncated": len(selected_attempts) != len(attempts),
+        "inventory_sha256": sha256_json(attempts),
+    }
 
 
 def create_review_packet(paths: StudyPaths, base_ref: str | None = None) -> Path:
@@ -280,6 +391,9 @@ def create_review_packet(paths: StudyPaths, base_ref: str | None = None) -> Path
         evidence,
         runs,
         paths,
+    )
+    confirmation_sources, confirmation_attempt_inventory = (
+        _confirmation_source_index(paths, runs)
     )
 
     approval_issues = brief_approval_issues(paths)
@@ -415,6 +529,8 @@ def create_review_packet(paths: StudyPaths, base_ref: str | None = None) -> Path
             item for item in run_sources if "other" in item["roles"]
         ],
         "run_inventory": run_inventory,
+        "confirmation_records": confirmation_sources,
+        "confirmation_attempt_inventory": confirmation_attempt_inventory,
         "cohort_fingerprints": cohort_fingerprints,
         "protected_condition_hash_checks": protected_checks,
         "git_diff_metadata": git,

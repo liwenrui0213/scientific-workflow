@@ -62,6 +62,7 @@ REQUIRED_BRIEF_HEADINGS = (
 SCHEMA_FILES = {
     "run": "run.schema.json",
     "evidence": "evidence.schema.json",
+    "confirmation": "confirmation.schema.json",
     "claims": "claims.schema.json",
     "checkpoint": "checkpoint.schema.json",
     "review": "review.schema.json",
@@ -459,10 +460,16 @@ def object_schema_issues(
                 ValidationIssue("ERROR", str(path), message)
                 for message in v2_messages
             ]
-        # Validate all fields shared by V2/V3 through a transient current view,
-        # adding only fields that did not exist in V2.
+        # Validate all fields shared with the current Run contract through a
+        # transient V4 view, adding only fields that did not exist in V2.
         validation_value = copy.deepcopy(value)
-        validation_value["schema_version"] = 3
+        validation_value["schema_version"] = 4
+        validation_value["epistemic_role"] = {
+            "mode": "exploratory",
+            "confirmation_id": None,
+            "confirmation_sha256": None,
+            "slot_id": None,
+        }
         brief = validation_value["brief"]
         brief["snapshot"] = {
             "path": "<legacy-v2-unattested-brief>",
@@ -517,10 +524,17 @@ def object_schema_issues(
                 for message in v1_messages
             ]
         # V1 manifests are immutable historical records. Validate a transient
-        # V3-shaped view instead of rewriting disk; their synthetic scope stays
-        # deliberately Evidence-ineligible.
+        # V4-shaped view instead of rewriting disk; their synthetic scope stays
+        # deliberately Evidence-ineligible and their epistemic role is
+        # conservatively exploratory.
         validation_value = copy.deepcopy(value)
-        validation_value["schema_version"] = 3
+        validation_value["schema_version"] = 4
+        validation_value["epistemic_role"] = {
+            "mode": "exploratory",
+            "confirmation_id": None,
+            "confirmation_sha256": None,
+            "slot_id": None,
+        }
         execution = validation_value.get("execution")
         if isinstance(execution, dict):
             execution.setdefault("cwd_relative", ".")
@@ -627,6 +641,27 @@ def object_schema_issues(
                     check = legacy_scope.get(stage)
                     if isinstance(check, dict):
                         check.setdefault("validation", None)
+    elif original_run_version == 3:
+        # V3 was the first durable-ledger Run contract, but predates explicit
+        # exploratory/confirmatory provenance.  Its immutable absence of an
+        # epistemic role is always interpreted as exploratory; it can never be
+        # upgraded after the fact merely by changing a label.
+        if "epistemic_role" in value:
+            return [
+                ValidationIssue(
+                    "ERROR",
+                    str(path),
+                    "$: additional property is not allowed: 'epistemic_role'",
+                )
+            ]
+        validation_value = copy.deepcopy(value)
+        validation_value["schema_version"] = 4
+        validation_value["epistemic_role"] = {
+            "mode": "exploratory",
+            "confirmation_id": None,
+            "confirmation_sha256": None,
+            "slot_id": None,
+        }
     return [
         ValidationIssue("ERROR", str(path), message)
         for message in validate_schema_instance(validation_value, schema)
@@ -866,14 +901,14 @@ def run_ledger_issues(
         current = load_ledger(paths)
         if current is None:
             if any(
-                manifest.get("schema_version") == 3
+                manifest.get("schema_version") in {3, 4}
                 for _, manifest in runs.values()
             ):
                 return [
                     ValidationIssue(
                         "ERROR",
                         str(path),
-                        "Run ledger is missing for current V3 Run history",
+                        "Run ledger is missing for current V3/V4 Run history",
                     )
                 ]
             if runs:
@@ -1064,7 +1099,7 @@ def run_index(paths: StudyPaths) -> dict[str, tuple[Path, dict[str, Any]]]:
             raise ValidationError(
                 f"Run {run_id} identity does not match directory {path.parent.name}"
             )
-        if value.get("schema_version") in {1, 2, 3}:
+        if value.get("schema_version") in {1, 2, 3, 4}:
             # Budget registration is a hard authorization boundary. Validate
             # its reservation and terminal digest before any caller can use
             # this index to admit a later Run.
@@ -1206,9 +1241,9 @@ def _run_brief_authority_issues(
     *,
     for_evidence: bool,
 ) -> list[ValidationIssue]:
-    """Verify the immutable Brief and approval that authorized a V3 Run."""
+    """Verify the immutable Brief and approval that authorized a V3/V4 Run."""
 
-    if manifest.get("schema_version") != 3:
+    if manifest.get("schema_version") not in {3, 4}:
         return []
     issues: list[ValidationIssue] = []
     run_id = str(manifest.get("run_id") or "<unknown Run>")
@@ -1400,7 +1435,7 @@ def run_dependency_integrity_issues(
     elif (
         not isinstance(schema_version, int)
         or isinstance(schema_version, bool)
-        or schema_version not in {2, 3}
+        or schema_version not in {2, 3, 4}
     ):
         issues.append(
             ValidationIssue("ERROR", run_id, f"unsupported Run schema_version: {schema_version!r}")
@@ -1415,7 +1450,7 @@ def run_dependency_integrity_issues(
     )
 
     change_scope = manifest.get("change_scope")
-    if isinstance(change_scope, dict) and schema_version in {2, 3}:
+    if isinstance(change_scope, dict) and schema_version in {2, 3, 4}:
         for key, required in (
             ("repository_profile", True),
             ("changeset", False),
@@ -1625,7 +1660,7 @@ def retained_run_output_budget_issues(
 
 
 def sealed_run_evidence_eligible(manifest: dict[str, Any]) -> bool:
-    if manifest.get("schema_version") not in {2, 3}:
+    if manifest.get("schema_version") not in {2, 3, 4}:
         return False
     if manifest.get("status") not in {"succeeded", "failed", "interrupted"}:
         return False
@@ -1651,6 +1686,22 @@ def sealed_run_evidence_eligible(manifest: dict[str, Any]) -> bool:
         )
         is True
     )
+
+
+def effective_run_epistemic_mode(manifest: dict[str, Any]) -> str:
+    """Return the only epistemic mode supported by the immutable Run bytes.
+
+    V1--V3 predate the V4 role binding and are therefore permanently
+    exploratory.  For V4, schema validation is responsible for the exact role
+    shape; this helper still fails conservatively when used on malformed input.
+    """
+
+    if manifest.get("schema_version") != 4:
+        return "exploratory"
+    role = manifest.get("epistemic_role")
+    if isinstance(role, dict) and role.get("mode") == "confirmatory":
+        return "confirmatory"
+    return "exploratory"
 
 
 def _changed_cohort_fields(manifests: list[dict[str, Any]]) -> list[str]:
@@ -1797,7 +1848,7 @@ def _run_issues(paths: StudyPaths) -> tuple[list[ValidationIssue], dict[str, tup
                     )
                 )
             change_scope = manifest.get("change_scope", {})
-            if manifest.get("schema_version") in {2, 3}:
+            if manifest.get("schema_version") in {2, 3, 4}:
                 expected_eligibility = sealed_run_evidence_eligible(manifest)
                 if change_scope.get("evidence_eligible") is not expected_eligibility:
                     issues.append(
@@ -1816,7 +1867,7 @@ def _run_issues(paths: StudyPaths) -> tuple[list[ValidationIssue], dict[str, tup
                     )
                 )
             budget = manifest.get("budget", {})
-            if manifest.get("schema_version") == 3 and isinstance(budget, dict):
+            if manifest.get("schema_version") in {3, 4} and isinstance(budget, dict):
                 try:
                     manifest_budget_commitment(manifest)
                     expected_budget = budget_projection(
@@ -1900,6 +1951,11 @@ def _evidence_issues(
     paths: StudyPaths,
     runs: dict[str, tuple[Path, dict[str, Any]]],
 ) -> tuple[list[ValidationIssue], dict[tuple[str, int], tuple[Path, dict[str, Any]]]]:
+    # Local import avoids the validation/evidence module cycle while ensuring
+    # ordinary full-Study validation replays the same deterministic epistemic
+    # audit used at Evidence finalization.
+    from .evidence import validate_evidence_basis
+
     issues: list[ValidationIssue] = []
     evidence: dict[tuple[str, int], tuple[Path, dict[str, Any]]] = {}
     for path in evidence_paths(paths):
@@ -1907,7 +1963,10 @@ def _evidence_issues(
             item = load_json(path)
             if not isinstance(item, dict):
                 raise ValidationError("Evidence must be an object")
-            issues.extend(object_schema_issues(paths.root, "evidence", path, item))
+            schema_validation = object_schema_issues(
+                paths.root, "evidence", path, item
+            )
+            issues.extend(schema_validation)
             evidence_id = str(item.get("evidence_id", ""))
             version = int(item.get("version", 0))
             require_id("evidence", evidence_id)
@@ -1924,6 +1983,17 @@ def _evidence_issues(
             if key in evidence:
                 issues.append(ValidationIssue("ERROR", str(path), f"duplicate Evidence version {key}"))
             evidence[key] = (path, item)
+            if not errors_only(schema_validation):
+                try:
+                    validate_evidence_basis(paths, item)
+                except (ValidationError, WorkflowError, OSError) as exc:
+                    issues.append(
+                        ValidationIssue(
+                            "ERROR",
+                            str(path),
+                            f"Evidence epistemic basis is invalid: {exc}",
+                        )
+                    )
             actual_fingerprints: set[str] = set()
             referenced_manifests: list[dict[str, Any]] = []
             for run_ref in item.get("runs", []):
@@ -2088,6 +2158,40 @@ def _ref_key(ref: dict[str, Any]) -> tuple[str, int]:
     return str(ref.get("evidence_id")), int(ref.get("version", 0))
 
 
+def _evidence_basis_mode(item: dict[str, Any]) -> str:
+    """Return the conservative epistemic basis of an Evidence record.
+
+    Evidence finalized before this field existed is permanently exploratory;
+    absence is never interpreted as confirmation.
+    """
+
+    basis = item.get("evidence_basis")
+    if isinstance(basis, dict) and basis.get("mode") in {
+        "exploratory",
+        "confirmatory",
+        "mixed",
+    }:
+        return str(basis["mode"])
+    return "exploratory"
+
+
+def _strong_confirmatory_evidence(item: dict[str, Any]) -> bool:
+    basis = item.get("evidence_basis")
+    if not isinstance(basis, dict) or basis.get("mode") not in {
+        "confirmatory",
+        "mixed",
+    }:
+        return False
+    held_out = basis.get("held_out")
+    if not isinstance(held_out, dict):
+        return False
+    status = held_out.get("status")
+    freshness = held_out.get("freshness")
+    return (status == "held_out" and freshness == "fresh") or (
+        status == "not_applicable" and freshness == "not_applicable"
+    )
+
+
 def evidence_sequence_issues(paths: StudyPaths) -> list[ValidationIssue]:
     """Validate the durable Evidence creation high-water authority."""
 
@@ -2238,6 +2342,8 @@ def _claims_issues(
             combined = list(groups.values())
             if any(combined[i] & combined[j] for i in range(3) for j in range(i + 1, 3)):
                 issues.append(ValidationIssue("ERROR", str(paths.claims), f"Claim {claim_id} repeats Evidence across roles"))
+            supporting_basis_modes: list[str] = []
+            has_strong_confirmation = False
             for field, group_name in (
                 ("supporting_evidence", "supporting"),
                 ("contradictory_evidence", "contradictory"),
@@ -2264,6 +2370,12 @@ def _claims_issues(
                                 f"Claim {claim_id} uses Evidence {key} with assessment {assessment!r} as supporting",
                             )
                         )
+                    if group_name == "supporting" and item.get("status") == "finalized":
+                        supporting_basis_modes.append(_evidence_basis_mode(item))
+                        has_strong_confirmation = (
+                            has_strong_confirmation
+                            or _strong_confirmatory_evidence(item)
+                        )
                     if group_name == "contradictory" and assessment not in {
                         "contradicts",
                         "mixed",
@@ -2277,8 +2389,55 @@ def _claims_issues(
                         )
             state = claim.get("state")
             evidence_count = sum(len(group) for group in groups.values())
+            if not supporting_basis_modes:
+                computed_basis = "none"
+            elif set(supporting_basis_modes) == {"exploratory"}:
+                computed_basis = "exploratory"
+            elif set(supporting_basis_modes) == {"confirmatory"}:
+                computed_basis = "confirmatory"
+            else:
+                computed_basis = "mixed"
+            declared_basis = claim.get("evidence_basis")
+            if declared_basis is None:
+                if groups["supporting"]:
+                    issues.append(
+                        ValidationIssue(
+                            "WARNING",
+                            str(paths.claims),
+                            f"Claim {claim_id} predates explicit evidence_basis; "
+                            f"its conservative effective basis is {computed_basis!r}. "
+                            "Record that value on the next semantic Claim update.",
+                        )
+                    )
+            elif declared_basis != computed_basis:
+                issues.append(
+                    ValidationIssue(
+                        "ERROR",
+                        str(paths.claims),
+                        f"Claim {claim_id} evidence_basis {declared_basis!r} does not match supporting Evidence basis {computed_basis!r}",
+                    )
+                )
             if state in {"partially_supported", "numerically_supported"} and not groups["supporting"]:
                 issues.append(ValidationIssue("ERROR", str(paths.claims), f"Claim {claim_id} state {state} requires supporting Evidence"))
+            if state == "partially_supported" and (
+                not isinstance(claim.get("scope"), str)
+                or not str(claim.get("scope")).strip()
+            ):
+                issues.append(
+                    ValidationIssue(
+                        "ERROR",
+                        str(paths.claims),
+                        f"Claim {claim_id} state partially_supported requires an explicit bounded scope",
+                    )
+                )
+            if state == "numerically_supported" and not has_strong_confirmation:
+                issues.append(
+                    ValidationIssue(
+                        "ERROR",
+                        str(paths.claims),
+                        f"Claim {claim_id} state numerically_supported requires fresh held-out or not-applicable confirmatory Evidence",
+                    )
+                )
             if state == "contradicted" and not groups["contradictory"]:
                 issues.append(ValidationIssue("ERROR", str(paths.claims), f"Claim {claim_id} state contradicted requires contradictory Evidence"))
             if state == "inconclusive" and evidence_count == 0:
@@ -3070,6 +3229,9 @@ def _verdict_issues(
 def validate_study(paths: StudyPaths) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
     issues.extend(schema_issues(paths.root))
+    # The Confirmation workflow calls validation primitives, so use a local
+    # import while still replaying its immutable semantic checks here.
+    from .confirmation import confirmation_record_issues, confirmation_run_issues
     from .workspace import changeset_issues, repository_profile_issues
 
     issues.extend(repository_profile_issues(paths.root))
@@ -3081,9 +3243,11 @@ def validate_study(paths: StudyPaths) -> list[ValidationIssue]:
     issues.extend(changeset_issues(paths))
     issues.extend(brief_content_issues(paths))
     issues.extend(brief_approval_issues(paths))
+    issues.extend(confirmation_record_issues(paths))
     run_issues, runs = _run_issues(paths)
     issues.extend(run_issues)
     issues.extend(run_ledger_issues(paths, runs))
+    issues.extend(confirmation_run_issues(paths, runs))
     evidence_issues, evidence = _evidence_issues(paths, runs)
     issues.extend(evidence_issues)
     issues.extend(evidence_sequence_issues(paths))

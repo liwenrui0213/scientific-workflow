@@ -1,6 +1,6 @@
 ---
 name: research-compaction
-description: Compact a long-running scientific Study into finite active context without deleting history. Use when Run and work-note history has grown, the Frontier needs clarification, Claims or Evidence need disciplined updates, representative failures must be preserved, or a new immutable Checkpoint is needed. Do not use for an ordinary status summary or garbage collection.
+description: Compact a scientific Study into finite active context without deleting history. Use when history has grown, the Frontier needs clarification, Claims or Evidence need updates, representative failures need preservation, or a new immutable Checkpoint is needed. Do not use for status summaries or garbage collection.
 ---
 
 # Research Compaction
@@ -28,7 +28,9 @@ Frontier.
 
 1. Update draft or new-version Evidence and Claims without inventing results.
    Preserve decisive support, all contradictions, unique anomalies, and
-   representative failed Runs or failed-direction records. Mark no-longer-current
+   representative failed Runs or failed-direction records. Evidence basis is
+   immutable and Claim basis is recomputed from its supporting Evidence;
+   compaction cannot relabel exploratory or mixed support as confirmatory. Mark no-longer-current
    Claims `retired`, or mark them `superseded` with a new active Claim ID. The
    new Checkpoint seals these lifecycle decisions; never reactivate them after
    that boundary.
@@ -67,6 +69,10 @@ Frontier.
   anomalies, or referenced material.
 - Never treat generated projections as sources of truth or silently widen a
   Claim while summarizing it.
+- Never omit a confirmatory attempt from Confirmation/Evidence accounting or
+  treat an unlisted bounded locator as absent. Never collapse exploratory and
+  confirmatory Evidence into one unlabeled result or override the Claim basis
+  recomputed from its current supporting Evidence.
 - Never change a protected condition or authorized Claim scope through
   compaction. Open the normal human-authorized revision path instead.
 

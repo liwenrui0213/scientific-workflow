@@ -37,6 +37,7 @@ def initialize_study(root: Path, study_id: str, title: str) -> Path:
         raise WorkflowError(f"refusing to overwrite existing study: {study_id}")
     directories = (
         paths.formal,
+        paths.confirmations,
         paths.active_work,
         paths.archived_work,
         paths.runs,
@@ -79,6 +80,25 @@ def _root_from_args(raw: str | None) -> Path:
 
 def _print_json(value: Any) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False))
+
+
+def _parse_seed(value: str) -> int | str | None:
+    """Preserve a frozen seed's JSON scalar type at the CLI boundary.
+
+    Plain non-JSON text remains a string, while ``17`` becomes the integer 17,
+    ``null`` becomes ``None``, and a quoted JSON string can deliberately retain
+    numeric-looking text such as ``"17"``.
+    """
+
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return value
+    if isinstance(parsed, bool) or not isinstance(parsed, (int, str, type(None))):
+        raise argparse.ArgumentTypeError(
+            "seed must be a JSON integer, string, null, or plain string"
+        )
+    return parsed
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -187,9 +207,32 @@ def build_parser() -> argparse.ArgumentParser:
     )
     validate_changes.add_argument("study_id")
 
+    confirmation_new = subparsers.add_parser(
+        "confirmation-new",
+        help="create a small pre-confirmatory-Run Confirmation Record draft",
+    )
+    confirmation_new.add_argument("study_id")
+    confirmation_new.add_argument("--id", dest="confirmation_id", required=True)
+    confirmation_new.add_argument("--claim", action="append", required=True)
+
+    confirmation_finalize = subparsers.add_parser(
+        "confirmation-finalize",
+        help="freeze a Confirmation Record before confirmatory Runs",
+    )
+    confirmation_finalize.add_argument("study_id")
+    confirmation_finalize.add_argument("--file", required=True)
+
     run = subparsers.add_parser("run", help="execute and seal a reproducible Run")
     run.add_argument("study_id")
     run.add_argument("--purpose", required=True)
+    run.add_argument(
+        "--mode",
+        choices=("exploratory", "confirmatory"),
+        default="exploratory",
+        help="epistemic role; exploratory is the default",
+    )
+    run.add_argument("--confirmation")
+    run.add_argument("--slot")
     run.add_argument("--cohort")
     run.add_argument("--estimated-gpu-hours", type=float, default=0.0)
     run.add_argument("--estimated-cpu-hours", type=float, default=0.0)
@@ -202,7 +245,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--changed-path", action="append", default=[])
     run.add_argument("--scientific-critical", action="store_true")
     run.add_argument("--shared-across-runs", action="store_true")
-    run.add_argument("--seed")
+    run.add_argument("--seed", type=_parse_seed)
     run.add_argument("--hardware-class")
     run.add_argument("--precision")
     run.add_argument("--cohort-field", action="append", default=[])
@@ -397,6 +440,9 @@ def dispatch(args: argparse.Namespace) -> int:
             paths,
             argv=command,
             purpose=args.purpose,
+            epistemic_mode=args.mode,
+            confirmation_id=args.confirmation,
+            confirmation_slot=args.slot,
             cohort_id=args.cohort,
             estimated_gpu_hours=args.estimated_gpu_hours,
             estimated_cpu_hours=args.estimated_cpu_hours,
@@ -430,6 +476,22 @@ def dispatch(args: argparse.Namespace) -> int:
         if status in {"incomplete", "running"}:
             return 2
         return 2
+    if name == "confirmation-new":
+        from .confirmation import create_confirmation_draft
+
+        print(
+            create_confirmation_draft(
+                paths,
+                args.confirmation_id,
+                args.claim,
+            )
+        )
+        return 0
+    if name == "confirmation-finalize":
+        from .confirmation import finalize_confirmation
+
+        print(finalize_confirmation(paths, Path(args.file)))
+        return 0
     if name == "evidence-new":
         from .evidence import create_evidence_draft
 

@@ -20,6 +20,17 @@ Work -> Run -> Evidence -> Claim -> human Verdict
 
 `work/active/` is a mutable scratch space. A Run records what actually executed under fixed code, inputs, configuration, environment and Cohort fields. Evidence states an explicit analysis of one or more Runs, including scope, uncertainty, limitations and contradictions. A Claim may reference only a finalized, hash-pinned Evidence version. A Verdict separately judges implementation and scientific Claims.
 
+Runs also have an epistemic role. Every ordinary and legacy Run is
+`exploratory`: it may discover a hypothesis, narrow a candidate, or support an
+`under_test` or carefully scoped `partially_supported` Claim. Exploration does
+not require a Confirmation Record or other preregistration; important
+calculations still run through `studyctl run`. Only when a result is being promoted to the
+high-strength `numerically_supported` state does the workflow require a small
+pre-confirmatory-Run Confirmation Record followed by new `confirmatory` Runs. The record
+freezes the exact Claim statement and scope, selected candidate, protocol,
+evaluator, held-out conditions, analysis rule, and planned Run slots. This is a
+deterministic time-and-hash boundary, not a new human approval gate.
+
 ## Thin Skills, thick protocol
 
 The five repository Skills are intentionally small. Each Skill is a **routing
@@ -423,6 +434,90 @@ Pass every data, configuration, checkpoint, dynamically imported module, or muta
 
 Every retention flag must repeat a declared `--output` path. Use `--pin-output PATH`, `--baseline-output PATH`, or `--unique-anomaly-output PATH` before execution so the sealed manifest carries GC protection; a baseline and unique-anomaly classification are mutually exclusive, while either may also be pinned.
 
+### Confirm only when promoting a strong Claim
+
+Do not pre-register routine exploration. The default command shown above
+creates an exploratory Run. After exploration identifies a candidate worth a
+strong test, use this one-way sequence:
+
+```text
+explore freely
+-> select a candidate and explicit Claim
+-> freeze one minimal Confirmation Record
+-> execute new confirmatory Runs in its planned slots
+-> create confirmatory Evidence
+-> promote the Claim
+```
+
+Create a draft that copies the current Claim statement and scope:
+
+```bash
+python -m tools.studyctl confirmation-new SC-0001 \
+  --id CONF-0001 \
+  --claim CLAIM-0001
+```
+
+Edit only the author-owned fields in the returned draft: candidate descriptions
+and paths; held-out status, rationale, and paths; analysis and decision rules;
+stopping and exclusion rules; and every planned slot. Leave `bindings`, code
+state, formal-artifact bindings, freshness, watermarks, freeze time, and digests
+out of the draft: finalization derives and adds them from live files and
+verified Run history. Do not edit the generated `created_at` or Claim bindings.
+The compact draft is authoring input; `confirmation.schema.json` validates only
+the derived immutable record produced by finalization.
+The conservative draft default is `not_held_out`, so `not_applicable` must be
+chosen explicitly and explained. Active or finalized `PROTOCOL.json` and
+`EVALUATOR.json` are frozen automatically. Then freeze the record before any
+registered slot runs:
+
+Each slot freezes its exact argument vector, candidate ID, seed,
+`hardware_class`, precision, custom Cohort fields, and declared input paths.
+Run flags omitted at execution resolve through repository-policy defaults, and
+those resolved values must still equal the frozen slot.
+
+```bash
+python -m tools.studyctl confirmation-finalize SC-0001 \
+  --file <returned-confirmation-draft>
+```
+
+Freezing is not human approval and does not claim that data is secret. It
+creates an immutable, hash-addressed record of what this repository workflow
+had observed before the confirmatory Runs. If the workflow has already used a
+declared held-out binding, the record marks it reused rather than fresh.
+External access that was not recorded by this repository cannot be proved
+absent and remains a review limitation.
+
+Each confirmatory execution must match one frozen slot exactly:
+
+```bash
+python -m tools.studyctl run SC-0001 \
+  --mode confirmatory \
+  --confirmation CONF-0001 \
+  --slot SLOT-001 \
+  --purpose "Confirm CLAIM-0001 under the frozen protocol" \
+  --cohort COHORT-002 \
+  --input config/confirmatory.json \
+  --output .objects/SC-0001/confirmatory-slot-001.json \
+  --seed 17 \
+  -- python scripts/evaluate.py --config config/confirmatory.json
+```
+
+The Confirmation ID, hash, and slot are written into the initial `running`
+Manifest before the child process starts. A published `running`, succeeded,
+failed, interrupted, or incomplete attempt consumes the slot. A slot cannot be
+retried by hiding a failure; change the design explicitly and freeze a new
+Confirmation Record instead. Exploratory and legacy Runs cannot be edited or
+re-labeled into confirmatory Runs.
+
+Confirmatory Evidence may be authored after results are available, but its
+result-independent fields are recomputed from the frozen record. It must include
+every Evidence-eligible terminal attempt, account for every planned slot, and
+list integrity-ineligible attempts as explicit exclusions. Missing slots,
+omitted eligible attempts, changed Claim scope, stale candidate/protocol/
+evaluator bindings, any changed frozen analysis-plan field, or Runs from multiple
+Confirmation Records prevent finalization. Evidence containing both roles is
+`mixed` and records the exploratory and confirmatory Run IDs separately.
+
 Create an Evidence draft from terminal Runs:
 
 ```bash
@@ -442,6 +537,20 @@ python -m tools.studyctl evidence-finalize SC-0001 \
 
 Update `CLAIMS.json` with the finalized `{evidence_id, version, sha256}` reference. Do not omit contradictory Evidence.
 
+Set the Claim's `evidence_basis` to the basis computed from its supporting
+Evidence. `under_test` and scoped `partially_supported` may rely on exploratory
+or mixed support. `numerically_supported` requires at least one finalized
+Evidence record containing a complete confirmatory component, with a
+workflow-observed fresh held-out
+condition, or an explicit and valid `not_applicable` held-out status. A mixed
+record may satisfy this gate only through its complete confirmatory component;
+its exploratory component adds context but no confirmatory strength.
+
+For `not_applicable`, deterministic validation proves only that the rationale
+was nonblank, frozen before the Runs, and bound to no held-out path. Whether an
+independent condition is genuinely inapplicable is a scientific judgment that
+the independent reviewer must challenge and the human must interpret.
+
 Evidence finalization rejects a Run whose sealed `change_scope.evidence_eligible` is false. A successful scientific command is therefore not enough: its host implementation scope must also be reproducible and governed.
 
 ## Validate and inspect active state
@@ -455,7 +564,7 @@ python -m tools.studyctl context SC-0001
 python -m tools.studyctl status SC-0001
 ```
 
-`profile-validate` checks repository adaptation. `validate-changes` executes and pins the host validation contract. `check-changes` regenerates `generated/CHANGES.json` from Git. `validate` checks schemas, IDs, immutable digests, approval freshness, references, profile/CHANGESET/validation state, actual change scope, Run dependency integrity and eligibility, Cohort compatibility, Checkpoint links, and Verdict structure. `context` regenerates the bounded `generated/ACTIVE_CONTEXT.json` selector; `status` regenerates `generated/STATUS.md`. Generated files are projections and are never authoritative.
+`profile-validate` checks repository adaptation. `validate-changes` executes and pins the host validation contract. `check-changes` regenerates `generated/CHANGES.json` from Git. `validate` checks schemas, IDs, immutable digests, approval freshness, references, profile/CHANGESET/validation state, actual change scope, Confirmation bindings and slot coverage, Run dependency integrity and eligibility, Evidence basis, Claim evidence strength, Cohort compatibility, Checkpoint links, and Verdict structure. `context` regenerates the bounded `generated/ACTIVE_CONTEXT.json` selector; `status` regenerates `generated/STATUS.md`. Generated files are projections and are never authoritative.
 
 ### Bounded active context and automatic compaction pressure
 
@@ -465,7 +574,9 @@ validation, run `studyctl context` and start from
 Frontier-selected Claims and the Frontier itself: IDs, short previews, counts,
 and content hashes rather than full semantic payloads. The approved Brief,
 active formal artifacts, and latest Checkpoint are represented by
-path/hash/size and compact count summaries. Inspect only the authoritative
+path/hash/size and compact count summaries. A separate bounded Confirmation
+index exposes editable drafts, pending/running slots, and records awaiting
+Evidence; resume these locators before creating a new Confirmation. Inspect only the authoritative
 source sections or IDs needed by the current question. Load older Runs,
 Evidence, Checkpoints, retired Claims, or work notes only by an explicit ID or
 question. `STATUS.md` is a bounded human-facing projection, not the default
@@ -581,7 +692,7 @@ python -m tools.studyctl check-changes SC-0001
 python -m tools.studyctl review-packet SC-0001
 ```
 
-The default review base comes from the repository profile; use `--base-ref` only for an explicit one-off override. The packet includes the repository profile and current Git change scope in addition to the scientific artifacts. Start a fresh top-level Codex task for the review, set it to read-only, and invoke the repository `scientific-review` skill. The reviewer must check that the profile fits the host repository, compare the actual diff with `formal/CHANGESET.json`, verify the commit-bound `formal/VALIDATION.json`, confirm that production code/tests occupy their configured roots, and reject Evidence built from ineligible Runs. It must inspect source artifacts and return JSON matching `review.schema.json`; it must not edit code, Claims, Evidence or Verdicts. Save that JSON outside the reviewer session, then deterministically import and render it:
+The default review base comes from the repository profile; use `--base-ref` only for an explicit one-off override. The packet includes the repository profile and current Git change scope in addition to the scientific artifacts. It also includes bounded Confirmation Record and attempt locators plus full counts and inventory hashes. When `confirmation_records_truncated` or attempt `truncated` is true, the reviewer must inspect the referenced source inventory rather than treating unlisted records or attempts as absent. Start a fresh top-level Codex task for the review, set it to read-only, and invoke the repository `scientific-review` skill. The reviewer must check that the profile fits the host repository, compare the actual diff with `formal/CHANGESET.json`, verify the commit-bound `formal/VALIDATION.json`, confirm that production code/tests occupy their configured roots, audit every relevant confirmation attempt, and reject Evidence built from ineligible Runs. It must inspect source artifacts and return JSON matching `review.schema.json`; it must not edit code, Claims, Evidence or Verdicts. Save that JSON outside the reviewer session, then deterministically import and render it:
 
 ```bash
 python -m tools.studyctl review-render SC-0001 --file /path/to/review.json
@@ -603,7 +714,23 @@ Implementation acceptance and scientific acceptance are independent fields. Only
 4. Recreate the recorded Python/runtime, hardware class, precision and selected environment fields.
 5. Execute the recorded `execution.argv` directly as an argument vector, not as a reconstructed shell string. Compare output hashes and inspect `stdout.log` and `stderr.log`.
 
-New Runs use manifest schema V3. Immutable pre-budget V2 Runs keep their earlier Evidence semantics and are also conservatively charged for their declared output bytes; V1 remains historical and Evidence-ineligible because it predates the repository-profile, change-scope, validation-proof, and dependency-integrity contract. Compatibility views never rewrite old Manifest bytes.
+New Runs use manifest schema V4 and require an explicit epistemic role. V1,
+V2, and V3 predate that contract and are permanently interpreted as
+exploratory even if a later copy is decorated with confirmation-looking fields.
+Immutable pre-budget V2 Runs keep their earlier Evidence semantics and are also
+conservatively charged for declared output bytes. V1 remains historical and
+Evidence-ineligible because it predates the repository-profile, change-scope,
+validation-proof, and dependency-integrity contract. V3 retains its original
+ledger and budget semantics. Compatibility views never rewrite old Manifest
+bytes.
+
+Finalized Evidence created before epistemic roles existed remains immutable and
+is interpreted conservatively as exploratory. For a legacy Claim, preserve its
+Evidence references, set `evidence_basis` to the computed conservative basis,
+and change `numerically_supported` to a scoped `partially_supported` state unless
+new Runs under a frozen Confirmation satisfy the strong gate. This semantic
+migration requires scientific judgment; never rewrite or relabel old Run or
+Evidence bytes.
 
 A genuinely pre-ledger Study cannot silently create a new identity namespace.
 After independently checking that its visible V1/V2 history is intact and has
@@ -613,7 +740,7 @@ contiguous IDs beginning at `RUN-000001`, explicitly run:
 python -m tools.studyctl ledger-migrate SC-0001
 ```
 
-The migration rejects V3 Runs, gaps, an empty history, or an existing ledger.
+The migration rejects V3/V4 Runs, gaps, an empty history, or an existing ledger.
 It cannot prove from local files alone that a continuous tail was never deleted
 before migration; use Git, backups, scheduler records, or another external
 append-only anchor to establish that historical premise.

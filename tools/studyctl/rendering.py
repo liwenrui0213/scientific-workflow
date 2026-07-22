@@ -27,6 +27,7 @@ from .run_ledger import (
 )
 from .validation import (
     brief_approval_issues,
+    effective_run_epistemic_mode,
     evidence_index,
     run_index,
     validate_study,
@@ -69,9 +70,13 @@ def active_formal_artifacts(paths: StudyPaths) -> list[dict[str, Any]]:
         if path.is_symlink() or not path.is_file():
             continue
         relative = path.relative_to(paths.formal)
-        if relative.parts and relative.parts[0] == "changeset-history":
-            # Superseded CHANGESET records remain historical provenance, not
-            # active scientific/formal context.
+        if relative.parts and relative.parts[0] in {
+            "changeset-history",
+            "confirmations",
+        }:
+            # Superseded CHANGESETs and finalized Confirmation registrations
+            # remain historical provenance, not globally active formal context.
+            # Confirmation bindings are reached through Runs and Evidence.
             continue
         kind = known.get(path.resolve())
         if kind is None:
@@ -367,6 +372,7 @@ def render_status(paths: StudyPaths) -> Path:
         }
         pressure_error = str(exc)
     selector_error: str | None = None
+    confirmation_projection: dict[str, Any] | None = None
     try:
         if pressure_error is None:
             selector_path, compaction_due_path = refresh_active_projection(
@@ -377,6 +383,17 @@ def render_status(paths: StudyPaths) -> Path:
         else:
             selector_path = write_active_selector(paths, claims_data=claims_data)
             compaction_due_path = paths.generated / "COMPACTION_DUE.json"
+        selector_data = load_json(selector_path)
+        raw_confirmations = (
+            selector_data.get("confirmations")
+            if isinstance(selector_data, dict)
+            else None
+        )
+        if not isinstance(raw_confirmations, dict):
+            raise ValidationError(
+                "ACTIVE_CONTEXT.json lacks the bounded Confirmation index"
+            )
+        confirmation_projection = raw_confirmations
     except (ValidationError, WorkflowError, OSError, ValueError) as exc:
         selector_path = paths.generated / "ACTIVE_CONTEXT.json"
         compaction_due_path = paths.generated / "COMPACTION_DUE.json"
@@ -485,13 +502,19 @@ def render_status(paths: StudyPaths) -> Path:
 
     lines.extend(["", "## Current Claims", ""])
     if claims:
-        lines.extend(["| Claim | Lifecycle | State | Statement |", "|---|---|---|---|"])
+        lines.extend(
+            [
+                "| Claim | Lifecycle | State | Evidence basis | Statement |",
+                "|---|---|---|---|---|",
+            ]
+        )
         for claim in claims:
             statement = str(claim.get("statement", "")).replace("|", "\\|").replace("\n", " ")
             lines.append(
                 f"| `{claim.get('claim_id')}` | "
                 f"`{claim.get('lifecycle', 'active')}` | "
-                f"`{claim.get('state')}` | {statement} |"
+                f"`{claim.get('state')}` | "
+                f"`{claim.get('evidence_basis', 'none')}` | {statement} |"
             )
     else:
         lines.append("No Frontier-selected Claims recorded.")
@@ -506,14 +529,130 @@ def render_status(paths: StudyPaths) -> Path:
         lines.append("")
         lines.append("Active Claim IDs: " + ", ".join(f"`{item}`" for item in frontier["claim_ids"]))
 
+    epistemic_counts: dict[str, int] = {"exploratory": 0, "confirmatory": 0}
+    for _, manifest in runs.values():
+        mode = effective_run_epistemic_mode(manifest)
+        epistemic_counts[mode] = epistemic_counts.get(mode, 0) + 1
+    lines.extend(
+        [
+            "",
+            "## Run Epistemic Roles",
+            "",
+            f"- Exploratory Runs: {epistemic_counts['exploratory']}",
+            f"- Confirmatory Runs: {epistemic_counts['confirmatory']}",
+            "- V1–V3 Runs are conservatively counted as exploratory.",
+        ]
+    )
+
+    lines.extend(["", "## Pending Confirmation Work", ""])
+    if confirmation_projection is None:
+        lines.append("Confirmation locator index is unavailable because active context is invalid.")
+    else:
+        drafts = confirmation_projection["drafts"]
+        pending_confirmations = confirmation_projection["pending_finalized"]
+        in_progress_confirmations = confirmation_projection["in_progress"]
+        awaiting_evidence = confirmation_projection["awaiting_evidence"]
+        history = confirmation_projection["history"]
+        lines.extend(
+            [
+                f"- Editable Confirmation drafts: {drafts['total_count']}",
+                f"- Finalized Confirmation records: {history['total_count']}",
+                f"- Finalized records with pending slots: {history['pending_count']}",
+                f"- Finalized records with running slots: {history['in_progress_count']}",
+                "- Finalized records awaiting Evidence: "
+                f"{history['awaiting_evidence_count']}",
+                f"- Finalized records represented in Evidence: {history['completed_count']}",
+                f"- Full-history inventory SHA-256: `{history['inventory_sha256']}`",
+            ]
+        )
+        for draft in drafts["items"]:
+            lines.append(
+                f"- Draft `{draft['confirmation_id']}`: `{draft['path']}` "
+                f"(SHA-256 `{draft['sha256']}`)"
+            )
+        if drafts["truncated"]:
+            lines.append(
+                f"- Draft locator list truncated to {drafts['selected_count']} of "
+                f"{drafts['total_count']}; inventory SHA-256 "
+                f"`{drafts['inventory_sha256']}`"
+            )
+        for record in pending_confirmations["items"]:
+            slots = record["pending_slot_ids"]
+            visible_slots = ", ".join(f"`{item}`" for item in slots["items"])
+            lines.append(
+                f"- `{record['confirmation_id']}`: {record['pending_slot_count']} "
+                f"pending slot(s) at `{record['path']}`; visible slots: "
+                f"{visible_slots or 'none'}"
+            )
+            if slots["truncated"]:
+                lines.append(
+                    f"  - Slot locator list truncated to {slots['selected_count']} of "
+                    f"{slots['total_count']}; inventory SHA-256 "
+                    f"`{slots['inventory_sha256']}`"
+                )
+        if pending_confirmations["truncated"]:
+            lines.append(
+                "- Pending Confirmation locator list truncated to "
+                f"{pending_confirmations['selected_count']} of "
+                f"{pending_confirmations['total_count']}; inventory SHA-256 "
+                f"`{pending_confirmations['inventory_sha256']}`"
+            )
+        for record in in_progress_confirmations["items"]:
+            running_slots = record["running_slots"]
+            visible = ", ".join(
+                f"`{item['slot_id']}` as `{item['run_id']}` at `{item['path']}`"
+                for item in running_slots["items"]
+            )
+            lines.append(
+                f"- `{record['confirmation_id']}` has "
+                f"{record['running_slot_count']} running slot(s): "
+                f"{visible or 'none visible'}; do not start a replacement Run."
+            )
+            if running_slots["truncated"]:
+                lines.append(
+                    "  - Running-slot locator list truncated to "
+                    f"{running_slots['selected_count']} of "
+                    f"{running_slots['total_count']}; inventory SHA-256 "
+                    f"`{running_slots['inventory_sha256']}`"
+                )
+        for record in awaiting_evidence["items"]:
+            drafts_for_record = record["evidence_drafts"]
+            if drafts_for_record["total_count"]:
+                visible = ", ".join(
+                    f"`{item['evidence_id']}` v{item['version']} at `{item['path']}`"
+                    for item in drafts_for_record["items"]
+                )
+                lines.append(
+                    f"- `{record['confirmation_id']}` has confirmatory Evidence "
+                    f"draft(s) to resume: {visible}."
+                )
+            else:
+                lines.append(
+                    f"- `{record['confirmation_id']}` consumed all planned slots and "
+                    "now awaits a confirmatory Evidence draft."
+                )
+        if in_progress_confirmations["truncated"]:
+            lines.append(
+                "- In-progress Confirmation locator list is truncated; inventory "
+                f"SHA-256 `{in_progress_confirmations['inventory_sha256']}`"
+            )
+        if awaiting_evidence["truncated"]:
+            lines.append(
+                "- Awaiting-Evidence Confirmation locator list is truncated; "
+                f"inventory SHA-256 `{awaiting_evidence['inventory_sha256']}`"
+            )
+        if not pending_confirmations["items"]:
+            lines.append("No finalized Confirmation has an unconsumed Run slot.")
+
     lines.extend(["", "## Recent Decisive Evidence", ""])
     decisive_rows: list[str] = []
     for key in supporting_keys[-10:]:
         record = evidence.get(key)
         if record:
             source, item = record
+            basis = item.get("evidence_basis", {}).get("mode", "exploratory")
             decisive_rows.append(
-                f"`{key[0]}` v{key[1]} — `{item.get('assessment')}` — "
+                f"`{key[0]}` v{key[1]} — `{item.get('assessment')}` / `{basis}` — "
                 f"source: `{source.relative_to(paths.root).as_posix()}` — "
                 f"SHA-256: `{sha256_file(source)}`"
             )
@@ -525,8 +664,9 @@ def render_status(paths: StudyPaths) -> Path:
         record = evidence.get(key)
         if record:
             source, item = record
+            basis = item.get("evidence_basis", {}).get("mode", "exploratory")
             contradictory_rows.append(
-                f"`{key[0]}` v{key[1]} — `{item.get('assessment')}` — "
+                f"`{key[0]}` v{key[1]} — `{item.get('assessment')}` / `{basis}` — "
                 f"source: `{source.relative_to(paths.root).as_posix()}` — "
                 f"SHA-256: `{sha256_file(source)}`"
             )
@@ -538,8 +678,9 @@ def render_status(paths: StudyPaths) -> Path:
         record = evidence.get(key)
         if record:
             source, item = record
+            basis = item.get("evidence_basis", {}).get("mode", "exploratory")
             other_rows.append(
-                f"`{key[0]}` v{key[1]} — `{item.get('assessment')}` — "
+                f"`{key[0]}` v{key[1]} — `{item.get('assessment')}` / `{basis}` — "
                 f"source: `{source.relative_to(paths.root).as_posix()}` — "
                 f"SHA-256: `{sha256_file(source)}`"
             )

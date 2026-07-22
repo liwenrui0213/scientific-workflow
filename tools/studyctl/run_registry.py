@@ -77,7 +77,8 @@ from .workspace import (
 )
 
 
-_RUN_SCHEMA_VERSION = 3
+_RUN_SCHEMA_VERSION = 4
+_EPISTEMIC_ROLE_SCHEMA_VERSIONS = frozenset({4})
 _REPRODUCIBILITY_ENVIRONMENT_KEYS = (
     "CONDA_DEFAULT_ENV",
     "CONDA_PREFIX",
@@ -90,6 +91,97 @@ _REPRODUCIBILITY_ENVIRONMENT_KEYS = (
     "VIRTUAL_ENV",
     "XLA_FLAGS",
 )
+
+
+def effective_run_mode(manifest: dict[str, Any]) -> str:
+    """Return the immutable epistemic mode represented by ``manifest``.
+
+    Run manifests created before epistemic roles became first-class have no
+    ``epistemic_role`` field.  They are permanently interpreted as
+    exploratory; this helper never synthesizes or writes a role back into a
+    historical record.
+    """
+
+    # V1--V3 predate first-class epistemic registration.  Even if a mutable
+    # in-memory copy is decorated with a newer-looking field, its historical
+    # schema version can never be upgraded into confirmatory evidence.
+    schema_version = manifest.get("schema_version")
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version not in _EPISTEMIC_ROLE_SCHEMA_VERSIONS
+    ):
+        return "exploratory"
+    role = manifest.get("epistemic_role")
+    if not isinstance(role, dict):
+        return "exploratory"
+    return "confirmatory" if role.get("mode") == "confirmatory" else "exploratory"
+
+
+def confirmation_binding(manifest: dict[str, Any]) -> dict[str, str] | None:
+    """Return a confirmatory Run's frozen registration binding, if present."""
+
+    if effective_run_mode(manifest) != "confirmatory":
+        return None
+    role = manifest.get("epistemic_role")
+    if not isinstance(role, dict):  # pragma: no cover - guarded above
+        return None
+    binding = {
+        key: role.get(key)
+        for key in ("confirmation_id", "confirmation_sha256", "slot_id")
+    }
+    confirmation_id = binding["confirmation_id"]
+    confirmation_sha256 = binding["confirmation_sha256"]
+    slot_id = binding["slot_id"]
+    if (
+        not isinstance(confirmation_id, str)
+        or re.fullmatch(r"CONF-[0-9]{4,}", confirmation_id) is None
+        or not isinstance(confirmation_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", confirmation_sha256) is None
+        or not isinstance(slot_id, str)
+        or re.fullmatch(r"SLOT-[0-9]{3,}", slot_id) is None
+    ):
+        # Indexed manifests are schema-validated before reaching this helper.
+        # For direct callers, malformed data must never be promoted to a
+        # confirmatory binding.
+        return None
+    return {key: str(value) for key, value in binding.items()}
+
+
+def _exploratory_epistemic_role() -> dict[str, Any]:
+    return {
+        "mode": "exploratory",
+        "confirmation_id": None,
+        "confirmation_sha256": None,
+        "slot_id": None,
+    }
+
+
+def _require_unconsumed_confirmation_slot(
+    existing_runs: dict[str, tuple[Path, dict[str, Any]]],
+    *,
+    confirmation_id: str,
+    slot_id: str,
+) -> None:
+    """Reject every prior visible attempt for one frozen confirmation slot.
+
+    A slot is consumed as soon as its initial running Manifest is published.
+    Consequently successful, failed, interrupted, incomplete, and still
+    running Runs all prevent reuse.
+    """
+
+    for run_id, (_, manifest) in sorted(existing_runs.items()):
+        binding = confirmation_binding(manifest)
+        if binding is None:
+            continue
+        if (
+            binding["confirmation_id"] == confirmation_id
+            and binding["slot_id"] == slot_id
+        ):
+            raise ValidationError(
+                f"confirmation slot {confirmation_id}/{slot_id} is already "
+                f"consumed by {run_id} ({manifest.get('status', 'unknown')})"
+            )
 
 
 def _display_path(path: Path, root: Path) -> str:
@@ -550,8 +642,14 @@ def _capture_formal_artifacts(
         relative = path.relative_to(paths.formal)
         if path.name in {"CHANGESET.json", "VALIDATION.json"} or (
             relative.parts and relative.parts[0] == "changeset-history"
+        ) or (
+            relative.parts and relative.parts[0] == "confirmations"
         ):
-            # These governance records are pinned separately in change_scope.
+            # Change authorities are pinned separately in change_scope.
+            # Confirmation Records are independently immutable and a
+            # confirmatory Run binds exactly one by ID and canonical digest;
+            # copying every historical record into every later Run would add
+            # no authority while causing unbounded snapshot growth.
             continue
         payload = path.read_bytes()
         digest = hashlib.sha256(payload).hexdigest()
@@ -1376,6 +1474,9 @@ def execute_run(
     hardware_class: str | None = None,
     precision: str | None = None,
     cohort_fields: Sequence[str] | None = None,
+    epistemic_mode: str = "exploratory",
+    confirmation_id: str | None = None,
+    confirmation_slot: str | None = None,
 ) -> dict[str, Any]:
     """Execute ``argv`` and atomically seal its immutable Run manifest."""
     if not isinstance(argv, list) or not argv:
@@ -1386,6 +1487,30 @@ def execute_run(
         raise ValidationError("purpose must be a non-empty string")
     if isinstance(seed, bool) or not isinstance(seed, (int, str, type(None))):
         raise ValidationError("seed must be an integer, string, or null")
+    if epistemic_mode not in ("exploratory", "confirmatory"):
+        raise ValidationError(
+            "epistemic_mode must be 'exploratory' or 'confirmatory'"
+        )
+    if epistemic_mode == "exploratory":
+        if confirmation_id is not None or confirmation_slot is not None:
+            raise ValidationError(
+                "exploratory Runs cannot bind a confirmation record or slot"
+            )
+    elif (
+        not isinstance(confirmation_id, str)
+        or not confirmation_id
+        or not isinstance(confirmation_slot, str)
+        or not confirmation_slot
+    ):
+        raise ValidationError(
+            "confirmatory Runs require confirmation_id and confirmation_slot"
+        )
+    else:
+        require_id("confirmation", confirmation_id)
+        if re.fullmatch(r"SLOT-[0-9]{3,}", confirmation_slot) is None:
+            raise ValidationError(
+                f"invalid confirmation slot identifier: {confirmation_slot!r}"
+            )
     declared_changed_paths = list(changed_paths or ())
     if any(not isinstance(path, str) or not path.strip() for path in declared_changed_paths):
         raise ValidationError("changed paths must be non-empty strings")
@@ -1595,6 +1720,54 @@ def execute_run(
             effective_precision,
             runtime_environment,
         )
+        epistemic_role = _exploratory_epistemic_role()
+        if epistemic_mode == "confirmatory":
+            # Import lazily so ordinary exploratory Runs do not depend on the
+            # optional registration path.  The validation itself remains in
+            # this serialized transaction and therefore precedes Run-ID
+            # allocation, Manifest publication, and child-process startup.
+            from .confirmation import validate_confirmation_slot
+
+            assert confirmation_id is not None
+            assert confirmation_slot is not None
+            validated_binding = validate_confirmation_slot(
+                paths,
+                confirmation_id,
+                confirmation_slot,
+                argv=command,
+                seed=seed,
+                hardware_class=effective_hardware,
+                precision=effective_precision,
+                cohort_fields=cohort["fields"],
+                input_paths=input_paths,
+            )
+            if not isinstance(validated_binding, dict):
+                raise WorkflowError(
+                    "confirmation validation did not return a binding"
+                )
+            binding_confirmation_id = validated_binding.get("confirmation_id")
+            binding_sha256 = validated_binding.get("confirmation_sha256")
+            binding_slot_id = validated_binding.get("slot_id")
+            if (
+                binding_confirmation_id != confirmation_id
+                or binding_slot_id != confirmation_slot
+                or not isinstance(binding_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", binding_sha256) is None
+            ):
+                raise WorkflowError(
+                    "confirmation validation returned an inconsistent binding"
+                )
+            _require_unconsumed_confirmation_slot(
+                existing_runs,
+                confirmation_id=confirmation_id,
+                slot_id=confirmation_slot,
+            )
+            epistemic_role = {
+                "mode": "confirmatory",
+                "confirmation_id": confirmation_id,
+                "confirmation_sha256": binding_sha256,
+                "slot_id": confirmation_slot,
+            }
         brief = {
             "path": _display_path(paths.brief, root),
             "sha256": brief_digest,
@@ -1653,6 +1826,7 @@ def execute_run(
             "run_id": run_id,
             "purpose": purpose,
             "status": "running",
+            "epistemic_role": epistemic_role,
             "execution": {
                 "argv": command,
                 "cwd": str(configured_cwd),

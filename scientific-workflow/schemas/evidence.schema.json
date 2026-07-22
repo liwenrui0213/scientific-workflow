@@ -28,12 +28,22 @@
       },
       "additionalProperties": false
     },
-    "runs": {"type": "array", "minItems": 1, "maxItems": 128, "uniqueItems": true, "items": {"$ref": "#/$defs/run_ref"}},
+    "evidence_basis": {"$ref": "#/$defs/evidence_basis"},
+    "runs": {"type": "array", "minItems": 1, "maxItems": 256, "uniqueItems": true, "items": {"$ref": "#/$defs/run_ref"}},
     "analysis": {
       "type": "object",
       "required": ["method", "comparison"],
       "properties": {
         "method": {"type": ["string", "null"], "maxLength": 8192},
+        "primary_outcomes": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "maxLength": 1024}
+        },
+        "decision_rule": {"type": ["string", "null"], "maxLength": 4096},
+        "stopping_rule": {"type": ["string", "null"], "maxLength": 4096},
+        "exclusion_rule": {"type": ["string", "null"], "maxLength": 4096},
         "comparison": {"$ref": "#/$defs/comparison"}
       },
       "additionalProperties": false
@@ -61,6 +71,115 @@
     "record_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"}
   },
   "$defs": {
+    "confirmation_ref": {
+      "type": "object",
+      "required": ["confirmation_id", "sha256"],
+      "properties": {
+        "confirmation_id": {"type": "string", "pattern": "^CONF-[0-9]{4,}$"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "excluded_confirmatory_run": {
+      "type": "object",
+      "required": ["run_id", "manifest_sha256", "slot_id", "reason"],
+      "properties": {
+        "run_id": {"type": "string", "pattern": "^RUN-[0-9]{6}$"},
+        "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "slot_id": {"type": "string", "pattern": "^SLOT-[0-9]{3,}$"},
+        "reason": {"type": "string", "minLength": 1, "maxLength": 2048}
+      },
+      "additionalProperties": false
+    },
+    "held_out_summary": {
+      "type": "object",
+      "required": ["status", "freshness", "workflow_observed_prior_run_count"],
+      "properties": {
+        "status": {"enum": ["held_out", "not_held_out", "not_applicable"]},
+        "freshness": {"enum": ["fresh", "reused", "unknown", "not_applicable"]},
+        "workflow_observed_prior_run_count": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "evidence_basis": {
+      "type": "object",
+      "required": [
+        "mode", "exploratory_run_ids", "confirmatory_run_ids", "confirmation",
+        "planned_slot_ids", "included_slot_ids", "missing_slot_ids",
+        "excluded_confirmatory_runs", "held_out"
+      ],
+      "properties": {
+        "mode": {"enum": ["exploratory", "confirmatory", "mixed"]},
+        "exploratory_run_ids": {
+          "type": "array", "maxItems": 256, "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^RUN-[0-9]{6}$"}
+        },
+        "confirmatory_run_ids": {
+          "type": "array", "maxItems": 256, "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^RUN-[0-9]{6}$"}
+        },
+        "confirmation": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/confirmation_ref"}
+          ]
+        },
+        "planned_slot_ids": {
+          "type": "array", "maxItems": 256, "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^SLOT-[0-9]{3,}$"}
+        },
+        "included_slot_ids": {
+          "type": "array", "maxItems": 256, "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^SLOT-[0-9]{3,}$"}
+        },
+        "missing_slot_ids": {
+          "type": "array", "maxItems": 256, "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^SLOT-[0-9]{3,}$"}
+        },
+        "excluded_confirmatory_runs": {
+          "type": "array", "maxItems": 256, "uniqueItems": true,
+          "items": {"$ref": "#/$defs/excluded_confirmatory_run"}
+        },
+        "held_out": {"$ref": "#/$defs/held_out_summary"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"mode": {"const": "exploratory"}}, "required": ["mode"]},
+          "then": {
+            "properties": {
+              "exploratory_run_ids": {"minItems": 1},
+              "confirmatory_run_ids": {"maxItems": 0},
+              "confirmation": {"type": "null"},
+              "planned_slot_ids": {"maxItems": 0},
+              "included_slot_ids": {"maxItems": 0},
+              "missing_slot_ids": {"maxItems": 0},
+              "excluded_confirmatory_runs": {"maxItems": 0}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"mode": {"const": "confirmatory"}}, "required": ["mode"]},
+          "then": {
+            "properties": {
+              "exploratory_run_ids": {"maxItems": 0},
+              "confirmatory_run_ids": {"minItems": 1},
+              "confirmation": {"$ref": "#/$defs/confirmation_ref"}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"mode": {"const": "mixed"}}, "required": ["mode"]},
+          "then": {
+            "properties": {
+              "exploratory_run_ids": {"minItems": 1},
+              "confirmatory_run_ids": {"minItems": 1},
+              "confirmation": {"$ref": "#/$defs/confirmation_ref"}
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
     "run_ref": {
       "type": "object",
       "required": ["run_id", "manifest_sha256", "role"],
@@ -76,7 +195,7 @@
       "required": ["mode", "cohort_fingerprints", "changed_fields", "compatibility_justification"],
       "properties": {
         "mode": {"enum": ["single_cohort", "compatible_cohorts"]},
-        "cohort_fingerprints": {"type": "array", "minItems": 1, "maxItems": 128, "uniqueItems": true, "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}},
+        "cohort_fingerprints": {"type": "array", "minItems": 1, "maxItems": 256, "uniqueItems": true, "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}},
         "changed_fields": {"type": "array", "maxItems": 64, "uniqueItems": true, "items": {"type": "string", "maxLength": 256}},
         "compatibility_justification": {"type": ["string", "null"], "maxLength": 8192}
       },
@@ -93,5 +212,11 @@
       "additionalProperties": false
     }
   },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "draft"}}, "required": ["status"]},
+      "then": {"required": ["evidence_basis"]}
+    }
+  ],
   "additionalProperties": false
 }

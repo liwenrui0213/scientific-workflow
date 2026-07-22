@@ -55,6 +55,7 @@ from .validation import (
     assert_valid_study,
     authoritative_string_references,
     checkpoint_paths,
+    effective_run_epistemic_mode,
     evidence_index,
     evidence_paths,
     object_schema_issues,
@@ -280,6 +281,13 @@ def _validate_prepared_bindings(
         raise ValidationError("Brief approval changed after compact-prepare")
     if source_hashes.get("claims") != sha256_file(paths.claims):
         raise ValidationError("CLAIMS.json changed after compact-prepare")
+    prepared_confirmations = compaction_state.get("confirmations")
+    current_confirmations = build_active_selector(paths)["confirmations"]
+    if prepared_confirmations != current_confirmations:
+        raise ValidationError(
+            "Confirmation drafts, records, or consumed slots changed after "
+            "compact-prepare"
+        )
     if source_hashes.get("evidence") != current_evidence_inventory_binding(paths):
         raise ValidationError("Evidence set changed after compact-prepare")
     if source_hashes.get("evidence_sequence") != sha256_file(
@@ -565,6 +573,9 @@ def prepare_compaction(paths: StudyPaths) -> Path:
     evidence_run_ids = _evidence_run_ids(evidence)
     claim_evidence = _claim_evidence_keys(claims)
     status_counts = Counter(str(item.get("status")) for _, item in runs.values())
+    epistemic_counts = Counter(
+        effective_run_epistemic_mode(item) for _, item in runs.values()
+    )
     cohort_status: dict[str, Counter[str]] = defaultdict(Counter)
     for _, item in runs.values():
         cohort_record = item.get("cohort", {})
@@ -639,6 +650,7 @@ def prepare_compaction(paths: StudyPaths) -> Path:
         },
         "host_change_scope": host_change_scope,
         "run_counts_by_status": dict(sorted(status_counts.items())),
+        "run_counts_by_epistemic_role": dict(sorted(epistemic_counts.items())),
         "run_counts_by_cohort_and_status": _bounded_index(cohort_records),
         "runs_not_referenced_by_evidence": _bounded_index(unreferenced_runs),
         "evidence_not_referenced_by_claims": _bounded_index(unreferenced_evidence),
@@ -662,6 +674,7 @@ def prepare_compaction(paths: StudyPaths) -> Path:
             "claims_file_sha256": sha256_file(paths.claims),
         },
         "current_frontier": active_selector["frontier"],
+        "confirmations": active_selector["confirmations"],
         "failed_direction_records": _bounded_index(failed_directions),
         "budget_totals": budget_state,
         "budget_authority": budget_authority,

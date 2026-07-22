@@ -41,6 +41,9 @@ PRESSURE_METRICS = (
 
 
 ACTIVE_FORMAL_SOURCE_LIMIT = 8
+CONFIRMATION_SOURCE_LIMIT = 8
+CONFIRMATION_SLOT_LOCATOR_LIMIT = 16
+CONFIRMATION_CLAIM_LOCATOR_LIMIT = 8
 ACTIVE_CONTEXT_TEXT_PREVIEW_BYTES = 256
 ACTIVE_CONTEXT_FRONTIER_ITEM_LIMIT = 8
 ACTIVE_CONTEXT_FILENAME = "ACTIVE_CONTEXT.json"
@@ -235,6 +238,231 @@ def _active_formal_source_index(paths: StudyPaths) -> dict[str, Any]:
     }
 
 
+def _bounded_locator_index(
+    items: list[Any], *, limit: int
+) -> dict[str, Any]:
+    """Return a finite locator prefix committed to the complete inventory."""
+
+    selected = items[:limit]
+    return {
+        "items": selected,
+        "total_count": len(items),
+        "selected_count": len(selected),
+        "truncated": len(selected) != len(items),
+        "inventory_sha256": sha256_json(items),
+    }
+
+
+def _confirmation_source_index(paths: StudyPaths) -> dict[str, Any]:
+    """Index resumable Confirmation work without making it active formal context.
+
+    Finalized records are immutable history.  Their pending slots, running
+    attempts, and open Evidence drafts are selected as resumable work, while
+    bounded locators and complete inventory hashes make truncation explicit.
+    Editable Confirmation drafts are exposed separately so resumption does not
+    create a duplicate draft.
+    """
+
+    # Local imports avoid cycles: validation and run_registry both use active
+    # context helpers during their normal module initialization.
+    from .confirmation import load_final_confirmation
+    from .run_registry import confirmation_binding
+    from .validation import evidence_index, run_index
+
+    attempts: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for run_id, (manifest_path, manifest) in run_index(paths).items():
+        binding = confirmation_binding(manifest)
+        if binding is None:
+            continue
+        key = (
+            binding["confirmation_id"],
+            binding["confirmation_sha256"],
+        )
+        attempts.setdefault(key, []).append(
+            {
+                "slot_id": binding["slot_id"],
+                "run_id": run_id,
+                "status": str(manifest.get("status", "")),
+                "path": manifest_path.relative_to(paths.root).as_posix(),
+                "size": manifest_path.stat().st_size,
+                "sha256": sha256_file(manifest_path),
+            }
+        )
+
+    evidence_counts: dict[tuple[str, str], int] = {}
+    evidence_drafts: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for evidence_path, item in evidence_index(paths).values():
+        basis = item.get("evidence_basis")
+        confirmation = basis.get("confirmation") if isinstance(basis, dict) else None
+        if not isinstance(confirmation, dict):
+            continue
+        confirmation_id = confirmation.get("confirmation_id")
+        record_sha256 = confirmation.get("sha256")
+        if not isinstance(confirmation_id, str) or not isinstance(record_sha256, str):
+            continue
+        key = (confirmation_id, record_sha256)
+        if item.get("status") == "finalized":
+            evidence_counts[key] = evidence_counts.get(key, 0) + 1
+        elif item.get("status") == "draft":
+            evidence_drafts.setdefault(key, []).append(
+                {
+                    "evidence_id": item.get("evidence_id"),
+                    "version": item.get("version"),
+                    "path": evidence_path.relative_to(paths.root).as_posix(),
+                    "size": evidence_path.stat().st_size,
+                    "sha256": sha256_file(evidence_path),
+                }
+            )
+
+    finalized_paths = (
+        sorted(
+            paths.confirmations.glob("CONF-*.json"),
+            key=lambda item: item.name,
+        )
+        if paths.confirmations.is_dir()
+        else []
+    )
+    finalized_ids = {path.stem for path in finalized_paths}
+
+    drafts: list[dict[str, Any]] = []
+    if paths.active_work.is_dir():
+        for path in sorted(
+            paths.active_work.glob("CONF-*.confirmation.draft.json"),
+            key=lambda item: item.name,
+        ):
+            if path.is_symlink() or not path.is_file():
+                continue
+            confirmation_id = path.name.removesuffix(
+                ".confirmation.draft.json"
+            )
+            if confirmation_id in finalized_ids:
+                # Finalization retains the editable source for provenance; it
+                # is no longer resumable once the immutable record exists.
+                continue
+            drafts.append(
+                {
+                    "confirmation_id": confirmation_id,
+                    "path": path.relative_to(paths.root).as_posix(),
+                    "size": path.stat().st_size,
+                    "sha256": sha256_file(path),
+                }
+            )
+
+    history: list[dict[str, Any]] = []
+    pending: list[dict[str, Any]] = []
+    in_progress: list[dict[str, Any]] = []
+    awaiting_evidence: list[dict[str, Any]] = []
+    if finalized_paths:
+        for path in finalized_paths:
+            confirmation_id = path.stem
+            record = load_final_confirmation(paths, confirmation_id)
+            record_sha256 = str(record["record_sha256"])
+            slot_ids = [str(item["slot_id"]) for item in record["run_slots"]]
+            key = (confirmation_id, record_sha256)
+            record_attempts = sorted(
+                attempts.get(key, []),
+                key=lambda item: (str(item["slot_id"]), str(item["run_id"])),
+            )
+            consumed_ids = {
+                str(item["slot_id"]) for item in record_attempts
+            }
+            pending_ids = [slot_id for slot_id in slot_ids if slot_id not in consumed_ids]
+            claim_ids = [str(item["claim_id"]) for item in record["claims"]]
+            finalized_evidence_count = evidence_counts.get(key, 0)
+            draft_evidence = sorted(
+                evidence_drafts.get(key, []),
+                key=lambda item: (str(item["evidence_id"]), int(item["version"])),
+            )
+            running_slots = [
+                item for item in record_attempts if item["status"] == "running"
+            ]
+            has_running_slot = bool(running_slots)
+            history_item = {
+                "confirmation_id": confirmation_id,
+                "path": path.relative_to(paths.root).as_posix(),
+                "size": path.stat().st_size,
+                "sha256": sha256_file(path),
+                "record_sha256": record_sha256,
+                "frozen_at": record.get("frozen_at"),
+                "planned_slot_count": len(slot_ids),
+                "consumed_slot_count": len(slot_ids) - len(pending_ids),
+                "pending_slot_count": len(pending_ids),
+                "running_slot_count": len(running_slots),
+                "finalized_evidence_count": finalized_evidence_count,
+                "draft_evidence_count": len(draft_evidence),
+            }
+            history.append(history_item)
+            action_item = {
+                **history_item,
+                "claim_ids": _bounded_locator_index(
+                    claim_ids,
+                    limit=CONFIRMATION_CLAIM_LOCATOR_LIMIT,
+                ),
+                "evidence_drafts": _bounded_locator_index(
+                    draft_evidence,
+                    limit=CONFIRMATION_SOURCE_LIMIT,
+                ),
+            }
+            if pending_ids:
+                pending.append(
+                    {
+                        **action_item,
+                        "pending_slot_ids": _bounded_locator_index(
+                            pending_ids,
+                            limit=CONFIRMATION_SLOT_LOCATOR_LIMIT,
+                        ),
+                    }
+                )
+            if has_running_slot:
+                in_progress.append(
+                    {
+                        **action_item,
+                        "running_slots": _bounded_locator_index(
+                            running_slots,
+                            limit=CONFIRMATION_SLOT_LOCATOR_LIMIT,
+                        ),
+                    }
+                )
+            if draft_evidence or (
+                not has_running_slot
+                and not pending_ids
+                and finalized_evidence_count == 0
+            ):
+                awaiting_evidence.append(action_item)
+
+    completed_count = sum(
+        int(item["finalized_evidence_count"]) > 0 for item in history
+    )
+    return {
+        "drafts": _bounded_locator_index(
+            drafts,
+            limit=CONFIRMATION_SOURCE_LIMIT,
+        ),
+        "pending_finalized": _bounded_locator_index(
+            pending,
+            limit=CONFIRMATION_SOURCE_LIMIT,
+        ),
+        "in_progress": _bounded_locator_index(
+            in_progress,
+            limit=CONFIRMATION_SOURCE_LIMIT,
+        ),
+        "awaiting_evidence": _bounded_locator_index(
+            awaiting_evidence,
+            limit=CONFIRMATION_SOURCE_LIMIT,
+        ),
+        "history": {
+            **_bounded_locator_index(
+                history,
+                limit=CONFIRMATION_SOURCE_LIMIT,
+            ),
+            "pending_count": len(pending),
+            "in_progress_count": len(in_progress),
+            "awaiting_evidence_count": len(awaiting_evidence),
+            "completed_count": completed_count,
+        },
+    }
+
+
 def _text_preview(
     value: Any, *, byte_limit: int = ACTIVE_CONTEXT_TEXT_PREVIEW_BYTES
 ) -> dict[str, Any]:
@@ -290,6 +518,7 @@ def _claim_selector_ref(claim: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "claim_id": claim.get("claim_id"),
         "state": claim.get("state"),
+        "evidence_basis": claim.get("evidence_basis", "none"),
         "lifecycle": claim_lifecycle(claim),
         "updated_at": claim.get("updated_at"),
         "statement": _text_preview(claim.get("statement")),
@@ -385,6 +614,7 @@ def build_active_selector(
         "frontier": _frontier_selector(frontier),
         "selected_claims": selected_claim_refs,
         "active_formal_artifacts": formal,
+        "confirmations": _confirmation_source_index(paths),
         "latest_checkpoint": checkpoint_summary,
         "selector_sha256": "",
     }

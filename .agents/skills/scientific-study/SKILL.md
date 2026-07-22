@@ -19,14 +19,12 @@ description: Resume an existing approved Claim-to-Evidence Study selected by ID 
    `scientific-workflow/repository-profile.json`. Invoke bootstrap only when
    workflow infrastructure is missing and the user authorizes installation.
 3. Run `studyctl validate` and `studyctl context`, then start from bounded
-   `generated/ACTIVE_CONTEXT.json`. It contains bounded locators for selected
-   active Claims and the Frontier (IDs, short previews, counts, and hashes),
-   plus path/hash/size summaries for the Brief, formal artifacts, and latest
-   Checkpoint. Read only the Brief sections and source artifacts needed by the
-   current question; use targeted heading/ID lookup when a source is large.
-   Open complete `CLAIMS.json` only to validate or update it. Load historical
-   Runs, Evidence, Checkpoints, retired Claims, or notes only for a selected ID
-   or question. `STATUS.md` remains a human-facing projection, not authority.
+   `generated/ACTIVE_CONTEXT.json`. It locates selected active Claims, Frontier, Brief,
+   formal artifacts, Checkpoint, editable Confirmation drafts, pending/running
+   slots, and records awaiting Evidence. Resume those before creating another
+   Confirmation. Read authoritative sources only for the current question or
+   selected ID. Open complete `CLAIMS.json` only to validate or update it.
+   `STATUS.md` is a human-facing projection, not authority.
 4. Repository source, tests, Git state, sealed Runs, finalized Evidence, and
    hash-pinned records establish what happened. Generated views and Agent
    explanations are indexes or hypotheses, never authority.
@@ -65,10 +63,13 @@ rendering.
    `validate-changes` and `check-changes`.
 5. Execute consequential calculations through `studyctl run`. Declare mutable
    or external inputs and all new outputs below `object_root`. A `running` or
-   `incomplete` Run cannot enter Evidence.
-6. Create Evidence only from eligible sealed Runs. Record analysis, result,
-   scope, uncertainty, limitations, assessment, Run roles, and any Cohort
-   compatibility justification; then finalize it.
+   `incomplete` Run cannot enter Evidence. Runs default to exploratory.
+6. Create exploratory Evidence only from eligible sealed Runs. Before setting
+   `numerically_supported`, freeze a minimal Confirmation Record for the Claim,
+   candidate, protocol, evaluator, held-out conditions, analysis, and slots;
+   execute new confirmatory Runs; then finalize Evidence with analysis, result,
+   scope, uncertainty, limitations, assessment, its applicable Run roles, and any Cohort
+   compatibility justification. Do not confirm routine exploration.
 7. Update Claims only with finalized `{evidence_id, version, sha256}` refs and
    preserve contradictions. Current Claims use lifecycle `active`. Remove one
    from the Frontier only by marking it `retired`, or create a replacement ID
@@ -96,6 +97,9 @@ rendering.
   draft explicitly; afterwards use a new Claim ID instead of rewriting history.
 - Numerical success is not proof; implementation acceptance is not scientific
   acceptance. Do not upgrade a Claim beyond finalized Evidence.
+- Never relabel an exploratory or legacy Run as confirmatory. Confirmatory
+  Evidence accounts for every planned slot and visible attempt; mixed Evidence
+  labels both bases.
 
 ## Output and handoff
 
