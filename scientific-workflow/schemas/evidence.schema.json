@@ -7,12 +7,13 @@
   "x-maxCanonicalBytesStatuses": ["draft"],
   "required": [
     "schema_version", "study_id", "evidence_id", "version", "status",
-    "created_at", "updated_at", "addresses", "runs", "analysis", "result",
+    "created_at", "updated_at", "addresses", "evidence_basis", "observation_ref",
+    "runs", "analysis", "result",
     "scope", "uncertainty", "limitations", "inference", "assessment",
     "related_evidence", "record_sha256"
   ],
   "properties": {
-    "schema_version": {"const": 3},
+    "schema_version": {"const": 4},
     "study_id": {"type": "string", "pattern": "^SC-[0-9]{4,}$"},
     "evidence_id": {"type": "string", "pattern": "^EVID-[0-9]{4,}$"},
     "version": {"type": "integer", "minimum": 1},
@@ -23,12 +24,18 @@
       "type": "object",
       "required": ["claim_ids", "question"],
       "properties": {
-        "claim_ids": {"type": "array", "minItems": 1, "maxItems": 64, "uniqueItems": true, "items": {"type": "string", "pattern": "^CLAIM-[0-9]{4,}$"}},
+        "claim_ids": {"type": "array", "minItems": 1, "maxItems": 1, "uniqueItems": true, "items": {"type": "string", "pattern": "^CLAIM-[0-9]{4,}$"}},
         "question": {"type": ["string", "null"], "maxLength": 4096}
       },
       "additionalProperties": false
     },
     "evidence_basis": {"$ref": "#/$defs/evidence_basis"},
+    "observation_ref": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/observation_ref"}
+      ]
+    },
     "runs": {"type": "array", "minItems": 1, "maxItems": 256, "uniqueItems": true, "items": {"$ref": "#/$defs/run_ref"}},
     "analysis": {
       "type": "object",
@@ -108,6 +115,20 @@
     "record_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"}
   },
   "$defs": {
+    "observation_ref": {
+      "type": "object",
+      "required": ["observation_id", "version", "sha256"],
+      "properties": {
+        "observation_id": {
+          "type": "string",
+          "pattern": "^OBS-[0-9]{4,}$",
+          "maxLength": 64
+        },
+        "version": {"type": "integer", "minimum": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
     "confirmation_ref": {
       "type": "object",
       "required": ["confirmation_id", "sha256"],
@@ -333,11 +354,5 @@
       "additionalProperties": false
     }
   },
-  "allOf": [
-    {
-      "if": {"properties": {"status": {"const": "draft"}}, "required": ["status"]},
-      "then": {"required": ["evidence_basis"]}
-    }
-  ],
   "additionalProperties": false
 }

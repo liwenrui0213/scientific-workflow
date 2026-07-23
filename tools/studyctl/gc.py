@@ -89,7 +89,9 @@ def garbage_collection_report(paths: StudyPaths) -> dict[str, Any]:
         run_ids = sorted({item[0] for item in registrations})
         reason: str | None = None
         if any(run_id in protected_run_ids for run_id in run_ids):
-            reason = "Run is referenced by Evidence, Claim, or Verdict"
+            reason = (
+                "Run is referenced by Observation, Evidence, Claim, or Verdict"
+            )
         elif any(item[2].get("pinned") for item in registrations):
             reason = "output is pinned"
         elif any(item[2].get("classification") == "baseline" for item in registrations):

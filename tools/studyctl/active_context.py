@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import hashlib
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -9,6 +10,7 @@ from typing import Any, Mapping
 
 from .checkpoint_sequence import require_checkpoint_sequence
 from .evidence_sequence import require_evidence_sequence
+from .observation_sequence import require_observation_sequence
 from .hashing import (
     atomic_write_bytes,
     atomic_write_json,
@@ -53,27 +55,20 @@ COMPACTION_DUE_FILENAME = "COMPACTION_DUE.json"
 def require_bounded_claims_version(
     claims_data: Mapping[str, Any], *, operation: str
 ) -> None:
-    """Require the bounded current Claims schema for active operations.
-
-    Schema V1 remains readable for historical validation, but its arrays and
-    strings were unbounded.  Treating it as active input would recreate the
-    very context-growth failure this protocol is meant to prevent.
-    """
+    """Fail closed unless active operations receive the current Claims schema."""
 
     version = claims_data.get("schema_version")
     if version != CLAIMS_SCHEMA_VERSION:
         raise ValidationError(
-            f"{operation} requires bounded CLAIMS.json schema_version "
-            f"{CLAIMS_SCHEMA_VERSION}; schema_version {version!r} is "
-            "historical-validation-only and must be semantically compacted "
-            "into a bounded current Claims file before active research resumes"
+            f"unsupported CLAIMS.json schema_version: {version!r}; current "
+            f"schema_version {CLAIMS_SCHEMA_VERSION} is required for {operation}"
         )
 
 
 def claim_lifecycle(claim: Mapping[str, Any]) -> str:
-    """Return the explicit lifecycle, treating legacy Claims as active."""
+    """Return the explicitly declared Claim lifecycle."""
 
-    value = claim.get("lifecycle", "active")
+    value = claim.get("lifecycle")
     return value if isinstance(value, str) else ""
 
 
@@ -530,7 +525,7 @@ def _claim_selector_ref(claim: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "claim_id": claim.get("claim_id"),
         "state": claim.get("state"),
-        "evidence_basis": claim.get("evidence_basis", "none"),
+        "evidence_basis": claim.get("evidence_basis"),
         "lifecycle": claim_lifecycle(claim),
         "updated_at": claim.get("updated_at"),
         "statement": _text_preview(claim.get("statement")),
@@ -560,6 +555,89 @@ def _frontier_selector(frontier: Mapping[str, Any]) -> dict[str, Any]:
         ),
         "sha256": sha256_json(frontier),
     }
+
+
+def _decisive_observation_locators(
+    paths: StudyPaths,
+    selected_claims: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Project only Observations reached through active Claim Evidence."""
+
+    evidence_keys: set[tuple[str, int]] = set()
+    for claim in selected_claims:
+        for field in (
+            "supporting_evidence",
+            "contradictory_evidence",
+            "other_evidence",
+        ):
+            for reference in claim.get(field, []):
+                if isinstance(reference, dict):
+                    evidence_keys.add(
+                        (
+                            str(reference.get("evidence_id", "")),
+                            int(reference.get("version", 0)),
+                        )
+                    )
+    by_observation: dict[tuple[str, int], dict[str, Any]] = {}
+    addressed_by: dict[tuple[str, int], list[str]] = {}
+    for evidence_id, version in sorted(evidence_keys):
+        evidence_path = paths.evidence / f"{evidence_id}.v{version:04d}.json"
+        if not evidence_path.is_file():
+            continue
+        evidence = load_json(evidence_path)
+        if not isinstance(evidence, dict):
+            continue
+        reference = evidence.get("observation_ref")
+        if not isinstance(reference, dict):
+            continue
+        observation_id = str(reference.get("observation_id", ""))
+        observation_version = int(reference.get("version", 0))
+        key = (observation_id, observation_version)
+        observation_path = (
+            paths.observations
+            / f"{observation_id}.v{observation_version:04d}.json"
+        )
+        if not observation_path.is_file():
+            continue
+        observation = load_json(observation_path)
+        if not isinstance(observation, dict):
+            continue
+        primary = observation.get("results", {}).get("primary")
+        primary_text = json.dumps(
+            primary,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        by_observation[key] = {
+            "observation_id": observation_id,
+            "version": observation_version,
+            "path": observation_path.relative_to(paths.root).as_posix(),
+            "size": observation_path.stat().st_size,
+            "sha256": sha256_file(observation_path),
+            "record_sha256": observation.get("record_sha256"),
+            "analysis_fingerprint_sha256": observation.get(
+                "analysis_fingerprint_sha256"
+            ),
+            "promotion_registry": observation.get("promotion", {}).get(
+                "registry"
+            ),
+            "promotion_triggers": observation.get("promotion", {}).get(
+                "triggers", []
+            ),
+            "run_count": len(observation.get("runs", [])),
+            "cohort_count": len(observation.get("cohorts", [])),
+            "preview": _text_preview(primary_text),
+        }
+        addressed_by.setdefault(key, []).append(evidence_id)
+    locators: list[dict[str, Any]] = []
+    for key, locator in sorted(by_observation.items()):
+        locator["addressed_by"] = sorted(set(addressed_by.get(key, [])))
+        locators.append(locator)
+    return _bounded_locator_index(
+        locators,
+        limit=ACTIVE_CONTEXT_FRONTIER_ITEM_LIMIT,
+    )
 
 
 def build_active_selector(
@@ -605,6 +683,9 @@ def build_active_selector(
             "contradictory_evidence_count": len(
                 checkpoint.get("contradictory_evidence", [])
             ),
+            "decisive_observation_count": len(
+                checkpoint.get("decisive_observations", [])
+            ),
         }
 
     selector = {
@@ -625,6 +706,9 @@ def build_active_selector(
         },
         "frontier": _frontier_selector(frontier),
         "selected_claims": selected_claim_refs,
+        "decisive_observations": _decisive_observation_locators(
+            paths, selected_claims
+        ),
         "active_formal_artifacts": formal,
         "confirmations": _confirmation_source_index(paths),
         "latest_checkpoint": checkpoint_summary,
@@ -795,6 +879,22 @@ def _evidence_records(paths: StudyPaths) -> list[dict[str, Any]]:
     return records
 
 
+def _observation_records(paths: StudyPaths) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    if not paths.observations.is_dir():
+        return records
+    for observation_path in sorted(
+        paths.observations.glob("OBS-*.v*.json")
+    ):
+        value = load_json(observation_path)
+        if not isinstance(value, dict):
+            raise ValidationError(
+                f"Observation must be an object: {observation_path}"
+            )
+        records.append(value)
+    return records
+
+
 def _active_work_size(paths: StudyPaths) -> tuple[int, int]:
     count = 0
     size = 0
@@ -809,12 +909,16 @@ def _active_work_size(paths: StudyPaths) -> tuple[int, int]:
 
 
 def pressure_watermarks(
-    *, run_count: int, evidence_high_water_mark: int
+    *,
+    run_count: int,
+    observation_high_water_mark: int,
+    evidence_high_water_mark: int,
 ) -> dict[str, int]:
     """Capture the finite counters reset by a newly finalized Checkpoint."""
 
     return {
         "run_count": run_count,
+        "observation_record_count": observation_high_water_mark,
         "evidence_record_count": evidence_high_water_mark,
     }
 
@@ -870,12 +974,24 @@ def compaction_pressure(
         raise ValidationError(
             "Evidence sequence high_water_mark is below the visible Evidence record count"
         )
+    observation_records = _observation_records(paths)
+    observation_sequence = require_observation_sequence(paths)
+    observation_high_water_mark = int(
+        observation_sequence["high_water_mark"]
+    )
+    if observation_high_water_mark < len(observation_records):
+        raise ValidationError(
+            "Observation sequence high_water_mark is below the visible "
+            "Observation record count"
+        )
     run_watermark = 0
+    observation_watermark = 0
     evidence_watermark = 0
     if checkpoint is not None:
         watermarks = checkpoint.get("active_context_watermarks")
         if isinstance(watermarks, dict):
             raw_run = watermarks.get("run_count", 0)
+            raw_observation = watermarks.get("observation_record_count", 0)
             raw_evidence = watermarks.get("evidence_record_count", 0)
             if (
                 isinstance(raw_run, bool)
@@ -887,6 +1003,16 @@ def compaction_pressure(
                 )
             run_watermark = raw_run
             if (
+                isinstance(raw_observation, bool)
+                or not isinstance(raw_observation, int)
+                or raw_observation < 0
+            ):
+                raise ValidationError(
+                    "latest Checkpoint Observation watermark must be a "
+                    "non-negative integer"
+                )
+            observation_watermark = raw_observation
+            if (
                 isinstance(raw_evidence, bool)
                 or not isinstance(raw_evidence, int)
                 or raw_evidence < 0
@@ -896,16 +1022,9 @@ def compaction_pressure(
                 )
             evidence_watermark = raw_evidence
         else:
-            # A legacy Checkpoint has no authoritative Evidence sequence
-            # baseline.  Zero is conservative: it can overstate pressure but
-            # cannot hide creation history through timestamp reconstruction.
-            legacy_run = checkpoint.get("budget_state", {}).get("run_count", 0)
-            if (
-                isinstance(legacy_run, int)
-                and not isinstance(legacy_run, bool)
-                and legacy_run >= 0
-            ):
-                run_watermark = legacy_run
+            raise ValidationError(
+                "latest Checkpoint active_context_watermarks must be an object"
+            )
     if run_watermark > run_count:
         raise ValidationError(
             "Run ledger high_water_mark is below the latest Checkpoint watermark"
@@ -913,6 +1032,11 @@ def compaction_pressure(
     if evidence_watermark > evidence_high_water_mark:
         raise ValidationError(
             "Evidence sequence high_water_mark is below the latest Checkpoint watermark"
+        )
+    if observation_watermark > observation_high_water_mark:
+        raise ValidationError(
+            "Observation sequence high_water_mark is below the latest "
+            "Checkpoint watermark"
         )
 
     frontier = claims_data.get("frontier", {})
@@ -988,6 +1112,7 @@ def compaction_pressure(
         ),
         "watermarks": {
             "run_count": run_watermark,
+            "observation_record_count": observation_watermark,
             "evidence_record_count": evidence_watermark,
         },
         "metrics": metrics,

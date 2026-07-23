@@ -127,7 +127,7 @@ class SkillContractTests(unittest.TestCase):
                 lowered = description.casefold()
                 for phrase in DESCRIPTION_REQUIREMENTS[skill_name]:
                     self.assertIn(phrase.casefold(), lowered)
-                self.assertRegex(body, rf"(?m)^# (?!#).+\S$")
+                self.assertRegex(body, r"(?m)^# (?!#).+\S$")
 
     def test_every_skill_exposes_inputs_workflow_gates_and_handoff(self) -> None:
         for skill_name in SKILL_NAMES:

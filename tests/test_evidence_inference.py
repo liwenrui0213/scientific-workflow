@@ -94,28 +94,35 @@ class EvidenceInferenceTests(WorkflowTestCase):
                 self.assertEqual(unchanged["status"], "draft")
                 self.assertIsNone(unchanged["record_sha256"])
 
-    def test_legacy_v1_finalized_evidence_remains_valid_but_v1_draft_cannot_bypass(self) -> None:
+    def test_finalized_current_evidence_requires_inference_and_evidence_basis(self) -> None:
         path, item = self.complete_draft()
-        bypass = copy.deepcopy(item)
-        bypass["schema_version"] = 1
-        bypass.pop("inference")
-        atomic_write_json(path, bypass)
-
-        with self.assertRaisesRegex(ValidationError, "inference"):
-            finalize_evidence(self.paths, path)
-
-        upgraded = copy.deepcopy(item)
-        atomic_write_json(path, upgraded)
+        atomic_write_json(path, item)
         finalized = load_json(finalize_evidence(self.paths, path))
-        legacy = copy.deepcopy(finalized)
-        legacy["schema_version"] = 1
-        legacy.pop("inference")
-        legacy["record_sha256"] = record_digest(legacy, "record_sha256")
-        os.chmod(path, 0o644)
-        atomic_write_json(path, legacy)
-        os.chmod(path, 0o444)
 
-        self.assertEqual(errors_only(validate_study(self.paths)), [])
+        for field in ("inference", "evidence_basis"):
+            with self.subTest(missing_field=field):
+                invalid = copy.deepcopy(finalized)
+                self.assertEqual(
+                    invalid["schema_version"],
+                    EVIDENCE_SCHEMA_VERSION,
+                )
+                invalid.pop(field)
+                invalid["record_sha256"] = record_digest(
+                    invalid,
+                    "record_sha256",
+                )
+                os.chmod(path, 0o644)
+                atomic_write_json(path, invalid)
+                os.chmod(path, 0o444)
+
+                messages = [
+                    issue.message
+                    for issue in errors_only(validate_study(self.paths))
+                ]
+                self.assertTrue(
+                    any(field in message for message in messages),
+                    messages,
+                )
 
 
 if __name__ == "__main__":

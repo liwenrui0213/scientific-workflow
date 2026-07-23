@@ -201,7 +201,9 @@ class ConfirmatoryEvidenceTests(WorkflowTestCase):
         self.populate_evidence(draft_path)
         finalized = load_json(finalize_evidence(self.paths, draft_path))
         self.assertEqual(finalized["status"], "finalized")
-        self.assertEqual(effective_evidence_mode({"status": "finalized"}), "exploratory")
+        self.assertEqual(effective_evidence_mode(finalized), "exploratory")
+        with self.assertRaisesRegex(ValidationError, "evidence_basis"):
+            effective_evidence_mode({"status": "finalized"})
 
         self.support_claim(self.paths, finalized)
         claims = load_json(self.paths.claims)
@@ -231,7 +233,7 @@ class ConfirmatoryEvidenceTests(WorkflowTestCase):
             messages,
         )
 
-    def test_missing_legacy_claim_basis_is_conservative_and_migratable(self) -> None:
+    def test_missing_claim_basis_is_rejected(self) -> None:
         run = self.successful_run(self.paths)
         evidence = self.finalized_supporting_evidence(self.paths, [run])
         self.support_claim(self.paths, evidence)
@@ -241,11 +243,10 @@ class ConfirmatoryEvidenceTests(WorkflowTestCase):
 
         issues = validate_study(self.paths)
         messages = [issue.message for issue in issues]
-        self.assertFalse(any(issue.level == "ERROR" for issue in issues), messages)
         self.assertTrue(
             any(
-                issue.level == "WARNING"
-                and "conservative effective basis is 'exploratory'" in issue.message
+                issue.level == "ERROR"
+                and "evidence_basis" in issue.message
                 for issue in issues
             ),
             messages,

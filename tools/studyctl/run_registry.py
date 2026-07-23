@@ -91,6 +91,20 @@ _REPRODUCIBILITY_ENVIRONMENT_KEYS = (
     "VIRTUAL_ENV",
     "XLA_FLAGS",
 )
+_CAPSULE_ENVIRONMENT_KEYS = frozenset(
+    {
+        "CUDA_VISIBLE_DEVICES",
+        "JAX_PLATFORM_NAME",
+        "JAX_PLATFORMS",
+        "LANG",
+        "LC_ALL",
+        "NVIDIA_VISIBLE_DEVICES",
+        "OMP_NUM_THREADS",
+        "PATH",
+        "PYTHONHASHSEED",
+        "XLA_FLAGS",
+    }
+)
 
 
 def effective_run_mode(manifest: dict[str, Any]) -> str:
@@ -1034,6 +1048,108 @@ def _environment_record(
     }
 
 
+def _sandbox_literal(path: Path) -> str:
+    """Quote one canonical path for a macOS sandbox profile."""
+
+    return json.dumps(str(path.resolve(strict=False)))
+
+
+def _capsule_environment(capsule_home: Path) -> dict[str, str]:
+    """Build the complete child environment; do not inherit hidden channels."""
+
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key in _CAPSULE_ENVIRONMENT_KEYS
+    }
+    environment["HOME"] = str(capsule_home)
+    environment["TMPDIR"] = str(capsule_home / "tmp")
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment.setdefault("PATH", os.defpath)
+    return environment
+
+
+def _capsule_command(
+    *,
+    root: Path,
+    configured_cwd: Path,
+    profile: dict[str, Any],
+    command: list[str],
+    inputs: Sequence[tuple[Path, dict[str, Any]]],
+    output_paths: Sequence[str | os.PathLike[str]] | None,
+    capsule_home: Path,
+) -> tuple[list[str], dict[str, str], dict[str, Any]]:
+    """Return an OS-enforced, fail-closed execution boundary.
+
+    macOS Seatbelt is currently the supported backend.  Unsupported hosts fail
+    before starting the scientific command instead of silently degrading to
+    endpoint observation.
+    """
+
+    sandbox = shutil.which("sandbox-exec")
+    if platform.system() != "Darwin" or sandbox is None:
+        raise ValidationError(
+            "sealed Run execution requires a supported isolation backend; "
+            "this host has no macOS sandbox-exec backend"
+        )
+    executable = shutil.which(command[0]) if not Path(command[0]).is_absolute() else command[0]
+    if executable is None:
+        raise ValidationError(f"Run executable is not available: {command[0]!r}")
+
+    read_subpaths = [Path("/System"), Path("/usr/lib"), Path("/dev")]
+    executable_path = Path(executable).resolve(strict=False)
+    runtime_prefix = Path(sys.prefix).resolve(strict=False)
+    read_subpaths.append(runtime_prefix)
+    for raw in profile.get("source_roots", []):
+        read_subpaths.append(_user_path(root, str(raw)))
+    read_literals = [path for path, _ in inputs]
+    for argument in command[1:]:
+        read_literals.extend(_argument_file_candidates(configured_cwd, argument))
+    read_literals.append(executable_path)
+
+    writes = [_user_path(root, raw) for raw in output_paths or ()]
+    profile_lines = [
+        "(version 1)",
+        "(deny default)",
+        "(allow process*)",
+        "(allow signal (target self))",
+        "(allow sysctl-read)",
+        "(allow mach-lookup)",
+        "(allow file-read-metadata)",
+    ]
+    for path in sorted({item.resolve(strict=False) for item in read_subpaths}):
+        profile_lines.append(f"(allow file-read* (subpath {_sandbox_literal(path)}))")
+    for path in sorted({item.resolve(strict=False) for item in read_literals}):
+        profile_lines.append(f"(allow file-read* (literal {_sandbox_literal(path)}))")
+    profile_lines.append(
+        f"(allow file-read* file-write* (subpath {_sandbox_literal(capsule_home)}))"
+    )
+    for path in sorted({item.resolve(strict=False) for item in writes}):
+        profile_lines.append(f"(allow file-read* file-write* (literal {_sandbox_literal(path)}))")
+    sandbox_profile = "\n".join(profile_lines) + "\n"
+    profile_path = capsule_home / "sandbox.sb"
+    atomic_write_bytes(profile_path, sandbox_profile.encode("utf-8"), mode=0o400)
+    environment = _capsule_environment(capsule_home)
+    boundary = {
+        "mode": "sealed",
+        "backend": "macos-seatbelt",
+        "policy_sha256": sha256_bytes(sandbox_profile.encode("utf-8")),
+        "environment_allowlist": sorted(_CAPSULE_ENVIRONMENT_KEYS),
+        "network_access": False,
+        "repository_write_access": False,
+        "declared_inputs_only": True,
+        "declared_outputs_only": True,
+        "read_only_paths": sorted(
+            str(path.resolve(strict=False))
+            for path in {*read_subpaths, *read_literals}
+        ),
+        "writable_paths": sorted(
+            str(path.resolve(strict=False)) for path in writes
+        ),
+    }
+    return [sandbox, "-f", str(profile_path), "--", *command], environment, boundary
+
+
 def _input_records(
     root: Path, raw_paths: Sequence[str | os.PathLike[str]] | None
 ) -> list[tuple[Path, dict[str, Any]]]:
@@ -1477,6 +1593,7 @@ def execute_run(
     epistemic_mode: str = "exploratory",
     confirmation_id: str | None = None,
     confirmation_slot: str | None = None,
+    sealed: bool = True,
 ) -> dict[str, Any]:
     """Execute ``argv`` and atomically seal its immutable Run manifest."""
     if not isinstance(argv, list) or not argv:
@@ -1584,6 +1701,16 @@ def execute_run(
         raise ValidationError(f"formalization gate blocked Run:\n{requirements}")
 
     command = list(argv)
+    if sealed is not True:
+        raise ValidationError(
+            "unsealed Run execution is not accepted: endpoint hashes do not "
+            "establish a complete computation boundary"
+        )
+    capsule_home = Path(tempfile.mkdtemp(prefix="studyctl-capsule-"))
+    (capsule_home / "tmp").mkdir(mode=0o700)
+    sealed_command: list[str] | None = None
+    child_environment: dict[str, str] | None = None
+    execution_boundary: dict[str, Any] | None = None
 
     # Budget check, reservation, Run-ID allocation, and the initial Manifest
     # are one serialized registration transaction.  No child process can
@@ -1713,6 +1840,15 @@ def execute_run(
             runtime_environment,
         )
         inputs = _input_records(root, input_paths)
+        sealed_command, child_environment, execution_boundary = _capsule_command(
+            root=root,
+            configured_cwd=configured_cwd,
+            profile=profile,
+            command=command,
+            inputs=inputs,
+            output_paths=output_paths,
+            capsule_home=capsule_home,
+        )
         git = git_state(root)
         code_state_before = _tracked_state(paths, root)
         environment = _environment_record(
@@ -1837,6 +1973,7 @@ def execute_run(
                 "exit_code": None,
                 "seed": seed,
             },
+            "execution_boundary": execution_boundary,
             "git": git,
             "code_state": {
                 "before": code_state_before,
@@ -2000,6 +2137,7 @@ def execute_run(
                     # A visible reservation is safer than silently reusing
                     # its ID or dropping its conservative budget charge.
                     pass
+            shutil.rmtree(capsule_home, ignore_errors=True)
             raise
 
     exit_code: int | None = None
@@ -2015,9 +2153,12 @@ def execute_run(
             stderr_path
         ) as stderr_log:
             try:
+                assert sealed_command is not None
+                assert child_environment is not None
                 process = subprocess.Popen(
-                    command,
+                    sealed_command,
                     cwd=configured_cwd,
+                    env=child_environment,
                     stdout=stdout_log,
                     stderr=stderr_log,
                     shell=False,
@@ -2089,8 +2230,14 @@ def execute_run(
         formal_artifacts_unchanged = _formal_artifacts_unchanged(
             paths, policy, formal_capture_digest
         )
+        boundary = initial_manifest.get("execution_boundary", {})
         dependencies_evidence_eligible = (
-            all(
+            boundary.get("mode") == "sealed"
+            and boundary.get("declared_inputs_only") is True
+            and boundary.get("repository_write_access") is False
+            and boundary.get("declared_outputs_only") is True
+            and boundary.get("network_access") is False
+            and all(
                 record.get("changed_during_run") is False
                 for record in finalized_inputs
             )
@@ -2243,10 +2390,13 @@ def execute_run(
             # A durable running Manifest still exposes the unfinished Run and
             # keeps its budget reserved until explicit recovery.
             pass
+        shutil.rmtree(capsule_home, ignore_errors=True)
         raise
 
     if interrupted:
+        shutil.rmtree(capsule_home, ignore_errors=True)
         raise RunInterrupted(f"{run_id} was interrupted and sealed")
     if manifest is None:  # pragma: no cover - defensive invariant
         raise WorkflowError(f"{run_id} completed without a terminal manifest")
+    shutil.rmtree(capsule_home, ignore_errors=True)
     return manifest

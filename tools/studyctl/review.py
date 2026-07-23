@@ -22,6 +22,7 @@ from .hashing import (
     sha256_json,
 )
 from .models import SCHEMA_VERSION, StudyPaths, ValidationError
+from .observation_triggers import load_current_registry, registry_path
 from .rendering import render_review_markdown
 from .run_registry import confirmation_binding, effective_run_mode
 from .validation import (
@@ -38,6 +39,14 @@ from .workspace import evaluate_changes, load_repository_profile, profile_summar
 
 def _evidence_key(ref: dict[str, Any]) -> tuple[str, int]:
     return str(ref.get("evidence_id")), int(ref.get("version", 0))
+
+
+def _declared_evidence_mode(item: dict[str, Any]) -> str | None:
+    basis = item.get("evidence_basis")
+    if not isinstance(basis, dict):
+        return None
+    mode = basis.get("mode")
+    return str(mode) if mode in {"exploratory", "confirmatory", "mixed"} else None
 
 
 def _claim_refs(claims: dict[str, Any], field: str) -> list[dict[str, Any]]:
@@ -109,6 +118,9 @@ def _latest_checkpoint_source(paths: StudyPaths) -> dict[str, Any] | None:
         "contradictory_evidence_count": len(
             value.get("contradictory_evidence", [])
         ),
+        "decisive_observation_count": len(
+            value.get("decisive_observations", [])
+        ),
     }
 
 
@@ -144,10 +156,9 @@ def _evidence_source_index(
                 "version": key[1],
                 "status": item.get("status"),
                 "assessment": item.get("assessment"),
-                "evidence_basis": item.get("evidence_basis", {}).get(
-                    "mode", "exploratory"
-                ),
+                "evidence_basis": _declared_evidence_mode(item),
                 "record_sha256": item.get("record_sha256"),
+                "observation_ref": item.get("observation_ref"),
                 "addressed_claim_ids": item.get("addresses", {}).get(
                     "claim_ids", []
                 ),
@@ -176,9 +187,7 @@ def _evidence_source_index(
                     "role": role,
                     "status": item.get("status"),
                     "assessment": item.get("assessment"),
-                    "evidence_basis": item.get("evidence_basis", {}).get(
-                        "mode", "exploratory"
-                    ),
+                    "evidence_basis": _declared_evidence_mode(item),
                     # Compatibility key: this is deliberately a bounded source
                     # summary, never the authoritative Evidence object.
                     "object": summary,
@@ -456,12 +465,6 @@ def create_review_packet(paths: StudyPaths, base_ref: str | None = None) -> Path
         deviations.append(
             f"authoritative Study validation failed with {len(validation_errors)} error(s); no Evidence was labeled decisive"
         )
-    for source in evidence_sources:
-        if source.get("object", {}).get("schema_version") == 1:
-            deviations.append(
-                f"active Evidence {source['evidence_id']} v{source['version']} uses "
-                "legacy schema V1 without the required V2 inference argument"
-            )
     if not git.get("available"):
         deviations.append(str(git.get("deviation") or "Git diff unavailable"))
     if change_scope.get("outcome") != "PASS":
@@ -501,6 +504,10 @@ def create_review_packet(paths: StudyPaths, base_ref: str | None = None) -> Path
     contradictory_run_sources = [
         item for item in run_sources if "contradictory" in item["roles"]
     ]
+    trigger_registry = load_current_registry(paths.root)
+    trigger_registry_path = registry_path(
+        paths.root, int(trigger_registry["registry_version"])
+    )
     packet = {
         "schema_version": SCHEMA_VERSION,
         "study_id": paths.study_id,
@@ -519,6 +526,13 @@ def create_review_packet(paths: StudyPaths, base_ref: str | None = None) -> Path
             "sources"
         ],
         "claims": active_claims_data,
+        "observations": selector["decisive_observations"],
+        "observation_trigger_registry": {
+            "path": trigger_registry_path.relative_to(paths.root).as_posix(),
+            "version": trigger_registry["registry_version"],
+            "sha256": trigger_registry["registry_sha256"],
+            "size": trigger_registry_path.stat().st_size,
+        },
         "evidence": evidence_sources,
         "evidence_inventory": {
             "total_record_count": len(evidence),

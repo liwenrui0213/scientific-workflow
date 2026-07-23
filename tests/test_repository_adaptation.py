@@ -6,9 +6,9 @@ import sys
 import unittest
 
 from tests.helpers import WorkflowTestCase, completed_process
-from tools.studyctl.evidence import create_evidence_draft, finalize_evidence
+from tools.studyctl.evidence import create_evidence_draft
 from tools.studyctl.hashing import atomic_write_json, load_json, sha256_file
-from tools.studyctl.models import ValidationError, errors_only, study_paths
+from tools.studyctl.models import ValidationError, errors_only
 from tools.studyctl.run_registry import execute_run
 from tools.studyctl.workspace import (
     change_state_evidence_eligible,
@@ -16,7 +16,6 @@ from tools.studyctl.workspace import (
     changeset_path,
     create_changeset,
     evaluate_changes,
-    load_repository_profile,
     repository_profile_issues,
     repository_profile_path,
     run_change_validation,

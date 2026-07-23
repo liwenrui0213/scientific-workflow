@@ -251,6 +251,7 @@ class CompactionTests(_CompactionPlanMixin, WorkflowTestCase):
                 "statement": long_statement,
                 "scope": long_scope,
                 "state": "under_test",
+                "evidence_basis": "none",
                 "lifecycle": "active",
                 "supporting_evidence": [],
                 "contradictory_evidence": [],
@@ -828,6 +829,17 @@ class ReviewTests(_CompactionPlanMixin, WorkflowTestCase):
         self.assertEqual(packet["brief"]["approval"]["brief"]["sha256"], sha256_file(paths.brief))
         self.assertEqual(packet["decisive_evidence"], [evidence_ref])
         self.assertEqual(packet["contradictory_evidence"], [])
+        trigger_registry = packet["observation_trigger_registry"]
+        trigger_registry_path = paths.root / trigger_registry["path"]
+        self.assertEqual(trigger_registry["version"], 1)
+        self.assertEqual(
+            trigger_registry["sha256"],
+            load_json(trigger_registry_path)["registry_sha256"],
+        )
+        self.assertEqual(
+            trigger_registry["size"],
+            trigger_registry_path.stat().st_size,
+        )
         self.assertEqual(packet["evidence"][0]["object"]["record_sha256"], evidence["record_sha256"])
         self.assertEqual(packet["decisive_run_manifests"][0]["run_id"], manifest["run_id"])
         self.assertEqual(

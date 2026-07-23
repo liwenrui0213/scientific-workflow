@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from collections import defaultdict
 import copy
 import json
 import os
 from pathlib import Path
 import re
 import stat
-from typing import Any, Iterable, Iterator
+from typing import Any, Iterator
 
 from .active_context import CLAIM_LIFECYCLES, claim_lifecycle
 from .budget import (
@@ -23,6 +22,10 @@ from .evidence_sequence import (
     evidence_sequence_temporary_paths,
     load_evidence_sequence,
 )
+from .observation_sequence import (
+    load_observation_sequence,
+    observation_sequence_temporary_paths,
+)
 from .hashing import (
     canonical_json_bytes,
     load_json,
@@ -36,6 +39,7 @@ from .models import (
     CLAIMS_SCHEMA_VERSION,
     CLAIM_STATES,
     EVIDENCE_SCHEMA_VERSION,
+    OBSERVATION_SCHEMA_VERSION,
     ID_PATTERNS,
     StudyPaths,
     ValidationError,
@@ -62,6 +66,7 @@ REQUIRED_BRIEF_HEADINGS = (
 
 SCHEMA_FILES = {
     "run": "run.schema.json",
+    "observation": "observation.schema.json",
     "evidence": "evidence.schema.json",
     "confirmation": "confirmation.schema.json",
     "claims": "claims.schema.json",
@@ -75,24 +80,11 @@ SCHEMA_FILES = {
     "change_validation": "change-validation.schema.json",
 }
 
-VERSIONED_SCHEMA_FILES = {
-    "evidence": {
-        1: "evidence-v1.schema.json",
-        EVIDENCE_SCHEMA_VERSION: SCHEMA_FILES["evidence"],
-    },
-    "claims": {
-        1: "claims-v1.schema.json",
-        CLAIMS_SCHEMA_VERSION: SCHEMA_FILES["claims"],
-    },
-    "checkpoint": {
-        1: "checkpoint-v1.schema.json",
-        CHECKPOINT_SCHEMA_VERSION: SCHEMA_FILES["checkpoint"],
-    },
-}
-
-CHECKPOINT_CLAIMS_SCHEMA_VERSIONS = {
-    1: 1,
-    CHECKPOINT_SCHEMA_VERSION: CLAIMS_SCHEMA_VERSION,
+CURRENT_ARTIFACT_SCHEMA_VERSIONS = {
+    "observation": OBSERVATION_SCHEMA_VERSION,
+    "evidence": EVIDENCE_SCHEMA_VERSION,
+    "claims": CLAIMS_SCHEMA_VERSION,
+    "checkpoint": CHECKPOINT_SCHEMA_VERSION,
 }
 
 _RUN_V2_TOP_LEVEL_KEYS = {
@@ -215,28 +207,16 @@ def _run_v1_shape_messages(value: dict[str, Any]) -> list[str]:
     ]
 
 
-def schema_path(root: Path, name: str, *, version: int | None = None) -> Path:
-    if version is None:
-        try:
-            filename = SCHEMA_FILES[name]
-        except KeyError as exc:
-            raise ValidationError(f"unknown schema: {name}") from exc
-    else:
-        versions = VERSIONED_SCHEMA_FILES.get(name)
-        if versions is None:
-            raise ValidationError(f"schema {name} does not support version selection")
-        filename = versions.get(version)
-        if filename is None:
-            raise ValidationError(
-                f"unsupported {name} schema_version: {version!r}"
-            )
+def schema_path(root: Path, name: str) -> Path:
+    try:
+        filename = SCHEMA_FILES[name]
+    except KeyError as exc:
+        raise ValidationError(f"unknown schema: {name}") from exc
     return root / "scientific-workflow" / "schemas" / filename
 
 
-def load_schema(
-    root: Path, name: str, *, version: int | None = None
-) -> dict[str, Any]:
-    value = load_json(schema_path(root, name, version=version))
+def load_schema(root: Path, name: str) -> dict[str, Any]:
+    value = load_json(schema_path(root, name))
     if not isinstance(value, dict):
         raise ValidationError(f"schema {name} is not an object")
     return value
@@ -446,19 +426,10 @@ def validate_schema_instance(
 
 def schema_issues(root: Path) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
-    schema_variants: list[tuple[str, str, int | None]] = [
-        (name, filename, None) for name, filename in SCHEMA_FILES.items()
-    ]
-    schema_variants.extend(
-        (name, filename, version)
-        for name, versions in VERSIONED_SCHEMA_FILES.items()
-        for version, filename in versions.items()
-        if filename != SCHEMA_FILES[name]
-    )
-    for name, filename, version in schema_variants:
+    for name, filename in SCHEMA_FILES.items():
         path = root / "scientific-workflow" / "schemas" / filename
         try:
-            schema = load_schema(root, name, version=version)
+            schema = load_schema(root, name)
             if schema.get("$schema") != "https://json-schema.org/draft/2020-12/schema":
                 issues.append(ValidationIssue("ERROR", str(path), "unexpected or missing $schema"))
             for ref in _walk_values(schema):
@@ -483,23 +454,29 @@ def _walk_values(value: Any) -> Iterator[Any]:
 def object_schema_issues(
     root: Path, name: str, path: Path, value: Any
 ) -> list[ValidationIssue]:
-    if name in VERSIONED_SCHEMA_FILES:
+    current_version = CURRENT_ARTIFACT_SCHEMA_VERSIONS.get(name)
+    if current_version is not None:
         raw_version = value.get("schema_version") if isinstance(value, dict) else None
         if (
             isinstance(raw_version, bool)
             or not isinstance(raw_version, int)
-            or raw_version not in VERSIONED_SCHEMA_FILES[name]
+            or raw_version != current_version
         ):
+            display_name = {
+                "claims": "Claims",
+                "observation": "Observation",
+                "evidence": "Evidence",
+                "checkpoint": "Checkpoint",
+            }[name]
             return [
                 ValidationIssue(
                     "ERROR",
                     str(path),
-                    f"unsupported {name} schema_version: {raw_version!r}",
+                    f"unsupported {display_name} schema_version: {raw_version!r}; "
+                    f"current schema_version {current_version} is required",
                 )
             ]
-        schema = load_schema(root, name, version=raw_version)
-    else:
-        schema = load_schema(root, name)
+    schema = load_schema(root, name)
     validation_value = value
     original_run_version = (
         value.get("schema_version")
@@ -848,10 +825,6 @@ def brief_approval_issues(paths: StudyPaths) -> list[ValidationIssue]:
     return issues
 
 
-def brief_is_fresh(paths: StudyPaths) -> bool:
-    return not errors_only(brief_content_issues(paths) + brief_approval_issues(paths))
-
-
 def run_manifest_paths(paths: StudyPaths) -> list[Path]:
     if not paths.runs.is_dir():
         return []
@@ -1035,6 +1008,12 @@ def evidence_paths(paths: StudyPaths) -> list[Path]:
     if not paths.evidence.is_dir():
         return []
     return sorted(paths.evidence.glob("EVID-*.v*.json"))
+
+
+def observation_paths(paths: StudyPaths) -> list[Path]:
+    if not paths.observations.is_dir():
+        return []
+    return sorted(paths.observations.glob("OBS-*.v*.json"))
 
 
 def checkpoint_paths(paths: StudyPaths) -> list[Path]:
@@ -1720,8 +1699,15 @@ def sealed_run_evidence_eligible(manifest: dict[str, Any]) -> bool:
     from .workspace import change_state_evidence_eligible
 
     change_scope = manifest.get("change_scope", {})
+    boundary = manifest.get("execution_boundary", {})
     return (
         isinstance(change_scope, dict)
+        and isinstance(boundary, dict)
+        and boundary.get("mode") == "sealed"
+        and boundary.get("declared_inputs_only") is True
+        and boundary.get("repository_write_access") is False
+        and boundary.get("declared_outputs_only") is True
+        and boundary.get("network_access") is False
         and change_state_evidence_eligible(change_scope.get("before", {}))
         and change_state_evidence_eligible(change_scope.get("after", {}))
         and all(
@@ -2000,6 +1986,197 @@ def _run_issues(paths: StudyPaths) -> tuple[list[ValidationIssue], dict[str, tup
     return issues, runs
 
 
+def _observation_issues(
+    paths: StudyPaths,
+) -> tuple[
+    list[ValidationIssue],
+    dict[tuple[str, int], tuple[Path, dict[str, Any]]],
+]:
+    """Validate optional Observation records without making them mandatory."""
+
+    from .observation import (
+        analysis_fingerprint,
+        validate_observation_content,
+    )
+
+    issues: list[ValidationIssue] = []
+    observations: dict[
+        tuple[str, int], tuple[Path, dict[str, Any]]
+    ] = {}
+    fingerprints: dict[str, str] = {}
+    for path in observation_paths(paths):
+        try:
+            item = load_json(path)
+            if not isinstance(item, dict):
+                raise ValidationError("Observation must be an object")
+            schema_validation = object_schema_issues(
+                paths.root, "observation", path, item
+            )
+            issues.extend(schema_validation)
+            observation_id = str(item.get("observation_id", ""))
+            version = int(item.get("version", 0))
+            require_id("observation", observation_id)
+            expected_name = f"{observation_id}.v{version:04d}.json"
+            if path.name != expected_name:
+                issues.append(
+                    ValidationIssue(
+                        "ERROR", str(path), f"expected filename {expected_name}"
+                    )
+                )
+            key = (observation_id, version)
+            if key in observations:
+                issues.append(
+                    ValidationIssue(
+                        "ERROR", str(path), f"duplicate Observation version {key}"
+                    )
+                )
+            observations[key] = (path, item)
+            if item.get("study_id") != paths.study_id:
+                issues.append(
+                    ValidationIssue(
+                        "ERROR",
+                        str(path),
+                        "Observation study_id does not match Study directory",
+                    )
+                )
+            if not errors_only(schema_validation):
+                try:
+                    validate_observation_content(
+                        paths,
+                        item,
+                        require_finalized=item.get("status") == "finalized",
+                    )
+                except (ValidationError, WorkflowError, OSError) as exc:
+                    issues.append(
+                        ValidationIssue(
+                            "ERROR",
+                            str(path),
+                            f"Observation source or analysis is invalid: {exc}",
+                        )
+                    )
+            if item.get("status") == "finalized":
+                expected_fingerprint = analysis_fingerprint(item)
+                actual_fingerprint = item.get("analysis_fingerprint_sha256")
+                if actual_fingerprint != expected_fingerprint:
+                    issues.append(
+                        ValidationIssue(
+                            "ERROR",
+                            str(path),
+                            "Observation analysis_fingerprint_sha256 does not match",
+                        )
+                    )
+                if item.get("record_sha256") != record_digest(
+                    item, "record_sha256"
+                ):
+                    issues.append(
+                        ValidationIssue(
+                            "ERROR",
+                            str(path),
+                            "Observation record_sha256 does not match",
+                        )
+                    )
+                previous_id = fingerprints.setdefault(
+                    str(actual_fingerprint), observation_id
+                )
+                if previous_id != observation_id:
+                    issues.append(
+                        ValidationIssue(
+                            "ERROR",
+                            str(path),
+                            "duplicate Observation analysis fingerprint already "
+                            f"exists under {previous_id}",
+                        )
+                    )
+            elif (
+                item.get("record_sha256") is not None
+                or item.get("analysis_fingerprint_sha256") is not None
+            ):
+                issues.append(
+                    ValidationIssue(
+                        "ERROR",
+                        str(path),
+                        "draft Observation must not be sealed",
+                    )
+                )
+        except (ValidationError, OSError, ValueError) as exc:
+            issues.append(ValidationIssue("ERROR", str(path), str(exc)))
+    return issues, observations
+
+
+def observation_sequence_issues(paths: StudyPaths) -> list[ValidationIssue]:
+    """Validate the durable Observation creation high-water authority."""
+
+    issues = [
+        ValidationIssue(
+            "ERROR",
+            str(path),
+            "unfinished Observation-sequence temporary file is present",
+        )
+        for path in observation_sequence_temporary_paths(paths)
+    ]
+    try:
+        sequence = load_observation_sequence(paths)
+        if sequence is None:
+            issues.append(
+                ValidationIssue(
+                    "ERROR",
+                    str(paths.observation_sequence),
+                    "Observation sequence is missing; creation history cannot be verified",
+                )
+            )
+            return issues
+        if int(sequence["high_water_mark"]) < len(observation_paths(paths)):
+            issues.append(
+                ValidationIssue(
+                    "ERROR",
+                    str(paths.observation_sequence),
+                    "Observation sequence high_water_mark is below the visible "
+                    "Observation record count",
+                )
+            )
+        high_water_mark = int(sequence["high_water_mark"])
+        previous_watermark = 0
+        for checkpoint_path in checkpoint_paths(paths):
+            checkpoint = load_json(checkpoint_path)
+            if not isinstance(checkpoint, dict):
+                continue
+            watermarks = checkpoint.get("active_context_watermarks")
+            if not isinstance(watermarks, dict):
+                continue
+            watermark = watermarks.get("observation_record_count")
+            if (
+                isinstance(watermark, bool)
+                or not isinstance(watermark, int)
+                or watermark < 0
+            ):
+                continue
+            if watermark > high_water_mark:
+                issues.append(
+                    ValidationIssue(
+                        "ERROR",
+                        str(paths.observation_sequence),
+                        "Observation sequence high_water_mark is below "
+                        f"Checkpoint {checkpoint.get('checkpoint_id')} "
+                        f"watermark {watermark}",
+                    )
+                )
+            if watermark < previous_watermark:
+                issues.append(
+                    ValidationIssue(
+                        "ERROR",
+                        str(checkpoint_path),
+                        "Checkpoint Observation watermark regressed from "
+                        f"{previous_watermark} to {watermark}",
+                    )
+                )
+            previous_watermark = max(previous_watermark, watermark)
+    except (ValidationError, WorkflowError, OSError, ValueError) as exc:
+        issues.append(
+            ValidationIssue("ERROR", str(paths.observation_sequence), str(exc))
+        )
+    return issues
+
+
 def _evidence_issues(
     paths: StudyPaths,
     runs: dict[str, tuple[Path, dict[str, Any]]],
@@ -2138,48 +2315,47 @@ def _evidence_issues(
                 ):
                     if field_value is None or field_value == "":
                         issues.append(ValidationIssue("ERROR", str(path), f"finalized Evidence requires {field_path}"))
-                if item.get("schema_version") == EVIDENCE_SCHEMA_VERSION:
-                    inference = item.get("inference")
-                    if not isinstance(inference, dict):
+                inference = item.get("inference")
+                if not isinstance(inference, dict):
+                    issues.append(
+                        ValidationIssue(
+                            "ERROR",
+                            str(path),
+                            "finalized Evidence requires an explicit inference object",
+                        )
+                    )
+                else:
+                    bridge = inference.get("observation_to_claim")
+                    if not isinstance(bridge, str) or not bridge.strip():
                         issues.append(
                             ValidationIssue(
                                 "ERROR",
                                 str(path),
-                                "finalized Evidence requires an explicit inference object",
+                                "finalized Evidence requires inference.observation_to_claim",
                             )
                         )
-                    else:
-                        bridge = inference.get("observation_to_claim")
-                        if not isinstance(bridge, str) or not bridge.strip():
+                    for field in (
+                        "auxiliary_assumptions",
+                        "competing_explanations",
+                        "falsification_conditions",
+                    ):
+                        values = inference.get(field)
+                        if (
+                            not isinstance(values, list)
+                            or not values
+                            or any(
+                                not isinstance(value, str) or not value.strip()
+                                for value in values
+                            )
+                        ):
                             issues.append(
                                 ValidationIssue(
                                     "ERROR",
                                     str(path),
-                                    "finalized Evidence requires inference.observation_to_claim",
+                                    "finalized Evidence requires at least one explicit "
+                                    f"inference.{field} entry",
                                 )
                             )
-                        for field in (
-                            "auxiliary_assumptions",
-                            "competing_explanations",
-                            "falsification_conditions",
-                        ):
-                            values = inference.get(field)
-                            if (
-                                not isinstance(values, list)
-                                or not values
-                                or any(
-                                    not isinstance(value, str) or not value.strip()
-                                    for value in values
-                                )
-                            ):
-                                issues.append(
-                                    ValidationIssue(
-                                        "ERROR",
-                                        str(path),
-                                        "finalized Evidence requires at least one explicit "
-                                        f"inference.{field} entry",
-                                    )
-                                )
                 if item.get("record_sha256") != record_digest(item, "record_sha256"):
                     issues.append(ValidationIssue("ERROR", str(path), "Evidence record_sha256 does not match"))
             elif item.get("record_sha256") is not None:
@@ -2253,13 +2429,8 @@ def _ref_key(ref: dict[str, Any]) -> tuple[str, int]:
     return str(ref.get("evidence_id")), int(ref.get("version", 0))
 
 
-def _evidence_basis_mode(item: dict[str, Any]) -> str:
-    """Return the conservative epistemic basis of an Evidence record.
-
-    Evidence finalized before this field existed is permanently exploratory;
-    absence is never interpreted as confirmation.
-    """
-
+def _evidence_basis_mode(item: dict[str, Any]) -> str | None:
+    """Return an explicitly declared, valid Evidence basis mode."""
     basis = item.get("evidence_basis")
     if isinstance(basis, dict) and basis.get("mode") in {
         "exploratory",
@@ -2267,7 +2438,7 @@ def _evidence_basis_mode(item: dict[str, Any]) -> str:
         "mixed",
     }:
         return str(basis["mode"])
-    return "exploratory"
+    return None
 
 
 def _strong_confirmatory_evidence(
@@ -2406,15 +2577,6 @@ def _claims_issues(
         issues.extend(object_schema_issues(paths.root, "claims", paths.claims, claims_data))
         if claims_data.get("study_id") != paths.study_id:
             issues.append(ValidationIssue("ERROR", str(paths.claims), "study_id mismatch"))
-        if claims_data.get("schema_version") != CLAIMS_SCHEMA_VERSION:
-            issues.append(
-                ValidationIssue(
-                    "WARNING",
-                    str(paths.claims),
-                    "legacy Claims schema is historical-validation-only; "
-                    "migrate to bounded schema_version 2 before active research",
-                )
-            )
         claim_ids: set[str] = set()
         claims_by_id: dict[str, dict[str, Any]] = {}
         lifecycles: dict[str, str] = {}
@@ -2498,7 +2660,17 @@ def _claims_issues(
                             )
                         )
                     if group_name == "supporting" and item.get("status") == "finalized":
-                        supporting_basis_modes.append(_evidence_basis_mode(item))
+                        basis_mode = _evidence_basis_mode(item)
+                        if basis_mode is None:
+                            issues.append(
+                                ValidationIssue(
+                                    "ERROR",
+                                    str(paths.claims),
+                                    f"Claim {claim_id} uses Evidence {key} without a valid evidence_basis",
+                                )
+                            )
+                        else:
+                            supporting_basis_modes.append(basis_mode)
                         has_strong_confirmation = (
                             has_strong_confirmation
                             or _strong_confirmatory_evidence(paths, item)
@@ -2525,18 +2697,7 @@ def _claims_issues(
             else:
                 computed_basis = "mixed"
             declared_basis = claim.get("evidence_basis")
-            if declared_basis is None:
-                if groups["supporting"]:
-                    issues.append(
-                        ValidationIssue(
-                            "WARNING",
-                            str(paths.claims),
-                            f"Claim {claim_id} predates explicit evidence_basis; "
-                            f"its conservative effective basis is {computed_basis!r}. "
-                            "Record that value on the next semantic Claim update.",
-                        )
-                    )
-            elif declared_basis != computed_basis:
+            if declared_basis != computed_basis:
                 issues.append(
                     ValidationIssue(
                         "ERROR",
@@ -2719,7 +2880,7 @@ def _checkpoint_claim_record_issues(
     paths: StudyPaths,
     checkpoint_path: Path,
     ref: dict[str, Any],
-    claims_schema: dict[str, Any] | None,
+    claims_schema: dict[str, Any],
 ) -> tuple[list[ValidationIssue], dict[str, Any] | None]:
     """Verify one content-addressed non-Frontier Claim record."""
 
@@ -2806,14 +2967,13 @@ def _checkpoint_claim_record_issues(
                 f"Checkpoint Claim record must contain an object: {raw!r}",
             )
         ], None
-    if claims_schema is not None:
-        for message in validate_schema_instance(
-            claim,
-            claims_schema["$defs"]["claim"],
-            root_schema=claims_schema,
-            location=f"$.inactive_claim_refs[{claim_id!r}]",
-        ):
-            issues.append(ValidationIssue("ERROR", str(checkpoint_path), message))
+    for message in validate_schema_instance(
+        claim,
+        claims_schema["$defs"]["claim"],
+        root_schema=claims_schema,
+        location=f"$.inactive_claim_refs[{claim_id!r}]",
+    ):
+        issues.append(ValidationIssue("ERROR", str(checkpoint_path), message))
     digest = sha256_json(claim)
     if digest != ref.get("sha256"):
         issues.append(
@@ -2848,34 +3008,24 @@ def _checkpoint_issues(
     paths: StudyPaths,
     evidence: dict[tuple[str, int], tuple[Path, dict[str, Any]]],
     claims_data: dict[str, Any] | None = None,
+    observations: dict[
+        tuple[str, int], tuple[Path, dict[str, Any]]
+    ] | None = None,
 ) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
+    observation_records = observations or {}
     previous: dict[str, Any] | None = None
     previous_claim_states: dict[str, tuple[str, str | None]] = {}
     terminal_claim_states: dict[str, tuple[str, str | None]] = {}
     terminal_claim_digests: dict[str, str] = {}
     latest_known_claims: dict[str, dict[str, Any]] = {}
+    claims_schema = load_schema(paths.root, "claims")
     for path in checkpoint_paths(paths):
         try:
             item = load_json(path)
             if not isinstance(item, dict):
                 raise ValidationError("Checkpoint must be an object")
             issues.extend(object_schema_issues(paths.root, "checkpoint", path, item))
-            raw_checkpoint_version = item.get("schema_version")
-            checkpoint_version = (
-                raw_checkpoint_version
-                if isinstance(raw_checkpoint_version, int)
-                and not isinstance(raw_checkpoint_version, bool)
-                else None
-            )
-            claims_version = CHECKPOINT_CLAIMS_SCHEMA_VERSIONS.get(
-                checkpoint_version
-            )
-            claims_schema = (
-                load_schema(paths.root, "claims", version=claims_version)
-                if claims_version is not None
-                else None
-            )
             checkpoint_id = str(item.get("checkpoint_id", ""))
             if item.get("study_id") != paths.study_id:
                 issues.append(
@@ -2887,26 +3037,25 @@ def _checkpoint_issues(
                 issues.append(ValidationIssue("ERROR", str(path), "Checkpoint filename does not match ID"))
             if item.get("checkpoint_sha256") != record_digest(item, "checkpoint_sha256"):
                 issues.append(ValidationIssue("ERROR", str(path), "checkpoint_sha256 does not match"))
-            if claims_schema is not None:
-                for index, claim in enumerate(item.get("claims_snapshot", [])):
-                    for message in validate_schema_instance(
-                        claim,
-                        claims_schema["$defs"]["claim"],
-                        root_schema=claims_schema,
-                        location=f"$.claims_snapshot[{index}]",
-                    ):
-                        issues.append(ValidationIssue("ERROR", str(path), message))
-                    if isinstance(claim, dict) and isinstance(
-                        claim.get("claim_id"), str
-                    ):
-                        latest_known_claims[str(claim["claim_id"])] = claim
+            for index, claim in enumerate(item.get("claims_snapshot", [])):
                 for message in validate_schema_instance(
-                    item.get("frontier"),
-                    claims_schema["$defs"]["frontier"],
+                    claim,
+                    claims_schema["$defs"]["claim"],
                     root_schema=claims_schema,
-                    location="$.frontier",
+                    location=f"$.claims_snapshot[{index}]",
                 ):
                     issues.append(ValidationIssue("ERROR", str(path), message))
+                if isinstance(claim, dict) and isinstance(
+                    claim.get("claim_id"), str
+                ):
+                    latest_known_claims[str(claim["claim_id"])] = claim
+            for message in validate_schema_instance(
+                item.get("frontier"),
+                claims_schema["$defs"]["frontier"],
+                root_schema=claims_schema,
+                location="$.frontier",
+            ):
+                issues.append(ValidationIssue("ERROR", str(path), message))
             claim_states, snapshot_ids, inactive_ids = _checkpoint_claim_lifecycles(
                 item
             )
@@ -3035,6 +3184,78 @@ def _checkpoint_issues(
                                 "ERROR", str(path), f"Checkpoint Evidence hash is stale {key}"
                             )
                         )
+            expected_observations: dict[
+                tuple[str, int], dict[str, Any]
+            ] = {}
+            for field in ("decisive_evidence", "contradictory_evidence"):
+                for reference in item.get(field, []):
+                    if not isinstance(reference, dict):
+                        continue
+                    target = evidence.get(_ref_key(reference))
+                    if target is None:
+                        continue
+                    observation_ref = target[1].get("observation_ref")
+                    if isinstance(observation_ref, dict):
+                        observation_key = (
+                            str(observation_ref.get("observation_id")),
+                            int(observation_ref.get("version", 0)),
+                        )
+                        expected_observations[observation_key] = observation_ref
+            declared_observations: dict[
+                tuple[str, int], dict[str, Any]
+            ] = {}
+            for reference in item.get("decisive_observations", []):
+                if not isinstance(reference, dict):
+                    continue
+                observation_key = (
+                    str(reference.get("observation_id")),
+                    int(reference.get("version", 0)),
+                )
+                declared_observations[observation_key] = reference
+                target = observation_records.get(observation_key)
+                if target is None:
+                    issues.append(
+                        ValidationIssue(
+                            "ERROR",
+                            str(path),
+                            "Checkpoint references missing Observation "
+                            f"{observation_key}",
+                        )
+                    )
+                    continue
+                target_item = target[1]
+                digest = target_item.get("record_sha256")
+                if (
+                    target_item.get("status") != "finalized"
+                    or digest != record_digest(target_item, "record_sha256")
+                ):
+                    issues.append(
+                        ValidationIssue(
+                            "ERROR",
+                            str(path),
+                            "Checkpoint Observation is not valid/finalized "
+                            f"{observation_key}",
+                        )
+                    )
+                if reference.get("sha256") != digest:
+                    issues.append(
+                        ValidationIssue(
+                            "ERROR",
+                            str(path),
+                            "Checkpoint Observation hash is stale "
+                            f"{observation_key}",
+                        )
+                    )
+            if declared_observations != expected_observations:
+                issues.append(
+                    ValidationIssue(
+                        "ERROR",
+                        str(path),
+                        "Checkpoint decisive_observations must exactly equal "
+                        "Observation refs reached through decisive and "
+                        "contradictory Evidence",
+                    )
+                )
             for failure in item.get("representative_failures", []):
                 if not isinstance(failure, dict):
                     continue
@@ -3408,9 +3629,11 @@ def validate_study(paths: StudyPaths) -> list[ValidationIssue]:
     # The Confirmation workflow calls validation primitives, so use a local
     # import while still replaying its immutable semantic checks here.
     from .confirmation import confirmation_record_issues, confirmation_run_issues
+    from .observation_triggers import observation_trigger_registry_issues
     from .workspace import changeset_issues, repository_profile_issues
 
     issues.extend(repository_profile_issues(paths.root))
+    issues.extend(observation_trigger_registry_issues(paths.root))
     try:
         paths.assert_safe_layout(must_exist=True)
     except (ValidationError, WorkflowError) as exc:
@@ -3424,12 +3647,15 @@ def validate_study(paths: StudyPaths) -> list[ValidationIssue]:
     issues.extend(run_issues)
     issues.extend(run_ledger_issues(paths, runs))
     issues.extend(confirmation_run_issues(paths, runs))
+    observation_issues, observations = _observation_issues(paths)
+    issues.extend(observation_issues)
+    issues.extend(observation_sequence_issues(paths))
     evidence_issues, evidence = _evidence_issues(paths, runs)
     issues.extend(evidence_issues)
     issues.extend(evidence_sequence_issues(paths))
     claim_issues, claims_data = _claims_issues(paths, evidence)
     issues.extend(claim_issues)
-    issues.extend(_checkpoint_issues(paths, evidence, claims_data))
+    issues.extend(_checkpoint_issues(paths, evidence, claims_data, observations))
     issues.extend(checkpoint_sequence_issues(paths))
     issues.extend(_verdict_issues(paths, evidence))
     return issues
@@ -3446,6 +3672,7 @@ def authoritative_string_references(paths: StudyPaths) -> set[str]:
     references: set[str] = set()
     candidates = [
         paths.claims,
+        *observation_paths(paths),
         *evidence_paths(paths),
         *checkpoint_paths(paths),
         *sorted((paths.checkpoints / "claim-records").glob("*.json")),

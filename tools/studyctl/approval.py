@@ -756,7 +756,7 @@ def _current_judged_scope(paths: StudyPaths, claim_ids: list[str]) -> dict[str, 
     current_active = [
         item
         for item in current_claims.get("claims", [])
-        if isinstance(item, dict) and item.get("lifecycle", "active") == "active"
+        if isinstance(item, dict) and item.get("lifecycle") == "active"
     ]
     if latest is None and current_active:
         raise ValidationError(

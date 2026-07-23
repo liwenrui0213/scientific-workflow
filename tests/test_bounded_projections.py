@@ -8,7 +8,6 @@ import unittest
 from tests.helpers import WorkflowTestCase
 from tools.studyctl.active_context import (
     active_selector_bytes,
-    build_active_selector,
     compaction_pressure,
     require_growth_allowed,
     runtime_compaction_due_path,
@@ -132,6 +131,7 @@ class BoundedProjectionTests(WorkflowTestCase):
                     "statement": "s" * 4060 + f"-STATEMENT-TAIL-{index:02d}",
                     "scope": "c" * 4060 + f"-SCOPE-TAIL-{index:02d}",
                     "state": "proposed",
+                    "evidence_basis": "none",
                     "lifecycle": "active",
                     "supporting_evidence": [],
                     "contradictory_evidence": [],
@@ -223,7 +223,7 @@ class BoundedProjectionTests(WorkflowTestCase):
         ):
             write_active_selector(paths)
 
-    def test_canonical_byte_bound_is_exact_and_legacy_finalized_is_compatible(
+    def test_canonical_byte_bound_is_exact_and_finalized_is_exempt(
         self,
     ) -> None:
         value = {"status": "draft", "payload": "abcd"}
@@ -241,8 +241,8 @@ class BoundedProjectionTests(WorkflowTestCase):
             any(f"maximum is {exact}" in message for message in errors),
             errors,
         )
-        legacy_finalized = {"status": "finalized", "payload": "x" * 100_000}
-        self.assertEqual(validate_schema_instance(legacy_finalized, schema), [])
+        finalized = {"status": "finalized", "payload": "x" * 100_000}
+        self.assertEqual(validate_schema_instance(finalized, schema), [])
 
         paths = self.initialize_approved_with_claim()
         manifest = self.successful_run(paths)

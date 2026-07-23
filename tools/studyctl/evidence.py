@@ -53,18 +53,15 @@ _CONFIRMATION_TERMINAL_RUN_STATUSES = _TERMINAL_RUN_STATUSES | {"incomplete"}
 
 
 def effective_evidence_mode(item: dict[str, Any]) -> str:
-    """Return an Evidence record's effective epistemic mode.
-
-    Finalized Evidence created before ``evidence_basis`` became first-class is
-    historical exploratory Evidence.  Missing metadata can therefore never
-    upgrade an old record to confirmatory status.
-    """
+    """Return an Evidence record's explicitly declared epistemic mode."""
 
     basis = item.get("evidence_basis")
     if not isinstance(basis, dict):
-        return "exploratory"
+        raise ValidationError("Evidence requires an evidence_basis object")
     mode = basis.get("mode")
-    return mode if mode in {"exploratory", "confirmatory", "mixed"} else "exploratory"
+    if mode not in {"exploratory", "confirmatory", "mixed"}:
+        raise ValidationError("Evidence evidence_basis.mode is invalid")
+    return str(mode)
 
 
 def _invalid_object_message(kind: str, issues: Sequence[Any]) -> str:
@@ -259,10 +256,10 @@ def _confirmation_claim_issues(
         for claim in frozen_claims
         if isinstance(claim, dict)
     ]
-    if len(frozen_ids) != len(frozen_claims) or set(frozen_ids) != set(claim_ids):
+    if not set(claim_ids).issubset(set(frozen_ids)):
         raise ValidationError(
-            "confirmatory or mixed Evidence addresses.claim_ids must exactly match "
-            "the frozen Confirmation claims"
+            "confirmatory or mixed Evidence addresses.claim_ids must be a "
+            "single-Claim subset of the frozen Confirmation claims"
         )
 
     current_claims = _claims_object(paths).get("claims", [])
@@ -829,14 +826,40 @@ def create_evidence_draft(
     evidence_id: str,
     claim_ids: Sequence[str],
     run_ids: Sequence[str],
+    *,
+    observation_id: str | None = None,
+    observation_version: int | None = None,
 ) -> Path:
-    """Create the next editable version of an Evidence record."""
+    """Create one Claim-specific Evidence draft.
+
+    With no Observation reference, the existing Run/analysis/result fields are
+    the default inline observation.  A promoted Observation is optional and
+    must be selected by an exact ID/version pair.
+    """
     require_id("evidence", evidence_id)
     normalized_claim_ids = _normalize_ids("claim", claim_ids)
+    if len(normalized_claim_ids) != 1:
+        raise ValidationError(
+            "each new Evidence Argument must address exactly one Claim"
+        )
     _validate_claim_references(paths, normalized_claim_ids)
     run_refs, fingerprints, changed_fields, manifests = _run_references_for_draft(
         paths, run_ids
     )
+    if (observation_id is None) != (observation_version is None):
+        raise ValidationError(
+            "Observation ID and version must be supplied together"
+        )
+    promoted_observation_ref: dict[str, Any] | None = None
+    if observation_id is not None and observation_version is not None:
+        from .observation import observation_ref, validate_evidence_observation_ref
+
+        promoted_observation_ref = observation_ref(
+            paths, observation_id, observation_version
+        )
+        validate_evidence_observation_ref(
+            paths, promoted_observation_ref, run_refs
+        )
     evidence_basis, campaign_records = _derive_evidence_basis(
         paths, normalized_claim_ids, manifests
     )
@@ -883,6 +906,7 @@ def create_evidence_draft(
                 "question": None,
             },
             "evidence_basis": evidence_basis,
+            "observation_ref": promoted_observation_ref,
             "runs": run_refs,
             "analysis": {
                 **frozen_analysis,
@@ -1208,14 +1232,10 @@ def validate_evidence_basis(paths: StudyPaths, item: dict[str, Any]) -> None:
 
     This is intentionally callable through a local import from full-Study
     validation, avoiding a module-level ``validation``/``evidence`` cycle.
-    Historical finalized records without ``evidence_basis`` remain valid but
-    have exploratory effective mode via :func:`effective_evidence_mode`.
     """
 
     if "evidence_basis" not in item:
-        if item.get("status") == "finalized":
-            return
-        raise ValidationError("Evidence draft requires an explicit evidence_basis object")
+        raise ValidationError("Evidence requires an explicit evidence_basis object")
     runs = item.get("runs")
     if not isinstance(runs, list):
         raise ValidationError("Evidence runs must be a list")
@@ -1227,6 +1247,11 @@ def validate_evidence_basis(paths: StudyPaths, item: dict[str, Any]) -> None:
         if not isinstance(run_id, str):
             raise ValidationError("Evidence Run reference requires a string run_id")
         manifests.append(_terminal_run(paths, run_id))
+    from .observation import validate_evidence_observation_ref
+
+    validate_evidence_observation_ref(
+        paths, item.get("observation_ref"), runs
+    )
     _validate_final_evidence_basis(paths, item, manifests)
 
 
@@ -1281,6 +1306,11 @@ def finalize_evidence(paths: StudyPaths, source_path: Path) -> Path:
         claim_ids = item.get("addresses", {}).get("claim_ids", [])
         _validate_claim_references(paths, claim_ids)
         fingerprints, changed_fields, manifests = _validate_run_references(paths, item)
+        from .observation import validate_evidence_observation_ref
+
+        validate_evidence_observation_ref(
+            paths, item.get("observation_ref"), item.get("runs", [])
+        )
         _validate_related_evidence(paths, item)
         _validate_final_content(item, fingerprints, changed_fields)
         _validate_final_evidence_basis(paths, item, manifests)

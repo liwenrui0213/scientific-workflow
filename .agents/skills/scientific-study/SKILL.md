@@ -12,22 +12,23 @@ description: Resume an existing approved Claim-to-Evidence Study selected by ID 
    send a unique draft to `start-scientific-study` under the same ID. On zero,
    multiple, invalid, or unsafe candidates, ask once and never run `init`.
    Resolve a named continuation through the same command. A Verdict does not
-   close the Study. A migration-required legacy Claims file must be
-   semantically reduced to bounded schema V2 under the same Study ID; never
-   initialize a replacement or auto-truncate its scientific content.
+   close the Study. Unsupported Claims, Evidence, or Checkpoint schemas fail
+   closed. Use a Git-pinned compatible workflow or an explicit reviewed offline
+   migration; never replace a Study or rewrite old records.
 2. Require a fresh human-approved Brief and a valid
    `scientific-workflow/repository-profile.json`. Invoke bootstrap only when
    workflow infrastructure is missing and the user authorizes installation.
-3. Run `studyctl validate` and `studyctl context`, then start from bounded
+3. Run `studyctl validate` and `studyctl context`, then start from
    `generated/ACTIVE_CONTEXT.json`. It locates selected active Claims, Frontier, Brief,
-   formal artifacts, Checkpoint, editable Confirmation drafts, pending/running
-   slots, and records awaiting Evidence. Resume those before creating another
+   formal artifacts, Checkpoint, decisive Observation locators, editable
+   Confirmation drafts, pending/running slots, and records awaiting Evidence.
+   Resume those before creating another
    Confirmation. Read authoritative sources only for the current question or
    selected ID. Open complete `CLAIMS.json` only to validate or update it.
    `STATUS.md` is a human-facing projection, not authority.
-4. Repository source, tests, Git state, sealed Runs, finalized Evidence, and
-   hash-pinned records establish what happened. Generated views and Agent
-   explanations are indexes or hypotheses, never authority.
+4. Repository source, tests, Git state, sealed Runs, finalized Observation and
+   Evidence records, and hash-pinned records establish what happened. Generated
+   views and Agent explanations are indexes or hypotheses, never authority.
 
 ## Align only at material boundaries
 
@@ -38,14 +39,11 @@ Evidence, or interpretation boundary. Ask now only when plausible answers
 materially change an authorized Claim, protected condition, hard budget, or
 immediate expensive or hard-to-reverse action and no safe default exists.
 
-At one boundary ask one batch of at most three independent questions, with the
-current interpretation and blocking reason. Use one follow-up batch only for a
-new material branch; never repeat an unresolved question. Pause only the
-blocked action and continue useful safe read-only or low-cost work.
+Ask one batch of at most three questions with the interpretation and blocking
+reason. Never repeat an unresolved question; pause only the blocked action.
 
-Read [research strategy](references/research-strategy.md) when selecting among
-hypotheses or discriminating experiments, not for mechanical validation or
-rendering.
+Read [research strategy](references/research-strategy.md) only when selecting
+hypotheses or discriminating experiments.
 
 ## Workflow
 
@@ -64,21 +62,22 @@ rendering.
 5. Execute consequential calculations through `studyctl run`. Declare mutable
    or external inputs and all new outputs below `object_root`. A `running` or
    `incomplete` Run cannot enter Evidence. Runs default to exploratory.
-6. Create exploratory Evidence only from eligible sealed Runs. Before setting
-   `numerically_supported`, freeze the Claim version, candidate, protocol,
-   evaluator, held-out conditions, analysis, and slots. Continue its derived
-   campaign only after predecessor slots terminate, disclosing replication or
-   corrective-supersession reasons and differences. Run new slots, then finalize
-   campaign-complete Evidence with roles, analysis, result, scope, uncertainty,
-   limitations, assessment, Cohort justification, and the required inference
-   bridge, assumptions, alternatives, and falsifiers. Do not confirm routine
-   exploration.
-7. Update Claims only with finalized `{evidence_id, version, sha256}` refs and
+6. Keep observations inline unless `observation-trigger-list STUDY_ID` shows an
+   applicable condition. Missing conditions require a reviewed proposal,
+   explicit human adoption, and protected Registry maintenance; structural
+   additions require deterministic code. Finalized Observations bind Registry,
+   Runs, and analysis, without Claim assessment.
+7. Finalize one-Claim Evidence from eligible Runs or an exact Observation.
+   Before numerical support, freeze Claim, candidate, protocol, evaluator,
+   held-out conditions, analysis, and slots; disclose the complete campaign,
+   roles, exclusions, uncertainty, limitations, inference bridge, alternatives,
+   and falsifiers. Do not confirm routine exploration.
+8. Update Claims only with finalized `{evidence_id, version, sha256}` refs and
    preserve contradictions. Current Claims use lifecycle `active`. Remove one
    from the Frontier only by marking it `retired`, or create a replacement ID
    and mark the old one `superseded` with `superseded_by`. A lifecycle edit is
    provisional until the next immutable Checkpoint seals it.
-8. Regenerate status after each consequential batch. At soft compaction
+9. Regenerate status after each consequential batch. At soft compaction
    pressure, invoke `research-compaction` before discretionary growth. At hard
    pressure, compact before another Run, Evidence draft, or review packet;
    validation, status, and compaction remain available.
@@ -100,6 +99,8 @@ rendering.
   draft explicitly; afterwards use a new Claim ID instead of rewriting history.
 - Numerical success is not proof; implementation acceptance is not scientific
   acceptance. Do not upgrade a Claim beyond finalized Evidence.
+- Observation has no Claim assessment. Evidence pins its exact version/hash and
+  remains Claim-specific.
 - Never relabel an exploratory or legacy Run as confirmatory. Confirmatory
   Evidence covers every current-campaign slot and attempt; mixed Evidence
   labels both bases.

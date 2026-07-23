@@ -25,7 +25,7 @@ from tools.studyctl.hashing import (
     record_digest,
     sha256_file,
 )
-from tools.studyctl.models import StudyPaths, ValidationError
+from tools.studyctl.models import ValidationError
 from tools.studyctl.rendering import active_formal_artifacts, render_status
 from tools.studyctl.run_ledger import load_ledger, write_ledger
 from tools.studyctl.run_registry import execute_run

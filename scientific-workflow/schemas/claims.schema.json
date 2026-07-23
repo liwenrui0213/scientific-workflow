@@ -27,7 +27,7 @@
     "claim": {
       "type": "object",
       "required": [
-        "claim_id", "statement", "scope", "state", "lifecycle", "supporting_evidence",
+        "claim_id", "statement", "scope", "state", "evidence_basis", "lifecycle", "supporting_evidence",
         "contradictory_evidence", "other_evidence", "uncertainty", "limitations", "updated_at"
       ],
       "properties": {

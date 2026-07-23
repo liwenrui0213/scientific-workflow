@@ -200,7 +200,7 @@ class ChangeGovernanceTests(WorkflowTestCase):
         profile = self.profile()
         profile["git"]["require_linked_worktree"] = True
         atomic_write_json(repository_profile_path(self.root), profile)
-        paths = self.initialize_approved_with_claim()
+        self.initialize_approved_with_claim()
         self.commit_all("commit approved Study intake")
 
         with tempfile.TemporaryDirectory() as parent:

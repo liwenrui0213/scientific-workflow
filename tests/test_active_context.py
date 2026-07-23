@@ -4,7 +4,6 @@ import copy
 from pathlib import Path
 import shutil
 import sys
-from typing import Any
 import unittest
 
 from tests.helpers import WorkflowTestCase
@@ -265,7 +264,11 @@ class ActiveContextTests(WorkflowTestCase):
         first_checkpoint = load_json(finalize_compaction(paths, first_plan))
         self.assertEqual(
             first_checkpoint["active_context_watermarks"],
-            {"run_count": 2, "evidence_record_count": 0},
+            {
+                "run_count": 2,
+                "observation_record_count": 0,
+                "evidence_record_count": 0,
+            },
         )
         self.assertEqual(compaction_pressure(paths)["level"], "normal")
         third_manifest = self.successful_run(paths)
@@ -293,7 +296,11 @@ class ActiveContextTests(WorkflowTestCase):
         second_checkpoint = load_json(finalize_compaction(paths, second_plan))
         self.assertEqual(
             second_checkpoint["active_context_watermarks"],
-            {"run_count": 3, "evidence_record_count": 2},
+            {
+                "run_count": 3,
+                "observation_record_count": 0,
+                "evidence_record_count": 2,
+            },
         )
 
         for name in ("one.txt", "two.txt"):

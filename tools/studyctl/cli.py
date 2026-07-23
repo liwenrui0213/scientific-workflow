@@ -3,17 +3,19 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-import shutil
 import sys
 from typing import Any, Sequence
 
 from .checkpoint_sequence import empty_checkpoint_sequence, write_checkpoint_sequence
 from .evidence_sequence import empty_evidence_sequence, write_evidence_sequence
-from .hashing import atomic_write_bytes, atomic_write_json, load_json
+from .observation_sequence import (
+    empty_observation_sequence,
+    write_observation_sequence,
+)
+from .hashing import atomic_write_bytes, atomic_write_json
 from .models import (
     HumanGateError,
     RunInterrupted,
-    SCHEMA_VERSION,
     ValidationError,
     WorkflowError,
     get_repo_root,
@@ -29,9 +31,11 @@ def initialize_study(root: Path, study_id: str, title: str) -> Path:
     require_id("study", study_id)
     if not title.strip():
         raise ValidationError("title must not be empty")
+    from .observation_triggers import load_current_registry
     from .workspace import load_repository_profile
 
     load_repository_profile(root)
+    load_current_registry(root)
     paths = study_paths(root, study_id, must_exist=False)
     if paths.study.exists():
         raise WorkflowError(f"refusing to overwrite existing study: {study_id}")
@@ -41,6 +45,7 @@ def initialize_study(root: Path, study_id: str, title: str) -> Path:
         paths.active_work,
         paths.archived_work,
         paths.runs,
+        paths.observations,
         paths.evidence,
         paths.failed_directions,
         paths.checkpoints,
@@ -49,6 +54,9 @@ def initialize_study(root: Path, study_id: str, title: str) -> Path:
     for directory in directories:
         directory.mkdir(parents=True, exist_ok=False if directory == paths.formal else True)
     write_ledger(paths, empty_ledger(paths))
+    write_observation_sequence(
+        paths, empty_observation_sequence(paths), overwrite=False
+    )
     write_evidence_sequence(paths, empty_evidence_sequence(paths), overwrite=False)
     write_checkpoint_sequence(
         paths, empty_checkpoint_sequence(paths), overwrite=False
@@ -254,11 +262,39 @@ def build_parser() -> argparse.ArgumentParser:
     # remaining command argument literally.
     run.add_argument("command", nargs="+")
 
+    observation_new = subparsers.add_parser(
+        "observation-new",
+        help="promote Run analysis into an optional draft Observation Record",
+    )
+    observation_new.add_argument("study_id")
+    observation_new.add_argument("--id", dest="observation_id", required=True)
+    observation_new.add_argument(
+        "--run", dest="run_ids", action="append", required=True
+    )
+    observation_new.add_argument(
+        "--trigger", dest="promotion_triggers", action="append", required=True
+    )
+
+    observation_finalize = subparsers.add_parser(
+        "observation-finalize",
+        help="seal a completed Observation draft",
+    )
+    observation_finalize.add_argument("study_id")
+    observation_finalize.add_argument("--file", required=True)
+
+    observation_triggers = subparsers.add_parser(
+        "observation-trigger-list",
+        help="list the active versioned Observation promotion-trigger registry",
+    )
+    observation_triggers.add_argument("study_id")
+
     evidence_new = subparsers.add_parser("evidence-new", help="create a schema-valid draft Evidence version")
     evidence_new.add_argument("study_id")
     evidence_new.add_argument("--id", dest="evidence_id", required=True)
     evidence_new.add_argument("--claim", action="append", required=True)
     evidence_new.add_argument("--run", dest="run_ids", action="append", required=True)
+    evidence_new.add_argument("--observation-id")
+    evidence_new.add_argument("--observation-version", type=int)
 
     evidence_finalize = subparsers.add_parser("evidence-finalize", help="seal a completed Evidence draft")
     evidence_finalize.add_argument("study_id")
@@ -506,10 +542,59 @@ def dispatch(args: argparse.Namespace) -> int:
 
         print(finalize_confirmation(paths, Path(args.file)))
         return 0
+    if name == "observation-new":
+        from .observation import create_observation_draft
+
+        print(
+            create_observation_draft(
+                paths,
+                args.observation_id,
+                args.run_ids,
+                args.promotion_triggers,
+            )
+        )
+        return 0
+    if name == "observation-finalize":
+        from .observation import finalize_observation
+
+        print(finalize_observation(paths, Path(args.file)))
+        return 0
+    if name == "observation-trigger-list":
+        from .observation_triggers import load_current_registry
+
+        registry = load_current_registry(paths.root)
+        _print_json(
+            {
+                "registry_version": registry["registry_version"],
+                "registry_sha256": registry["registry_sha256"],
+                "triggers": [
+                    {
+                        "id": item["id"],
+                        "kind": item["kind"],
+                        "confirmatory_allowed": item[
+                            "confirmatory_allowed"
+                        ],
+                        "description": item["description"],
+                        "origin": item["governance"]["origin"],
+                    }
+                    for item in registry["triggers"]
+                ],
+            }
+        )
+        return 0
     if name == "evidence-new":
         from .evidence import create_evidence_draft
 
-        print(create_evidence_draft(paths, args.evidence_id, args.claim, args.run_ids))
+        print(
+            create_evidence_draft(
+                paths,
+                args.evidence_id,
+                args.claim,
+                args.run_ids,
+                observation_id=args.observation_id,
+                observation_version=args.observation_version,
+            )
+        )
         return 0
     if name == "evidence-finalize":
         from .evidence import finalize_evidence

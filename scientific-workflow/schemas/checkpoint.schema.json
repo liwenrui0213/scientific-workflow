@@ -7,13 +7,14 @@
     "schema_version", "study_id", "checkpoint_id", "created_at", "brief",
     "active_formal_artifacts", "claims_file_sha256", "claims_snapshot",
     "inactive_claim_refs", "active_context_watermarks", "frontier",
-    "decisive_evidence", "contradictory_evidence", "open_questions", "next_actions",
+    "decisive_evidence", "contradictory_evidence", "decisive_observations",
+    "open_questions", "next_actions",
     "budget_state", "formalization_debt", "representative_failures", "archived_work_files",
     "previous_checkpoint", "compaction_plan_sha256",
     "checkpoint_sha256"
   ],
   "properties": {
-    "schema_version": {"const": 2},
+    "schema_version": {"const": 3},
     "study_id": {"type": "string", "pattern": "^SC-[0-9]{4,}$", "maxLength": 64},
     "checkpoint_id": {"type": "string", "pattern": "^CHECKPOINT-[0-9]{6}$"},
     "created_at": {"type": "string", "minLength": 1, "maxLength": 64},
@@ -40,6 +41,7 @@
     "frontier": {"type": "object"},
     "decisive_evidence": {"type": "array", "maxItems": 2048, "uniqueItems": true, "items": {"$ref": "#/$defs/evidence_ref"}},
     "contradictory_evidence": {"type": "array", "maxItems": 2048, "uniqueItems": true, "items": {"$ref": "#/$defs/evidence_ref"}},
+    "decisive_observations": {"type": "array", "maxItems": 2048, "uniqueItems": true, "items": {"$ref": "#/$defs/observation_ref"}},
     "open_questions": {"type": "array", "maxItems": 64, "items": {"type": "string", "maxLength": 1024}},
     "next_actions": {"type": "array", "maxItems": 64, "items": {"type": "string", "maxLength": 1024}},
     "budget_state": {"type": "object"},
@@ -58,9 +60,10 @@
   "$defs": {
     "active_context_watermarks": {
       "type": "object",
-      "required": ["run_count", "evidence_record_count"],
+      "required": ["run_count", "observation_record_count", "evidence_record_count"],
       "properties": {
         "run_count": {"type": "integer", "minimum": 0},
+        "observation_record_count": {"type": "integer", "minimum": 0},
         "evidence_record_count": {"type": "integer", "minimum": 0}
       },
       "additionalProperties": false
@@ -163,6 +166,16 @@
       "required": ["evidence_id", "version", "sha256"],
       "properties": {
         "evidence_id": {"type": "string", "pattern": "^EVID-[0-9]{4,}$", "maxLength": 64},
+        "version": {"type": "integer", "minimum": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "observation_ref": {
+      "type": "object",
+      "required": ["observation_id", "version", "sha256"],
+      "properties": {
+        "observation_id": {"type": "string", "pattern": "^OBS-[0-9]{4,}$", "maxLength": 64},
         "version": {"type": "integer", "minimum": 1},
         "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
       },

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-import copy
 import json
 import os
 from pathlib import Path
@@ -955,7 +954,7 @@ class HardBudgetAndRunLifecycleTests(WorkflowTestCase):
             cpu_hours=1,
             storage_gb=1,
         )
-        manifest = self._run(paths, cpu_hours=0.75)
+        self._run(paths, cpu_hours=0.75)
         ledger_path = paths.study / "RUNS.ledger.json"
         ledger_before = load_json(ledger_path)
         removed = paths.root / ".objects" / "removed-runs-fixture"

@@ -7,17 +7,19 @@ import os
 from pathlib import Path
 import re
 import stat
-from typing import Any, Iterable
+from typing import Iterable
 
 
 SCHEMA_VERSION = 1
-EVIDENCE_SCHEMA_VERSION = 3
+OBSERVATION_SCHEMA_VERSION = 2
+EVIDENCE_SCHEMA_VERSION = 4
 CLAIMS_SCHEMA_VERSION = 2
-CHECKPOINT_SCHEMA_VERSION = 2
+CHECKPOINT_SCHEMA_VERSION = 3
 
 ID_PATTERNS = {
     "study": re.compile(r"^SC-[0-9]{4,}$"),
     "run": re.compile(r"^RUN-[0-9]{6}$"),
+    "observation": re.compile(r"^OBS-[0-9]{4,}$"),
     "evidence": re.compile(r"^EVID-[0-9]{4,}$"),
     "claim": re.compile(r"^CLAIM-[0-9]{4,}$"),
     "confirmation": re.compile(r"^CONF-[0-9]{4,}$"),
@@ -170,6 +172,19 @@ class StudyPaths:
         return self._safe_study_path(Path("evidence"), label="evidence directory")
 
     @property
+    def observations(self) -> Path:
+        return self._safe_study_path(
+            Path("observations"), label="observations directory"
+        )
+
+    @property
+    def observation_sequence(self) -> Path:
+        return self._safe_study_path(
+            Path("OBSERVATIONS.sequence.json"),
+            label="OBSERVATIONS.sequence.json",
+        )
+
+    @property
     def evidence_sequence(self) -> Path:
         return self._safe_study_path(
             Path("EVIDENCE.sequence.json"), label="EVIDENCE.sequence.json"
@@ -235,6 +250,7 @@ class StudyPaths:
             self.formal,
             self.work,
             self.runs,
+            self.observations,
             self.evidence,
             self.failed_directions,
             self.checkpoints,
@@ -261,6 +277,7 @@ class StudyPaths:
             self.brief,
             self.brief_approval,
             self.claims,
+            self.observation_sequence,
             self.evidence_sequence,
             self.checkpoint_sequence,
             self.verdict,
@@ -389,9 +406,3 @@ def study_paths(root: Path, study_id: str, *, must_exist: bool = True) -> StudyP
 
 def errors_only(issues: Iterable[ValidationIssue]) -> list[ValidationIssue]:
     return [issue for issue in issues if issue.level == "ERROR"]
-
-
-def as_jsonable(value: Any) -> Any:
-    if isinstance(value, Path):
-        return value.as_posix()
-    return value

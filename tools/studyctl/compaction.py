@@ -25,6 +25,8 @@ from .checkpoint_sequence import (
     require_checkpoint_sequence,
 )
 from .evidence_sequence import require_evidence_sequence
+from .observation import observation_index
+from .observation_sequence import require_observation_sequence
 from .formalization import collect_formalization_debt
 from .hashing import (
     atomic_write_json,
@@ -58,6 +60,7 @@ from .validation import (
     effective_run_epistemic_mode,
     evidence_index,
     evidence_paths,
+    observation_paths,
     object_schema_issues,
     run_file_references,
     run_index,
@@ -290,6 +293,14 @@ def _validate_prepared_bindings(
         )
     if source_hashes.get("evidence") != current_evidence_inventory_binding(paths):
         raise ValidationError("Evidence set changed after compact-prepare")
+    if source_hashes.get(
+        "observations"
+    ) != current_observation_inventory_binding(paths):
+        raise ValidationError("Observation set changed after compact-prepare")
+    if source_hashes.get("observation_sequence") != sha256_file(
+        paths.observation_sequence
+    ):
+        raise ValidationError("Observation sequence changed after compact-prepare")
     if source_hashes.get("evidence_sequence") != sha256_file(
         paths.evidence_sequence
     ):
@@ -479,6 +490,19 @@ def current_evidence_inventory_binding(paths: StudyPaths) -> dict[str, Any]:
     return _inventory_binding(records)
 
 
+def current_observation_inventory_binding(paths: StudyPaths) -> dict[str, Any]:
+    """Bind the complete optional Observation set."""
+
+    records = [
+        {
+            "path": path.relative_to(paths.root).as_posix(),
+            "sha256": sha256_file(path),
+        }
+        for path in observation_paths(paths)
+    ]
+    return _inventory_binding(records)
+
+
 def _materialize_inactive_claim_records(
     paths: StudyPaths,
     claims: dict[str, Any],
@@ -567,6 +591,7 @@ def prepare_compaction(paths: StudyPaths) -> Path:
     runs = run_index(paths)
     budget_state, budget_authority = _compaction_budget_state(paths, runs)
     evidence = evidence_index(paths)
+    observations = observation_index(paths)
     claims = load_json(paths.claims)
     if not isinstance(claims, dict):
         raise ValidationError("CLAIMS.json must be an object")
@@ -618,6 +643,24 @@ def prepare_compaction(paths: StudyPaths) -> Path:
         for key, (_, item) in sorted(evidence.items())
         if key not in claim_evidence
     ]
+    referenced_observations = {
+        (
+            str(reference.get("observation_id")),
+            int(reference.get("version", 0)),
+        )
+        for _, item in evidence.values()
+        for reference in [item.get("observation_ref")]
+        if isinstance(reference, dict)
+    }
+    unreferenced_observations = [
+        {
+            "observation_id": key[0],
+            "version": key[1],
+            "status": item.get("status"),
+        }
+        for key, (_, item) in sorted(observations.items())
+        if key not in referenced_observations
+    ]
     cohort_records = [
         {"cohort": cohort, "status_counts": dict(sorted(counts.items()))}
         for cohort, counts in sorted(cohort_status.items())
@@ -636,6 +679,8 @@ def prepare_compaction(paths: StudyPaths) -> Path:
             "brief": sha256_file(paths.brief),
             "brief_approval": sha256_file(paths.brief_approval) if paths.brief_approval.is_file() else None,
             "claims": sha256_file(paths.claims),
+            "observations": current_observation_inventory_binding(paths),
+            "observation_sequence": sha256_file(paths.observation_sequence),
             "evidence": evidence_binding,
             "evidence_sequence": sha256_file(paths.evidence_sequence),
             "checkpoint_sequence": sha256_file(paths.checkpoint_sequence),
@@ -653,6 +698,9 @@ def prepare_compaction(paths: StudyPaths) -> Path:
         "run_counts_by_epistemic_role": dict(sorted(epistemic_counts.items())),
         "run_counts_by_cohort_and_status": _bounded_index(cohort_records),
         "runs_not_referenced_by_evidence": _bounded_index(unreferenced_runs),
+        "observations_not_referenced_by_evidence": _bounded_index(
+            unreferenced_observations
+        ),
         "evidence_not_referenced_by_claims": _bounded_index(unreferenced_evidence),
         "active_formal_artifacts": _bounded_index(active_formal),
         "stale_formal_artifacts": _bounded_index(stale_formal),
@@ -742,6 +790,32 @@ def _evidence_ref_exists(
         and digest == record_digest(item, "record_sha256")
         and ref.get("sha256") == digest
     )
+
+
+def _observation_refs_for_evidence(
+    evidence_refs: list[dict[str, Any]],
+    evidence: dict[tuple[str, int], tuple[Path, dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Return deduplicated exact Observation refs reached through Evidence."""
+
+    observations: dict[tuple[str, int], dict[str, Any]] = {}
+    for reference in evidence_refs:
+        key = (
+            str(reference.get("evidence_id")),
+            int(reference.get("version", 0)),
+        )
+        target = evidence.get(key)
+        if target is None:
+            continue
+        observation = target[1].get("observation_ref")
+        if not isinstance(observation, dict):
+            continue
+        observation_key = (
+            str(observation.get("observation_id")),
+            int(observation.get("version", 0)),
+        )
+        observations[observation_key] = dict(observation)
+    return [observations[key] for key in sorted(observations)]
 
 
 def _normalize_archive_source(paths: StudyPaths, raw: str) -> tuple[Path, Path]:
@@ -928,6 +1002,14 @@ def _finalize_compaction_locked(paths: StudyPaths, plan_path: Path) -> Path:
         inactive_refs,
     )
     evidence_sequence = require_evidence_sequence(paths)
+    observation_sequence = require_observation_sequence(paths)
+    decisive_observations = _observation_refs_for_evidence(
+        [
+            *plan.get("decisive_evidence", []),
+            *plan.get("contradictory_evidence", []),
+        ],
+        evidence,
+    )
     run_ledger = load_ledger(paths)
     run_high_water_mark = (
         run_ledger["high_water_mark"]
@@ -954,11 +1036,15 @@ def _finalize_compaction_locked(paths: StudyPaths, plan_path: Path) -> Path:
         "inactive_claim_refs": checkpoint_inactive_refs,
         "active_context_watermarks": pressure_watermarks(
             run_count=run_high_water_mark,
+            observation_high_water_mark=observation_sequence[
+                "high_water_mark"
+            ],
             evidence_high_water_mark=evidence_sequence["high_water_mark"],
         ),
         "frontier": frontier,
         "decisive_evidence": plan.get("decisive_evidence", []),
         "contradictory_evidence": plan.get("contradictory_evidence", []),
+        "decisive_observations": decisive_observations,
         "open_questions": frontier.get("open_questions", []),
         "next_actions": frontier.get("next_actions", []),
         "budget_state": plan.get("budget_state", {}),

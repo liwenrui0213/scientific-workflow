@@ -31,8 +31,7 @@
     "tools/studyctl/**"
   ],
   "generated_patterns": [
-    "**/__pycache__/**",
-    "studies/*/generated/**"
+    "**/__pycache__/**"
   ],
   "vendor_patterns": [],
   "commands": {

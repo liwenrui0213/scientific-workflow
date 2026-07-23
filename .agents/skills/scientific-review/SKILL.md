@@ -28,7 +28,11 @@ or deciding which questions require human review.
    inputs, outputs, logs, governance snapshots, and formal snapshots. Check the
    base anchor, native validation, protected conditions, evaluator and split,
    mathematical mapping, baselines, Cohorts, uncertainty, contradictions, and
-   formalization debt. For every current Evidence version, challenge its
+   formalization debt. For a promoted Observation, verify every source Run,
+   inclusion/exclusion disposition, exact promotion Registry binding and
+   trigger applicability, analysis fingerprint, Cohort boundary, distribution,
+   uncertainty, anomaly, and representative failure before
+   reviewing any Claim interpretation. For every current Evidence version, challenge its
    observation-to-Claim bridge, auxiliary assumptions, competing explanations,
    and stated falsification conditions against the actual Runs and addressed
    Claim. For a high-strength Claim, inspect the frozen
@@ -59,6 +63,14 @@ or deciding which questions require human review.
 - Treat legacy or unbound Runs as exploratory. Reject post-hoc relabeling,
   cherry-picked confirmation slots, concealed attempts, or mixed Evidence that
   does not distinguish its exploratory and confirmatory components.
+- Reject a mutable/latest Observation reference, a stale Observation hash,
+  omitted source Run, hidden exclusion or minority observation, duplicate
+  analysis under a new ID, or any `supports`/`contradicts` semantics assigned
+  directly to an Observation.
+- Reject an unregistered promotion reason, stale Registry binding, reinterpreted
+  trigger, semantic trigger presented as mechanically verified, or extension
+  lacking an endorsed independent review and explicit human adoption. A
+  Reviewer may recommend a new trigger but cannot make it effective.
 
 ## Output and handoff
 

@@ -76,6 +76,37 @@
       },
       "additionalProperties": false
     },
+    "execution_boundary": {
+      "type": "object",
+      "required": [
+        "mode", "backend", "policy_sha256", "environment_allowlist",
+        "network_access", "repository_write_access", "declared_inputs_only",
+        "declared_outputs_only", "read_only_paths", "writable_paths"
+      ],
+      "properties": {
+        "mode": {"const": "sealed"},
+        "backend": {"enum": ["macos-seatbelt"]},
+        "policy_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "environment_allowlist": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "network_access": {"const": false},
+        "repository_write_access": {"const": false},
+        "declared_inputs_only": {"const": true},
+        "declared_outputs_only": {"const": true},
+        "read_only_paths": {
+          "type": "array", "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "writable_paths": {
+          "type": "array", "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        }
+      },
+      "additionalProperties": false
+    },
     "git": {
       "type": "object",
       "required": ["available", "commit", "dirty", "status", "status_sha256"],

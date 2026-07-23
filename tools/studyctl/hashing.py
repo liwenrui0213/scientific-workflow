@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import os
 from pathlib import Path
 import tempfile
@@ -197,10 +196,3 @@ def file_record(path: Path, root: Path) -> dict[str, Any]:
         "size": resolved.stat().st_size,
         "sha256": sha256_file(resolved),
     }
-
-
-def require_nonnegative_finite(name: str, value: float | int | None) -> float:
-    numeric = 0.0 if value is None else float(value)
-    if not math.isfinite(numeric) or numeric < 0:
-        raise ValidationError(f"{name} must be finite and non-negative")
-    return numeric

@@ -70,8 +70,8 @@ def _classify_safe_candidate(root: Path, study_id: str) -> StudyCandidate:
     ):
         return _invalid_candidate(
             study_id,
-            "legacy Claims schema is historical-validation-only; migrate it "
-            f"to bounded schema_version {CLAIMS_SCHEMA_VERSION} before resuming",
+            f"unsupported Claims schema_version: {claims.get('schema_version')!r}; "
+            f"current schema_version {CLAIMS_SCHEMA_VERSION} is required before resuming",
         )
 
     if not errors:

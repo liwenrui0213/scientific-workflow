@@ -3,6 +3,31 @@
 Compaction preserves epistemic state while reducing active context. It is not a
 ranking of attractive results and not a deletion policy.
 
+## Promote observations only when useful
+
+Treat `Run -> Evidence` as the default. Create an Observation Record only when
+at least one condition in the active versioned promotion-trigger Registry
+applies. Inspect it with `python -m tools.studyctl observation-trigger-list
+STUDY_ID`; do not invent an unregistered trigger or use independent review as a
+generic escape hatch. The initial Registry covers aggregation across Runs,
+multi-Claim reuse, complex analysis, Cohort crossings, anomalies or failures,
+Frontier or confirmatory use, independent review, cross-Checkpoint reuse, and
+material context deduplication.
+
+If a materially distinct reason is not registered, record it as a proposal and
+stop promotion. Explain why existing triggers are insufficient, the expected
+benefit, and abuse risks. A reviewed semantic extension becomes usable only
+after explicit human adoption and a protected append-only Registry update. A
+new structural trigger also requires a deterministic validator. Never treat a
+Reviewer recommendation alone as authority to change workflow policy.
+
+An Observation answers what the declared computation found. It binds every
+source Run, selection and exclusion rules, distribution and boundary results,
+uncertainty, anomalies, representative failures, analysis assumptions, and
+limitations. It never answers whether a Claim is supported. When two Claims
+reuse one Observation, write separate Evidence Arguments and allow their
+assessments to differ.
+
 ## Select decisive Evidence
 
 Treat Evidence as decisive when it materially changes at least one of:
@@ -57,15 +82,16 @@ authorized objective and better on at least one, under compatible Evidence.
 Archive a `work/active/` file only when its durable content has been promoted to
 an authoritative artifact or it is no longer needed to reproduce an active
 decision. The plan must identify the exact file. Generated projections, adopted
-host code, Runs, Evidence, Claims, formal artifacts, and human records are not
-scratch.
+host code, Runs, Observations, Evidence, Claims, formal artifacts, and human
+records are not scratch.
 
 ## Compaction self-check
 
 Before finalizing, ask:
 
 1. Can every active Claim still be traced to support and contradiction?
-2. Is every unique anomaly or failure boundary still discoverable?
-3. Does the Frontier contain only live, distinct choices?
-4. Did any wording become stronger while detail was removed?
-5. Would a fresh Agent know the next action and why it matters?
+2. Can every promoted Observation be traced to all source Runs and exclusions?
+3. Is every unique anomaly or failure boundary still discoverable?
+4. Does the Frontier contain only live, distinct choices?
+5. Did any wording become stronger while detail was removed?
+6. Would a fresh Agent know the next action and why it matters?

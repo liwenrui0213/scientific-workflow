@@ -15,10 +15,30 @@ Human Brief -> optional Formal Artifacts -> immutable Run
 The scientific interpretation chain is:
 
 ```text
-Work -> Run -> Evidence -> Claim -> human Verdict
+Work -> Run -> optional Observation Record -> Claim-specific Evidence
+     -> Claim synthesis -> human Verdict
 ```
 
-`work/active/` is a mutable scratch space. A Run records what actually executed under fixed code, inputs, configuration, environment and Cohort fields. Evidence states an explicit analysis of one or more Runs, including scope, uncertainty, limitations and contradictions. It also records a small inference argument: let \(O\) denote the reported observations, \(C\) the addressed Claim, and \(A\) the declared auxiliary assumptions. The Evidence must explain why \(O\), conditional on \(A\), changes support for \(C\); list live competing explanations; and state observations or failures that would overturn its assessment. This is not a proof that \(C\) is true. A Claim may reference only a finalized, hash-pinned Evidence version. A Verdict separately judges implementation and scientific Claims.
+`work/active/` is a mutable scratch space. A Run records what actually executed
+under fixed code, inputs, configuration, environment and Cohort fields. Simple
+observations remain inline in Evidence. An optional Observation Record is
+created only when analysis needs reuse, aggregation, independent review, or
+long-lived auditability. It records what was computed without assigning
+`supports` or `contradicts` semantics.
+
+More precisely, let \(R_1,\ldots,R_n\) be immutable Runs, let
+\(S\subseteq\{1,\ldots,n\}\) index the Runs selected by a declared analysis
+method \(A\), and define \(O=A(\{R_i:i\in S\})\). Here \(O\) is an Observation:
+the selected Runs, selection rules, aggregation, results, uncertainty,
+anomalies, failures, assumptions, and limitations. For one addressed Claim
+\(C\), Evidence records a separate inference argument explaining why \(O\),
+conditional on declared auxiliary assumptions, changes support for \(C\). It
+also lists live competing explanations and observations or failures that would
+overturn its assessment. This is not a proof that \(C\) is true. Each new
+Evidence Argument addresses exactly one Claim; multiple Claims may reuse the
+same exact Observation hash while reaching different assessments. A Claim may
+reference only finalized, hash-pinned Evidence. A Verdict separately judges
+implementation and scientific Claims.
 
 Runs also have an epistemic role. Every ordinary and legacy Run is
 `exploratory`: it may discover a hypothesis, narrow a candidate, or support an
@@ -420,11 +440,15 @@ python -m tools.studyctl run SC-0001 \
   -- python scripts/evaluate.py --config config/baseline.json
 ```
 
-Arguments after `--` are preserved as an argument vector and are never interpreted through a shell. The command runs from the profile's `run_cwd`; the manifest stores both its machine-local absolute path and portable profile-relative path. Before the child process starts, `studyctl` first reserves a never-reused ID and budget in the Study ledger, builds and fsyncs a complete hidden Run tree, atomically publishes its `running` Manifest, and binds that Manifest back into the ledger. Only then may it invoke the child. It later atomically replaces the Manifest with a read-only `succeeded`, `failed`, `interrupted`, or `incomplete` record. Output checking or hashing failures are sealed as visible `incomplete` records. If terminal replacement itself fails, the `running` Manifest and ledger reservation remain visible instead of disappearing from accounting. The terminal logs are sealed read-only whenever finalization can complete.
+Arguments after `--` are preserved as an argument vector and are never interpreted through a shell. The command runs from the profile's `run_cwd`; the manifest stores both its machine-local absolute path and portable profile-relative path. Before the child process starts, `studyctl` first reserves a never-reused ID and budget in the Study ledger, builds and fsyncs a complete hidden Run tree, atomically publishes its `running` Manifest, and binds that Manifest back into the ledger. Only then may it invoke the child inside a sealed execution boundary. It later atomically replaces the Manifest with a read-only `succeeded`, `failed`, `interrupted`, or `incomplete` record. Output checking or hashing failures are sealed as visible `incomplete` records. If terminal replacement itself fails, the `running` Manifest and ledger reservation remain visible instead of disappearing from accounting. The terminal logs are sealed read-only whenever finalization can complete.
 
 The manifest points to immutable per-Run copies of the repository profile, CHANGESET, validation proof, and active formal artifacts. It also classifies actual Git changes before and after execution and records whether the Run is Evidence-eligible. Later revisions of `METHOD`, `PROTOCOL`, or other active formal files therefore do not invalidate older Runs; changing a formal artifact during the Run does make that Run ineligible. `running` and `incomplete` Runs cannot enter Evidence. Validation scans allocated `RUN-*` directories as well as existing manifests, so a missing Manifest is an explicit registry error rather than an invisible orphan.
 
-Every mutable file statically visible in the command argv—including literal paths, quoted paths, and a directly executed local `python -m` module—must also be supplied with `--input`, so mutable code or configuration under `work/` or an ignored scratch directory cannot bypass provenance. Clean tracked files are already pinned by the recorded commit. General dynamic imports, generated path expressions, subprocesses, and obfuscated runtime file access cannot be discovered completely; the researcher or Agent must explicitly declare those mutable dependencies or move them into clean tracked host roots. Every declared output must use a new path below `object_root`; every produced regular file is hashed and sealed read-only. A missing declared output makes the Run Evidence-ineligible, and that declared path is thereafter reserved. Within one Study, normalized output ownership is checked inside the serialized registration transaction and becomes visible with the `running` Manifest, so concurrent registrars cannot claim the same still-absent path; validation independently rejects duplicate ownership across manifests. If an absent file appears later, or an existing output could not be hash-pinned, further Run admission fails closed until the retained bytes are resolved. Evidence creation and finalization re-check input, output, stdout, stderr, governance-snapshot, and formal-artifact-snapshot file types, sizes, and hashes. A missing or altered dependency makes the Run ineligible; it is not repaired by editing its immutable manifest.
+The sealed boundary is an enforcement mechanism, not merely an endpoint comparison. The child receives a newly constructed allowlisted environment, a private `HOME` and temporary directory, no network access, read access to the runtime, profile-declared source roots, direct command files, and declared inputs, and write access only to declared output files and its private temporary directory. Repository-wide writes are denied, so a command cannot temporarily replace approved code and restore it before final hashing. An inherited variable such as `HELDOUT_PATH=/tmp/heldout.json` is removed, and a target outside the read allowlist is inaccessible. The Manifest records the backend, policy digest, environment allowlist, and access claims in `execution_boundary`; a missing or non-sealed boundary is never Evidence-eligible. The current backend is macOS Seatbelt (`sandbox-exec`). A host without that backend fails before starting the scientific command; there is no silent endpoint-only fallback.
+
+This backend is not yet a complete content-addressed execution capsule. Profile `source_roots`, the Python/runtime prefix, selected system paths, and required local service lookups remain trusted readable ambient scope; undeclared data or default weights placed there are not excluded by the policy. The full Seatbelt policy is not retained with the Run, only its digest and summary, and Python dependencies or external programs are not independently content-pinned by this field. Therefore the boundary blocks the concrete hidden-environment-path and repository-rewrite examples only when the target lies outside those trusted readable roots and Seatbelt is actually applied; it does not by itself prove a complete, independently reconstructable computation boundary.
+
+Every mutable file statically visible in the command argv—including literal paths, quoted paths, and a directly executed local `python -m` module—must also be supplied with `--input`, so mutable code or configuration under `work/` or an ignored scratch directory cannot bypass provenance. Static discovery remains an early diagnostic, while the Seatbelt policy supplies the enforced host boundary described above. Profile `source_roots` are trusted code roots and must not contain held-out data or other undeclared scientific inputs. Every declared output must use a new path below `object_root`; every produced regular file is hashed and sealed read-only. A missing declared output makes the Run Evidence-ineligible, and that declared path is thereafter reserved. Within one Study, normalized output ownership is checked inside the serialized registration transaction and becomes visible with the `running` Manifest, so concurrent registrars cannot claim the same still-absent path; validation independently rejects duplicate ownership across manifests. If an absent file appears later, or an existing output could not be hash-pinned, further Run admission fails closed until the retained bytes are resolved. Evidence creation and finalization re-check input, output, stdout, stderr, governance-snapshot, and formal-artifact-snapshot file types, sizes, and hashes. A missing or altered dependency makes the Run ineligible; it is not repaired by editing its immutable manifest.
 
 Every declared `--output` must be a repository-relative path resolving below the configured, Git-ignored `object_root`; absolute outputs and outputs elsewhere are rejected before the computation starts. A declared output path must be new: `studyctl` refuses to overwrite an existing file and makes a produced regular file read-only after hashing it. Directory-shaped results must first be packaged into one immutable file, or represented by a hashed pointer manifest to an external artifact store. Bootstrap must merge an ignore rule for the chosen object root, and profile validation checks it. The manifest stores output paths, sizes, retention classes, and hashes.
 
@@ -560,6 +584,78 @@ covers the current campaign and cannot by itself satisfy the
 `numerically_supported` gate. Promotion becomes valid again only after new
 Evidence discloses the now-complete campaign.
 
+### Optional Observation Records
+
+The default path remains `Run -> Evidence`. Do not create one Observation per
+Run. Promote analysis into `observations/OBS-NNNN.vNNNN.json` only when at least
+one registered trigger applies. Inspect the active registry rather than assuming
+that a hard-coded list is complete:
+
+```bash
+python -m tools.studyctl observation-trigger-list SC-0001
+```
+
+Registry version 1 contains the initial conditions: multiple Runs, reuse by
+multiple Claims, complex analysis, multiple Cohorts, anomalies or failures,
+Frontier dependency, confirmatory use, independent review, reuse across
+Checkpoints, and material context deduplication.
+
+Create and edit a draft, then seal it:
+
+```bash
+python -m tools.studyctl observation-new SC-0001 \
+  --id OBS-0001 \
+  --run RUN-000001 \
+  --run RUN-000002 \
+  --trigger multiple_runs \
+  --trigger independent_review
+
+python -m tools.studyctl observation-finalize SC-0001 \
+  --file <study_root>/SC-0001/observations/OBS-0001.v0001.json
+```
+
+The draft must disclose its promotion rationale, exact Run hashes and
+dispositions, Cohort fingerprints, method and implementation/evaluator hashes
+when applicable, inclusion/exclusion/aggregation rules, results, distribution
+or boundary cases, three uncertainty categories, scope, anomalies,
+representative failures, analysis assumptions, and limitations. Cross-Cohort
+analysis requires an explicit compatibility justification. Excluded, anomalous,
+and representative-failure Runs require a rationale and remain visible.
+
+Every draft also binds the exact promotion-trigger Registry
+`{version, sha256}`. Registry snapshots live under
+`scientific-workflow/observation-trigger-registries/`, form a contiguous
+hash-linked chain, and are append-only: a later version may add a trigger but
+cannot remove or reinterpret an existing trigger. Old Observations therefore
+retain their original promotion meaning after the Registry grows.
+
+An unregistered reason is a proposal, not a usable trigger. The Agent must first
+explain why no existing condition covers it, the expected benefit, and the
+foreseeable abuse risks. A fresh independent Reviewer may recommend the proposal,
+but review alone does not change workflow policy. After explicit human adoption,
+a separate workflow-maintenance change may append a Registry version:
+
+- a semantic extension records its definition, endorsed independent-review
+  rationale, reviewer-independence statement, explicit human-adoption rationale,
+  and authorization statement;
+- a structural extension additionally requires a supported deterministic
+  validator in `studyctl`; prose cannot impersonate a mechanical check;
+- confirmatory use must be explicitly allowed by the registered definition;
+- a generic `other` trigger and arbitrary unregistered strings remain invalid.
+
+The Registry and its governance metadata are protected workflow sources rather
+than Study outputs. Their hashes prove which reviewed rule an Observation used;
+they do not cryptographically authenticate the identities behind the recorded
+review and human-authorization statements. Repository review and the required
+separation of roles remain responsible for those identities.
+
+Finalization computes an analysis fingerprint over the exact Run references,
+Cohorts, selection dispositions, and analysis method. A finalized Observation is
+immutable; a correction creates a new version. A different Observation ID with
+the same analysis fingerprint is rejected so callers reuse the existing record.
+Observation has no Claim ID or assessment field and therefore cannot itself
+support or contradict a Claim.
+
 Create an Evidence draft from terminal Runs:
 
 ```bash
@@ -570,6 +666,24 @@ python -m tools.studyctl evidence-new SC-0001 \
   --run RUN-000002
 ```
 
+To reuse a promoted Observation, bind its exact version while retaining the Run
+subset used by the Claim-specific argument:
+
+```bash
+python -m tools.studyctl evidence-new SC-0001 \
+  --id EVID-0002 \
+  --claim CLAIM-0001 \
+  --run RUN-000001 \
+  --observation-id OBS-0001 \
+  --observation-version 1
+```
+
+The selected Evidence Runs must be an exact-hash subset of the Observation Runs
+whose disposition is `included` or `anomaly`; an excluded or
+representative-failure Run cannot silently become the basis of the Evidence.
+The Evidence reference pins `{observation_id, version, sha256}`. Omitting the
+Observation flags keeps the observation inline and creates no new artifact.
+
 Edit the reported draft. Explicitly fill its question, Run roles, analysis method, result, scope, uncertainty, limitations and assessment. Also complete `inference.observation_to_claim`, `inference.auxiliary_assumptions`, `inference.competing_explanations`, and `inference.falsification_conditions`; each list needs at least one substantive entry before finalization. For multiple Cohort fingerprints, list changed fields and a compatibility justification. Seal it with:
 
 ```bash
@@ -579,17 +693,16 @@ python -m tools.studyctl evidence-finalize SC-0001 \
 
 Update `CLAIMS.json` with the finalized `{evidence_id, version, sha256}` reference. Do not omit contradictory Evidence.
 
-The current Evidence schema enforces this argument without introducing a separate
-artifact type. A result may be exact while its interpretation still depends on
-an implementation mapping, measurement validity, model assumptions, or an
-exclusion of alternative mechanisms. The reasoning bridge must therefore
+The current Evidence schema enforces this argument whether the observation is
+inline or hash-referenced. A result may be exact while its interpretation still
+depends on an implementation mapping, measurement validity, model assumptions,
+or an exclusion of alternative mechanisms. The reasoning bridge must therefore
 connect the actual observations to the exact addressed Claim rather than merely
 repeat either one. Auxiliary assumptions state what must hold for that bridge;
 competing explanations state other mechanisms consistent with the observations;
 falsification conditions identify concrete future observations, integrity
 failures, or discriminating checks that would make the current assessment no
-longer defensible. Finalized schema V1 Evidence remains immutable historical
-Evidence and is not retroactively upgraded.
+longer defensible.
 
 Set the Claim's `evidence_basis` to the basis computed from its supporting
 Evidence. `under_test` and scoped `partially_supported` may rely on exploratory
@@ -618,7 +731,7 @@ python -m tools.studyctl context SC-0001
 python -m tools.studyctl status SC-0001
 ```
 
-`profile-validate` checks repository adaptation. `validate-changes` executes and pins the host validation contract. `check-changes` regenerates `generated/CHANGES.json` from Git. `validate` checks schemas, IDs, immutable digests, approval freshness, references, profile/CHANGESET/validation state, actual change scope, Confirmation bindings and slot coverage, Run dependency integrity and eligibility, Evidence basis, Claim evidence strength, Cohort compatibility, Checkpoint links, and Verdict structure. `context` regenerates the bounded `generated/ACTIVE_CONTEXT.json` selector; `status` regenerates `generated/STATUS.md`. Generated files are projections and are never authoritative.
+`profile-validate` checks repository adaptation. `validate-changes` executes and pins the host validation contract. `check-changes` regenerates `generated/CHANGES.json` from Git. `validate` checks schemas, IDs, immutable digests, approval freshness, references, profile/CHANGESET/validation state, actual change scope, Confirmation bindings and slot coverage, Run dependency integrity and eligibility, Observation source/fingerprint integrity, Evidence basis and Observation bindings, Claim evidence strength, Cohort compatibility, Checkpoint links, and Verdict structure. `context` regenerates the bounded `generated/ACTIVE_CONTEXT.json` selector; `status` regenerates `generated/STATUS.md`. Generated files are projections and are never authoritative.
 
 ### Bounded active context and automatic compaction pressure
 
@@ -630,7 +743,10 @@ and content hashes rather than full semantic payloads. The approved Brief,
 active formal artifacts, and latest Checkpoint are represented by
 path/hash/size and compact count summaries. A separate bounded Confirmation
 index exposes editable drafts, pending/running slots, and records awaiting
-Evidence; resume these locators before creating a new Confirmation. Inspect only the authoritative
+Evidence. `decisive_observations` contains only short result previews,
+Run/Cohort counts, exact hashes, paths, and the Evidence IDs that use each
+Observation; it never injects complete Observation contents by default. Resume
+these locators before creating a new Confirmation. Inspect only the authoritative
 source sections or IDs needed by the current question. Load older Runs,
 Evidence, Checkpoints, retired Claims, or work notes only by an explicit ID or
 question. `STATUS.md` is a bounded human-facing projection, not the default
@@ -642,26 +758,16 @@ Only active Claims may appear in the Frontier. Retirement and supersession are
 provisional edits until the next immutable Checkpoint seals them; after that
 boundary they are terminal. A replacement receives a new Claim ID and the old
 Claim records `superseded_by`, and every supersession chain must end at an
-active Claim. Legacy Claims without a lifecycle are interpreted as active, but
-schema-V2 Claims must make the lifecycle explicit.
+active Claim. The current Claims schema requires an explicit lifecycle.
 
-Claims schema V1 is retained only so historical bytes can still be validated
-and audited. Because V1 had no structural size limits, it is never accepted as
-active context: `context`, Run/Evidence growth, review-packet generation and
-compaction preparation fail closed, while `status` emits only a bounded
-migration notice. Migration is deliberately semantic rather than automatic:
-
-1. preserve and commit the exact V1 `CLAIMS.json` (or otherwise pin its hash);
-2. inspect Claims by selected ID and decide which remain active, which are
-   retired, and which are superseded;
-3. construct a schema-V2 `CLAIMS.json` with a small Frontier, bounded current
-   questions/actions, explicit lifecycles, and no silently discarded Claim;
-4. keep omitted historical content recoverable from Git or an immutable
-   archived source, then run `validate`, `context`, and `status`.
-
-The CLI cannot choose those lifecycle or scientific-meaning decisions, so it
-does not provide an automatic truncating migrator. An ID-less resolver reports
-the Study as migration-required instead of allocating a replacement Study.
+The current runtime accepts only the current Claims, Observation, Evidence, and
+Checkpoint schemas. Any unsupported schema version fails closed before normal Study
+operation: the current CLI does not validate it as a retained historical schema
+variant, infer missing Evidence semantics, or rewrite it in place. Keep an older
+installation on a Git-pinned compatible workflow, or perform an explicit,
+reviewed offline migration on an isolated copy and validate every migrated
+record, reference, digest, and immutable-history binding before adopting the
+current runtime. Never allocate a replacement Study to bypass incompatibility.
 
 `policy.json` defines soft and hard thresholds for active, total-authoritative,
 and terminal Claims; `CLAIMS.json` bytes; Frontier questions/actions/decisions;
@@ -679,9 +785,10 @@ runtime cache, so crossing a soft threshold becomes visible without dirtying
 the scientific Git worktree.
 
 Each new Checkpoint stores only Frontier-selected active Claim snapshots,
-compact content-addressed references for non-Frontier Claims, and watermarks
-that reset Run/Evidence pressure. `compact-prepare` includes only the latest
-Checkpoint reference, never every historical Frontier.
+compact content-addressed references for non-Frontier Claims, exact Observation
+refs reached through decisive or contradictory Evidence, and watermarks for
+Run, Observation, and Evidence creation. `compact-prepare` includes only the
+latest Checkpoint reference, never every historical Frontier.
 
 After a Checkpoint seals `retired` or `superseded` Claims, a later semantic
 compaction may remove those terminal records from the current `CLAIMS.json`.
@@ -703,16 +810,16 @@ Compaction keeps active context finite while preserving all history. It updates 
 
 ```bash
 python -m tools.studyctl compact-prepare SC-0001
-# Use research-compaction to update Evidence/Claims, then rerun compact-prepare
+# Use research-compaction to update Observations/Evidence/Claims, then rerun compact-prepare
 # before binding the final plan to the current hashes.
 python -m tools.studyctl compact-finalize SC-0001 \
   --plan studies/SC-0001/work/COMPACTION_PLAN.json
 ```
 
-The plan must match `scientific-workflow/schemas/compaction-plan.schema.json`, live outside `work/active/`, and pin the current compaction-input, Claims hash, and constant-size Evidence inventory binding (`total_count` plus the canonical full `inventory_sha256`). It never copies the complete Evidence path/hash map. Finalization recomputes that binding and also rechecks the repository-profile hash, consequential host-scope fingerprint/count, and complete `work/active/` inventory; drift requires a new prepare step.
+The plan must match `scientific-workflow/schemas/compaction-plan.schema.json`, live outside `work/active/`, and pin the current compaction-input, Claims hash, and constant-size Evidence inventory binding (`total_count` plus the canonical full `inventory_sha256`). It never copies the complete Evidence path/hash map. `COMPACTION_INPUT.json` separately binds the complete Observation inventory and monotone Observation sequence, so creating, changing, or deleting an Observation after preparation makes the plan stale. Finalization recomputes these bindings and also rechecks the repository-profile hash, consequential host-scope fingerprint/count, and complete `work/active/` inventory; drift requires a new prepare step.
 
 `COMPACTION_INPUT.json` does not copy an unbounded history into the Agent
-context. Collections that can grow with Runs, Evidence, Cohorts, formal
+context. Collections that can grow with Runs, Observations, Evidence, Cohorts, formal
 artifacts, failed directions, or `work/active/` are bounded indexes. Each index
 contains a deterministic `items` batch plus `total_count`, `selected_count`,
 `truncated`, and an `inventory_sha256` over the complete ordered inventory.
@@ -725,8 +832,8 @@ inspect source records by the current question, compact one relevant batch,
 finalize, and prepare again. Finalization recomputes the complete
 `work/active/` inventory hash, so changing an entry omitted from `items` still
 invalidates the prepared plan. Compaction archives only explicitly selected
-scratch files and never deletes historical Runs, Evidence, Claims, or output
-objects.
+scratch files and never deletes historical Runs, Observations, Evidence, Claims,
+or output objects.
 
 Garbage collection is storage triage. V2 still only reports candidates and never deletes:
 
@@ -807,8 +914,8 @@ the Agent only translates and records the authorized content.
 1. Open the Run manifest below the configured `study_root` and verify its integrity with `studyctl validate`.
 2. Read the Run-local governance snapshots for the exact repository profile, CHANGESET, and validation proof, then restore the base/Run commit and Study branch. A non-Git or dirty-host-code Run is explicitly ineligible for Evidence.
 3. Restore inputs by their recorded paths and SHA-256 values; use the Run-local formal-artifact snapshots rather than whichever method files are currently active.
-4. Recreate the recorded Python/runtime, hardware class, precision and selected environment fields.
-5. Execute the recorded `execution.argv` directly as an argument vector, not as a reconstructed shell string. Compare output hashes and inspect `stdout.log` and `stderr.log`.
+4. Recreate the recorded Python/runtime, hardware class and precision. Reconstruct only the environment keys listed by `execution_boundary.environment_allowlist`; do not restore the caller's ambient environment.
+5. Recreate an isolation policy equivalent to the recorded `execution_boundary` and verify its policy digest. Execute the recorded `execution.argv` directly as an argument vector inside that boundary, not as a reconstructed shell string. Compare output hashes and inspect `stdout.log` and `stderr.log`.
 
 New Runs use manifest schema V4 and require an explicit epistemic role. V1,
 V2, and V3 predate that contract and are permanently interpreted as
@@ -819,14 +926,6 @@ Evidence-ineligible because it predates the repository-profile, change-scope,
 validation-proof, and dependency-integrity contract. V3 retains its original
 ledger and budget semantics. Compatibility views never rewrite old Manifest
 bytes.
-
-Finalized Evidence created before epistemic roles existed remains immutable and
-is interpreted conservatively as exploratory. For a legacy Claim, preserve its
-Evidence references, set `evidence_basis` to the computed conservative basis,
-and change `numerically_supported` to a scoped `partially_supported` state unless
-new Runs under a frozen Confirmation satisfy the strong gate. This semantic
-migration requires scientific judgment; never rewrite or relabel old Run or
-Evidence bytes.
 
 A genuinely pre-ledger Study cannot silently create a new identity namespace.
 After independently checking that its visible V1/V2 history is intact and has
@@ -841,7 +940,8 @@ It cannot prove from local files alone that a continuous tail was never deleted
 before migration; use Git, backups, scheduler records, or another external
 append-only anchor to establish that historical premise.
 
-A pre-sequence Evidence history has the analogous explicit migration:
+A schema-compatible pre-sequence Evidence history has the analogous explicit
+migration:
 
 ```bash
 python -m tools.studyctl migrate-evidence-sequence SC-0001
@@ -851,7 +951,8 @@ It validates canonical continuous versions and Checkpoint watermarks before
 creating the monotone counter. Its origin record states the unavoidable lower
 assurance for deletions that may have happened before migration.
 
-A pre-sequence Checkpoint history uses the separate explicit migration:
+A schema-compatible pre-sequence Checkpoint history uses the separate explicit
+migration:
 
 ```bash
 python -m tools.studyctl migrate-checkpoint-sequence SC-0001

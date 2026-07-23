@@ -13,6 +13,7 @@ Brief requirement
 -> formal method or protocol
 -> source symbol and test
 -> sealed Run
+-> optional finalized Observation
 -> finalized Evidence
 -> scoped Claim
 ```
@@ -21,7 +22,10 @@ At every link, check both identity and meaning. Matching IDs and hashes show
 which object was used; they do not prove that a mathematical derivation,
 implementation, comparison, or interpretation is scientifically valid.
 
-For every Evidence record, separate the observed result from its inference.
+For every promoted Observation, first verify that the complete source Run set,
+dispositions, analysis method, Cohorts, uncertainty, anomalies, exclusions, and
+representative failures support the recorded result without selection loss.
+Then, for every Evidence record, separate the observed result from its inference.
 Check whether the observation-to-Claim bridge actually follows under the stated
 auxiliary assumptions, whether a listed competing explanation fits the same
 observations, and whether the falsification conditions are concrete enough to
@@ -57,6 +61,10 @@ Choose probes relevant to the Claim:
 - test an ablation or negative control implied by the claimed mechanism;
 - inspect seed selection, excluded Runs, stopping decisions, and contradictory
   Evidence for selection bias;
+- for a promoted Observation, inspect its exact trigger-Registry version and
+  hash; verify that each trigger actually applies, that a reviewed extension
+  preserves prior trigger definitions, and that governance records both an
+  endorsed independent review and explicit human adoption;
 - for confirmatory Evidence, compare the frozen time, Claim/candidate/protocol/
   evaluator bindings, held-out history, planned slots, and analysis rule with
   every workflow-visible attempt; treat a truncated attempt index as a prompt

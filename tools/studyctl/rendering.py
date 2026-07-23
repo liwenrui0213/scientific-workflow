@@ -6,6 +6,7 @@ from typing import Any, Iterable
 
 from .active_context import (
     active_claims,
+    claim_lifecycle,
     compaction_pressure,
     refresh_active_projection,
     write_active_selector,
@@ -99,6 +100,14 @@ def active_formal_artifacts(paths: StudyPaths) -> list[dict[str, Any]]:
 
 def _evidence_ref_key(ref: dict[str, Any]) -> tuple[str, int]:
     return str(ref.get("evidence_id")), int(ref.get("version", 0))
+
+
+def _declared_evidence_mode(item: dict[str, Any]) -> str | None:
+    basis = item.get("evidence_basis")
+    if not isinstance(basis, dict):
+        return None
+    mode = basis.get("mode")
+    return str(mode) if mode in {"exploratory", "confirmatory", "mixed"} else None
 
 
 def _load_claims(paths: StudyPaths) -> dict[str, Any]:
@@ -254,41 +263,30 @@ def _append_items(lines: list[str], items: Iterable[str], empty: str = "None rec
         lines.append(f"- {item}")
 
 
-def _render_historical_claims_status(
+def _render_unsupported_claims_status(
     paths: StudyPaths,
     claims_data: dict[str, Any],
     validation_issues: list[Any],
 ) -> Path:
-    """Render a bounded migration notice without expanding legacy V1 content."""
+    """Render a bounded fail-closed notice for any unsupported Claims version."""
 
-    claims = claims_data.get("claims")
-    frontier = claims_data.get("frontier")
-    claim_count = len(claims) if isinstance(claims, list) else 0
-    frontier_ids = (
-        frontier.get("claim_ids", []) if isinstance(frontier, dict) else []
-    )
-    frontier_count = len(frontier_ids) if isinstance(frontier_ids, list) else 0
     error_count = sum(item.level == "ERROR" for item in validation_issues)
     warning_count = sum(item.level == "WARNING" for item in validation_issues)
     lines = [
         f"# Study Status: {paths.study_id}",
         "",
-        "## Active Context Migration Required",
+        "## Unsupported Claims State",
         "",
-        f"- Claims schema version: `{claims_data.get('schema_version')!r}`",
-        f"- Required active schema version: `{CLAIMS_SCHEMA_VERSION}`",
+        f"- Observed Claims schema version: `{claims_data.get('schema_version')!r}`",
+        f"- Required current schema version: `{CLAIMS_SCHEMA_VERSION}`",
         f"- Authoritative Claims path: `{paths.claims.relative_to(paths.root).as_posix()}`",
         f"- Authoritative Claims bytes: {paths.claims.stat().st_size}",
         f"- Authoritative Claims SHA-256: `{sha256_file(paths.claims)}`",
-        f"- Historical Claim count: {claim_count}",
-        f"- Historical Frontier count: {frontier_count}",
         f"- Validation summary: {error_count} error(s), {warning_count} warning(s)",
         "",
-        "This historical Claims format is validation-only because it has no "
-        "structural context bounds. Active context, Runs, Evidence, review, "
-        "and compaction finalization remain blocked until a deliberate semantic "
-        "migration produces a bounded current CLAIMS.json. Preserve the old "
-        "bytes in version history; do not truncate scientific content silently.",
+        "CLAIMS.json uses an unsupported schema_version. Status rendering fails "
+        "closed without projecting Claim content; repair the authoritative file "
+        "to the canonical current schema before resuming active operations.",
     ]
     output = paths.generated / "STATUS.md"
     atomic_write_bytes(output, ("\n".join(lines) + "\n").encode("utf-8"))
@@ -301,7 +299,7 @@ def render_status(paths: StudyPaths) -> Path:
     authority_warnings = [item for item in validation_issues if item.level == "WARNING"]
     claims_data = _load_claims(paths)
     if claims_data.get("schema_version") != CLAIMS_SCHEMA_VERSION:
-        return _render_historical_claims_status(
+        return _render_unsupported_claims_status(
             paths,
             claims_data,
             validation_issues,
@@ -512,9 +510,9 @@ def render_status(paths: StudyPaths) -> Path:
             statement = str(claim.get("statement", "")).replace("|", "\\|").replace("\n", " ")
             lines.append(
                 f"| `{claim.get('claim_id')}` | "
-                f"`{claim.get('lifecycle', 'active')}` | "
+                f"`{claim_lifecycle(claim)}` | "
                 f"`{claim.get('state')}` | "
-                f"`{claim.get('evidence_basis', 'none')}` | {statement} |"
+                f"`{claim.get('evidence_basis')}` | {statement} |"
             )
     else:
         lines.append("No Frontier-selected Claims recorded.")
@@ -650,7 +648,7 @@ def render_status(paths: StudyPaths) -> Path:
         record = evidence.get(key)
         if record:
             source, item = record
-            basis = item.get("evidence_basis", {}).get("mode", "exploratory")
+            basis = _declared_evidence_mode(item)
             decisive_rows.append(
                 f"`{key[0]}` v{key[1]} — `{item.get('assessment')}` / `{basis}` — "
                 f"source: `{source.relative_to(paths.root).as_posix()}` — "
@@ -664,7 +662,7 @@ def render_status(paths: StudyPaths) -> Path:
         record = evidence.get(key)
         if record:
             source, item = record
-            basis = item.get("evidence_basis", {}).get("mode", "exploratory")
+            basis = _declared_evidence_mode(item)
             contradictory_rows.append(
                 f"`{key[0]}` v{key[1]} — `{item.get('assessment')}` / `{basis}` — "
                 f"source: `{source.relative_to(paths.root).as_posix()}` — "
@@ -678,7 +676,7 @@ def render_status(paths: StudyPaths) -> Path:
         record = evidence.get(key)
         if record:
             source, item = record
-            basis = item.get("evidence_basis", {}).get("mode", "exploratory")
+            basis = _declared_evidence_mode(item)
             other_rows.append(
                 f"`{key[0]}` v{key[1]} — `{item.get('assessment')}` / `{basis}` — "
                 f"source: `{source.relative_to(paths.root).as_posix()}` — "

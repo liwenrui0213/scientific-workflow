@@ -1,0 +1,138 @@
+{
+  "previous_registry_sha256": null,
+  "registry_sha256": "ba0bff3371dde2e53385c8fa9d92559ceeed46e04ca9df6897fce85b0cab7a9a",
+  "registry_version": 1,
+  "schema_version": 1,
+  "triggers": [
+    {
+      "confirmatory_allowed": true,
+      "description": "The promoted analysis explicitly preserves anomalies or representative failures.",
+      "governance": {
+        "human_adoption": null,
+        "independent_review": null,
+        "origin": "builtin",
+        "proposal": null
+      },
+      "id": "anomalies_or_failures",
+      "kind": "structural",
+      "validator": "anomalies_or_failures"
+    },
+    {
+      "confirmatory_allowed": true,
+      "description": "The analysis must remain stable and reusable across immutable Checkpoints.",
+      "governance": {
+        "human_adoption": null,
+        "independent_review": null,
+        "origin": "builtin",
+        "proposal": null
+      },
+      "id": "checkpoint_reuse",
+      "kind": "semantic",
+      "validator": null
+    },
+    {
+      "confirmatory_allowed": true,
+      "description": "The analysis uses a complex model, transformation, fit, or uncertainty calculation that needs an independent record.",
+      "governance": {
+        "human_adoption": null,
+        "independent_review": null,
+        "origin": "builtin",
+        "proposal": null
+      },
+      "id": "complex_analysis",
+      "kind": "semantic",
+      "validator": null
+    },
+    {
+      "confirmatory_allowed": true,
+      "description": "The analysis contains confirmatory Runs and must remain visible as a formal Observation.",
+      "governance": {
+        "human_adoption": null,
+        "independent_review": null,
+        "origin": "builtin",
+        "proposal": null
+      },
+      "id": "confirmatory_use",
+      "kind": "structural",
+      "validator": "confirmatory_use"
+    },
+    {
+      "confirmatory_allowed": true,
+      "description": "Formal promotion removes material repeated analysis content from bounded active context.",
+      "governance": {
+        "human_adoption": null,
+        "independent_review": null,
+        "origin": "builtin",
+        "proposal": null
+      },
+      "id": "context_deduplication",
+      "kind": "semantic",
+      "validator": null
+    },
+    {
+      "confirmatory_allowed": true,
+      "description": "The analysis materially enters or constrains the current research Frontier.",
+      "governance": {
+        "human_adoption": null,
+        "independent_review": null,
+        "origin": "builtin",
+        "proposal": null
+      },
+      "id": "frontier_dependency",
+      "kind": "semantic",
+      "validator": null
+    },
+    {
+      "confirmatory_allowed": true,
+      "description": "The analysis requires independent review as a separately auditable computational record.",
+      "governance": {
+        "human_adoption": null,
+        "independent_review": null,
+        "origin": "builtin",
+        "proposal": null
+      },
+      "id": "independent_review",
+      "kind": "semantic",
+      "validator": null
+    },
+    {
+      "confirmatory_allowed": true,
+      "description": "The same analysis will be reused by two or more Claims while Evidence remains Claim-specific.",
+      "governance": {
+        "human_adoption": null,
+        "independent_review": null,
+        "origin": "builtin",
+        "proposal": null
+      },
+      "id": "multi_claim_reuse",
+      "kind": "semantic",
+      "validator": null
+    },
+    {
+      "confirmatory_allowed": true,
+      "description": "The promoted analysis combines Runs from more than one exact Cohort fingerprint.",
+      "governance": {
+        "human_adoption": null,
+        "independent_review": null,
+        "origin": "builtin",
+        "proposal": null
+      },
+      "id": "multiple_cohorts",
+      "kind": "structural",
+      "validator": "multiple_cohorts"
+    },
+    {
+      "confirmatory_allowed": true,
+      "description": "The promoted analysis aggregates or compares at least two immutable Runs.",
+      "governance": {
+        "human_adoption": null,
+        "independent_review": null,
+        "origin": "builtin",
+        "proposal": null
+      },
+      "id": "multiple_runs",
+      "kind": "structural",
+      "validator": "multiple_runs"
+    }
+  ]
+}

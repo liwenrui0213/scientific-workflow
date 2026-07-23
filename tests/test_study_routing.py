@@ -10,7 +10,7 @@ from tests.helpers import REPOSITORY_ROOT, TTYBuffer, WorkflowTestCase, complete
 from tools.studyctl.approval import record_verdict
 from tools.studyctl.approval import begin_brief_revision
 from tools.studyctl.hashing import atomic_write_json, load_json
-from tools.studyctl.models import StudyPaths, WorkflowError
+from tools.studyctl.models import CLAIMS_SCHEMA_VERSION, StudyPaths, WorkflowError
 from tools.studyctl.study_routing import classify_study_dirs, resolve_study
 
 
@@ -158,18 +158,23 @@ class StudyRoutingTests(WorkflowTestCase):
         self.assertEqual(verdict["judged_scope"]["evidence"], [])
         self.assertEqual((selected.study_id, selected.phase), ("SC-2003", "approved"))
 
-    def test_legacy_claims_require_same_study_migration_not_replacement(self) -> None:
+    def test_unsupported_claims_schema_requires_same_study_repair(self) -> None:
         paths = self.approved_study("SC-2008")
         claims = load_json(paths.claims)
-        claims["schema_version"] = 1
+        claims["schema_version"] = CLAIMS_SCHEMA_VERSION + 1
         atomic_write_json(paths.claims, claims)
         before = self.study_tree_snapshot()
 
         candidate = classify_study_dirs(self.root)[0]
         self.assertEqual((candidate.study_id, candidate.phase), ("SC-2008", "invalid"))
-        self.assertIn("historical-validation-only", candidate.detail)
-        with self.assertRaisesRegex(WorkflowError, "migrate it.*before resuming"):
+        self.assertIn("unsupported Claims schema_version", candidate.detail)
+        with self.assertRaisesRegex(WorkflowError, "repair this Study"):
             resolve_study(self.root)
+        with self.assertRaisesRegex(
+            WorkflowError,
+            "repair it instead of initializing a replacement Study",
+        ):
+            resolve_study(self.root, paths.study_id)
 
         result = self.cli_resolve()
         self.assertEqual(result.returncode, 2)
