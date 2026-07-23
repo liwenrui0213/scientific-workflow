@@ -198,9 +198,10 @@ Verdict 的 ID、时间、身份、commit 以及 Brief、Checkpoint、Claim、Ev
 ```text
 自由探索
   -> 选择候选并明确待确认 Claim
+  -> 为该精确 Claim 版本建立 confirmation campaign
   -> 冻结候选、协议、评价器、held-out 条件和分析规则
   -> 运行新的 confirmatory Runs
-  -> 生成 confirmatory Evidence
+  -> 生成覆盖整个 campaign 的 confirmatory Evidence
   -> 提升 Claim
 ```
 

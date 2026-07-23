@@ -208,6 +208,7 @@ def _exploratory_evidence_basis(run_ids: Sequence[str]) -> dict[str, Any]:
         "exploratory_run_ids": list(run_ids),
         "confirmatory_run_ids": [],
         "confirmation": None,
+        "confirmation_campaign": None,
         "planned_slot_ids": [],
         "included_slot_ids": [],
         "missing_slot_ids": [],
@@ -315,11 +316,66 @@ def _ineligible_confirmation_run_reason(manifest: dict[str, Any]) -> str:
     )
 
 
+def _qualified_slot_id(confirmation_id: str, slot_id: str) -> str:
+    return f"{confirmation_id}/{slot_id}"
+
+
+def _confirmation_campaign_projection(
+    records: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    if not records:
+        raise ValidationError("Confirmation campaign must contain at least one record")
+    campaign = records[0].get("campaign")
+    if not isinstance(campaign, dict):
+        raise ValidationError("Confirmation requires campaign metadata")
+    projected: list[dict[str, Any]] = []
+    for record in records:
+        metadata = record.get("campaign")
+        if not isinstance(metadata, dict):
+            raise ValidationError("Confirmation requires campaign metadata")
+        projected.append(
+            {
+                "confirmation_id": str(record["confirmation_id"]),
+                "sha256": str(record["record_sha256"]),
+                "sequence": metadata.get("sequence"),
+                "continuation_kind": metadata.get("continuation_kind"),
+                "rationale": metadata.get("rationale"),
+                "changes": copy.deepcopy(metadata.get("changes")),
+                "supersedes": copy.deepcopy(metadata.get("supersedes")),
+                "invalidity_reason": metadata.get("invalidity_reason"),
+            }
+        )
+    return {
+        "campaign_id": str(campaign["campaign_id"]),
+        "confirmations": projected,
+    }
+
+
+def _registered_analysis_plans(
+    records: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    plans: list[dict[str, Any]] = []
+    for record in records:
+        analysis_plan = record.get("analysis_plan")
+        if not isinstance(analysis_plan, dict):
+            raise ValidationError("Confirmation analysis_plan must be an object")
+        plans.append(
+            {
+                "confirmation_id": str(record["confirmation_id"]),
+                "sha256": str(record["record_sha256"]),
+                "analysis_plan_sha256": sha256_json(analysis_plan),
+            }
+        )
+    return plans
+
+
 def _derive_evidence_basis(
     paths: StudyPaths,
     claim_ids: Sequence[str],
     manifests: Sequence[dict[str, Any]],
-) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    *,
+    campaign_sequence_limit: int | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     exploratory_run_ids: list[str] = []
     selected_confirmatory: list[tuple[str, dict[str, Any], dict[str, str]]] = []
     for manifest in manifests:
@@ -335,33 +391,81 @@ def _derive_evidence_basis(
         selected_confirmatory.append((run_id, manifest, binding))
 
     if not selected_confirmatory:
-        return _exploratory_evidence_basis(exploratory_run_ids), None
+        return _exploratory_evidence_basis(exploratory_run_ids), []
 
     registrations = {
         (binding["confirmation_id"], binding["confirmation_sha256"])
         for _, _, binding in selected_confirmatory
     }
-    if len(registrations) != 1:
-        raise ValidationError(
-            "Evidence cannot combine confirmatory Runs from multiple Confirmation registrations"
-        )
-    confirmation_id, confirmation_sha256 = next(iter(registrations))
-    confirmation = _confirmation_record(paths, confirmation_id, confirmation_sha256)
-    _confirmation_claim_issues(paths, claim_ids, confirmation)
-
-    raw_slots = confirmation.get("run_slots")
-    if not isinstance(raw_slots, list):
-        raise ValidationError("Confirmation run_slots must be a list")
-    planned_slot_ids = [
-        str(slot.get("slot_id"))
-        for slot in raw_slots
-        if isinstance(slot, dict) and isinstance(slot.get("slot_id"), str)
+    selected_records = [
+        _confirmation_record(paths, confirmation_id, confirmation_sha256)
+        for confirmation_id, confirmation_sha256 in sorted(registrations)
     ]
-    if len(planned_slot_ids) != len(raw_slots) or len(planned_slot_ids) != len(
-        set(planned_slot_ids)
-    ):
-        raise ValidationError("Confirmation run_slots must have unique string slot_id values")
-    planned_slots = set(planned_slot_ids)
+    campaign_ids = {
+        str(record.get("campaign", {}).get("campaign_id"))
+        for record in selected_records
+        if isinstance(record.get("campaign"), dict)
+    }
+    if len(campaign_ids) != 1:
+        raise ValidationError(
+            "Evidence cannot combine confirmatory Runs from different Confirmation campaigns"
+        )
+    from .confirmation import confirmation_campaign_records
+
+    campaign_records = confirmation_campaign_records(paths, selected_records[0])
+    if campaign_sequence_limit is not None:
+        if (
+            isinstance(campaign_sequence_limit, bool)
+            or campaign_sequence_limit < 1
+            or campaign_sequence_limit > len(campaign_records)
+        ):
+            raise ValidationError(
+                "Evidence Confirmation campaign sequence watermark is invalid"
+            )
+        campaign_records = campaign_records[:campaign_sequence_limit]
+    for record in campaign_records:
+        _confirmation_claim_issues(paths, claim_ids, record)
+    campaign_by_id = {
+        str(record["confirmation_id"]): record for record in campaign_records
+    }
+    selected_registration_ids = {
+        confirmation_id for confirmation_id, _ in registrations
+    }
+    if not selected_registration_ids.issubset(campaign_by_id):
+        raise ValidationError(
+            "selected confirmatory Runs reference a Confirmation outside the campaign"
+        )
+    for confirmation_id, confirmation_sha256 in registrations:
+        if (
+            campaign_by_id[confirmation_id].get("record_sha256")
+            != confirmation_sha256
+        ):
+            raise ValidationError(
+                f"selected Run has a stale Confirmation reference: {confirmation_id}"
+            )
+
+    planned_slot_ids: list[str] = []
+    planned_slots: set[str] = set()
+    for record in campaign_records:
+        confirmation_id = str(record["confirmation_id"])
+        raw_slots = record.get("run_slots")
+        if not isinstance(raw_slots, list):
+            raise ValidationError("Confirmation run_slots must be a list")
+        local_slot_ids = [
+            str(slot.get("slot_id"))
+            for slot in raw_slots
+            if isinstance(slot, dict) and isinstance(slot.get("slot_id"), str)
+        ]
+        if len(local_slot_ids) != len(raw_slots) or len(local_slot_ids) != len(
+            set(local_slot_ids)
+        ):
+            raise ValidationError(
+                f"Confirmation {confirmation_id} run_slots must have unique string slot_id values"
+            )
+        for slot_id in local_slot_ids:
+            qualified = _qualified_slot_id(confirmation_id, slot_id)
+            planned_slot_ids.append(qualified)
+            planned_slots.add(qualified)
 
     runs = run_index(paths)
     require_consistent_ledger(paths, runs)
@@ -369,30 +473,48 @@ def _derive_evidence_basis(
     terminals_by_slot: dict[str, tuple[str, dict[str, Any]]] = {}
     for run_id, (_, manifest) in sorted(runs.items()):
         binding = confirmation_binding(manifest)
-        if binding is None or binding["confirmation_id"] != confirmation_id:
+        if effective_run_mode(manifest) != "confirmatory":
             continue
-        if binding["confirmation_sha256"] != confirmation_sha256:
+        if binding is None:
             raise ValidationError(
-                f"Runs bound to {confirmation_id} do not share one immutable registration hash"
+                f"confirmatory Run has no complete immutable Confirmation binding: {run_id}"
+            )
+        if binding["confirmation_id"] not in campaign_by_id:
+            # A different valid campaign is irrelevant to this Evidence, but
+            # an orphaned or stale binding is a global registry-integrity
+            # failure and cannot be used to hide an earlier attempt.
+            _confirmation_record(
+                paths,
+                binding["confirmation_id"],
+                binding["confirmation_sha256"],
+            )
+            continue
+        confirmation_id = binding["confirmation_id"]
+        confirmation = campaign_by_id[confirmation_id]
+        if binding["confirmation_sha256"] != confirmation["record_sha256"]:
+            raise ValidationError(
+                f"Runs bound to {confirmation_id} do not share its immutable registration hash"
             )
         from .confirmation import validate_confirmation_run
 
         validate_confirmation_run(paths, confirmation, manifest)
         slot_id = binding["slot_id"]
-        if slot_id not in planned_slots:
+        qualified_slot_id = _qualified_slot_id(confirmation_id, slot_id)
+        if qualified_slot_id not in planned_slots:
             raise ValidationError(
-                f"confirmatory Run {run_id} uses an unplanned Confirmation slot: {slot_id}"
+                f"confirmatory Run {run_id} uses an unplanned Confirmation slot: "
+                f"{qualified_slot_id}"
             )
-        attempts_by_slot.setdefault(slot_id, []).append((run_id, manifest))
+        attempts_by_slot.setdefault(qualified_slot_id, []).append((run_id, manifest))
         if manifest.get("status") not in _CONFIRMATION_TERMINAL_RUN_STATUSES:
             continue
-        if slot_id in terminals_by_slot:
-            other_run_id, _ = terminals_by_slot[slot_id]
+        if qualified_slot_id in terminals_by_slot:
+            other_run_id, _ = terminals_by_slot[qualified_slot_id]
             raise ValidationError(
-                f"Confirmation slot {slot_id} has multiple terminal Runs: "
+                f"Confirmation slot {qualified_slot_id} has multiple terminal Runs: "
                 f"{other_run_id}, {run_id}"
             )
-        terminals_by_slot[slot_id] = (run_id, manifest)
+        terminals_by_slot[qualified_slot_id] = (run_id, manifest)
 
     duplicate_attempt = next(
         (
@@ -411,7 +533,8 @@ def _derive_evidence_basis(
 
     selected_ids = {run_id for run_id, _, _ in selected_confirmatory}
     selected_slots = {
-        binding["slot_id"] for _, _, binding in selected_confirmatory
+        _qualified_slot_id(binding["confirmation_id"], binding["slot_id"])
+        for _, _, binding in selected_confirmatory
     }
     eligible_terminal_ids: set[str] = set()
     excluded_by_slot: dict[str, dict[str, Any]] = {}
@@ -464,7 +587,8 @@ def _derive_evidence_basis(
             "Confirmation attempts: " + ", ".join(unexpected)
         )
 
-    held_out = confirmation.get("held_out")
+    latest_confirmation = campaign_records[-1]
+    held_out = latest_confirmation.get("held_out")
     if not isinstance(held_out, dict):
         raise ValidationError("Confirmation held_out must be an object")
     held_out_summary = {
@@ -495,16 +619,19 @@ def _derive_evidence_basis(
             "exploratory_run_ids": exploratory_run_ids,
             "confirmatory_run_ids": confirmatory_run_ids,
             "confirmation": {
-                "confirmation_id": confirmation_id,
-                "sha256": confirmation_sha256,
+                "confirmation_id": str(latest_confirmation["confirmation_id"]),
+                "sha256": str(latest_confirmation["record_sha256"]),
             },
+            "confirmation_campaign": _confirmation_campaign_projection(
+                campaign_records
+            ),
             "planned_slot_ids": planned_slot_ids,
             "included_slot_ids": included_slot_ids,
             "missing_slot_ids": missing_slot_ids,
             "excluded_confirmatory_runs": excluded_confirmatory_runs,
             "held_out": held_out_summary,
         },
-        confirmation,
+        campaign_records,
     )
 
 
@@ -710,12 +837,15 @@ def create_evidence_draft(
     run_refs, fingerprints, changed_fields, manifests = _run_references_for_draft(
         paths, run_ids
     )
-    evidence_basis, confirmation = _derive_evidence_basis(
+    evidence_basis, campaign_records = _derive_evidence_basis(
         paths, normalized_claim_ids, manifests
     )
-    frozen_analysis: dict[str, Any] = {"method": None}
-    if confirmation is not None:
-        analysis_plan = confirmation.get("analysis_plan")
+    frozen_analysis: dict[str, Any] = {
+        "method": None,
+        "registered_plans": [],
+    }
+    if campaign_records:
+        analysis_plan = campaign_records[-1].get("analysis_plan")
         if not isinstance(analysis_plan, dict):
             raise ValidationError("Confirmation analysis_plan must be an object")
         frozen_analysis = {
@@ -728,6 +858,9 @@ def create_evidence_draft(
                 "exclusion_rule",
             )
         }
+        frozen_analysis["registered_plans"] = _registered_analysis_plans(
+            campaign_records
+        )
     with _evidence_lock(paths, evidence_id):
         versions = _versions(paths, evidence_id)
         drafts = [path for _, path, item in versions if item.get("status") == "draft"]
@@ -987,10 +1120,23 @@ def _validate_final_evidence_basis(
     actual = item.get("evidence_basis")
     if not isinstance(actual, dict):
         raise ValidationError("Evidence draft requires an explicit evidence_basis object")
-    expected, confirmation = _derive_evidence_basis(
+    campaign_sequence_limit: int | None = None
+    if item.get("status") == "finalized":
+        raw_campaign = actual.get("confirmation_campaign")
+        raw_confirmations = (
+            raw_campaign.get("confirmations")
+            if isinstance(raw_campaign, dict)
+            else None
+        )
+        if isinstance(raw_confirmations, list) and raw_confirmations:
+            last_sequence = raw_confirmations[-1].get("sequence")
+            if isinstance(last_sequence, int) and not isinstance(last_sequence, bool):
+                campaign_sequence_limit = last_sequence
+    expected, campaign_records = _derive_evidence_basis(
         paths,
         item.get("addresses", {}).get("claim_ids", []),
         manifests,
+        campaign_sequence_limit=campaign_sequence_limit,
     )
     if actual != expected:
         changed = sorted(
@@ -1010,13 +1156,19 @@ def _validate_final_evidence_basis(
             f"{mode} Evidence cannot finalize with missing Confirmation slots: "
             + ", ".join(missing_slots)
         )
-    if confirmation is not None:
-        analysis_plan = confirmation.get("analysis_plan")
+    analysis = item.get("analysis")
+    if not isinstance(analysis, dict):
+        raise ValidationError("Evidence analysis must be an object")
+    expected_registered_plans = _registered_analysis_plans(campaign_records)
+    if analysis.get("registered_plans") != expected_registered_plans:
+        raise ValidationError(
+            "Evidence analysis.registered_plans must disclose every frozen "
+            "Confirmation analysis plan in the campaign"
+        )
+    if campaign_records:
+        analysis_plan = campaign_records[-1].get("analysis_plan")
         if not isinstance(analysis_plan, dict):
             raise ValidationError("Confirmation analysis_plan must be an object")
-        analysis = item.get("analysis")
-        if not isinstance(analysis, dict):
-            raise ValidationError("Evidence analysis must be an object")
         frozen_fields = (
             "method",
             "primary_outcomes",
@@ -1034,6 +1186,20 @@ def _validate_final_evidence_basis(
                 "confirmatory or mixed Evidence analysis fields must exactly match "
                 "the frozen Confirmation analysis_plan: "
                 + ", ".join(changed_fields)
+            )
+        confirmatory_ids = set(expected["confirmatory_run_ids"])
+        unclassified = [
+            str(run_ref.get("run_id"))
+            for run_ref in item.get("runs", [])
+            if isinstance(run_ref, dict)
+            and run_ref.get("run_id") in confirmatory_ids
+            and run_ref.get("role") == "context"
+        ]
+        if unclassified:
+            raise ValidationError(
+                "every confirmatory campaign Run requires an explicit scientific "
+                "role; still context-only: "
+                + ", ".join(unclassified)
             )
 
 

@@ -10,6 +10,7 @@
     "confirmation_id",
     "status",
     "claims",
+    "campaign",
     "candidates",
     "formal_artifacts",
     "held_out",
@@ -20,7 +21,7 @@
     "record_sha256"
   ],
   "properties": {
-    "schema_version": {"const": 1},
+    "schema_version": {"const": 2},
     "study_id": {"type": "string", "pattern": "^SC-[0-9]{4,}$", "maxLength": 64},
     "confirmation_id": {"type": "string", "pattern": "^CONF-[0-9]{4,}$", "maxLength": 64},
     "status": {"const": "finalized"},
@@ -30,6 +31,7 @@
       "maxItems": 8,
       "items": {"$ref": "#/$defs/claim_binding"}
     },
+    "campaign": {"$ref": "#/$defs/campaign"},
     "candidates": {
       "type": "array",
       "minItems": 1,
@@ -97,6 +99,115 @@
         "scope": {"type": ["string", "null"], "maxLength": 4096},
         "spec_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
       },
+      "additionalProperties": false
+    },
+    "confirmation_ref": {
+      "type": "object",
+      "required": ["confirmation_id", "sha256"],
+      "properties": {
+        "confirmation_id": {
+          "type": "string",
+          "pattern": "^CONF-[0-9]{4,}$",
+          "maxLength": 64
+        },
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "campaign": {
+      "type": "object",
+      "required": [
+        "campaign_id",
+        "sequence",
+        "predecessor",
+        "continuation_kind",
+        "rationale",
+        "changes",
+        "supersedes",
+        "invalidity_reason"
+      ],
+      "properties": {
+        "campaign_id": {
+          "type": "string",
+          "pattern": "^CAMP-[0-9a-f]{64}$"
+        },
+        "sequence": {"type": "integer", "minimum": 1},
+        "predecessor": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/confirmation_ref"}
+          ]
+        },
+        "continuation_kind": {
+          "enum": ["initial", "replication", "corrective_supersession"]
+        },
+        "rationale": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "changes": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "maxLength": 2048}
+        },
+        "supersedes": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/confirmation_ref"}
+          ]
+        },
+        "invalidity_reason": {
+          "type": ["string", "null"],
+          "maxLength": 4096
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {"continuation_kind": {"const": "initial"}},
+            "required": ["continuation_kind"]
+          },
+          "then": {
+            "properties": {
+              "sequence": {"const": 1},
+              "predecessor": {"type": "null"},
+              "changes": {"maxItems": 0},
+              "supersedes": {"type": "null"},
+              "invalidity_reason": {"type": "null"}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {"continuation_kind": {"const": "replication"}},
+            "required": ["continuation_kind"]
+          },
+          "then": {
+            "properties": {
+              "sequence": {"minimum": 2},
+              "predecessor": {"$ref": "#/$defs/confirmation_ref"},
+              "changes": {"minItems": 1},
+              "supersedes": {"type": "null"},
+              "invalidity_reason": {"type": "null"}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "continuation_kind": {"const": "corrective_supersession"}
+            },
+            "required": ["continuation_kind"]
+          },
+          "then": {
+            "properties": {
+              "sequence": {"minimum": 2},
+              "predecessor": {"$ref": "#/$defs/confirmation_ref"},
+              "changes": {"minItems": 1},
+              "supersedes": {"$ref": "#/$defs/confirmation_ref"},
+              "invalidity_reason": {"type": "string", "minLength": 1}
+            }
+          }
+        }
+      ],
       "additionalProperties": false
     },
     "candidate": {

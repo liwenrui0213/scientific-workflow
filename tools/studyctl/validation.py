@@ -338,6 +338,51 @@ def validate_schema_instance(
         if valid_count != 1:
             messages.append(f"{location}: expected exactly one oneOf branch, got {valid_count}")
 
+    all_of = schema.get("allOf")
+    if all_of is not None:
+        if not isinstance(all_of, list) or any(
+            not isinstance(candidate, dict) for candidate in all_of
+        ):
+            raise ValidationError(f"{location}: schema allOf must be an object array")
+        for candidate in all_of:
+            messages.extend(
+                validate_schema_instance(
+                    value,
+                    candidate,
+                    root_schema=root,
+                    location=location,
+                )
+            )
+
+    condition = schema.get("if")
+    if condition is not None:
+        if not isinstance(condition, dict):
+            raise ValidationError(f"{location}: schema if must be an object")
+        branch_name = (
+            "then"
+            if not validate_schema_instance(
+                value,
+                condition,
+                root_schema=root,
+                location=location,
+            )
+            else "else"
+        )
+        branch = schema.get(branch_name)
+        if branch is not None:
+            if not isinstance(branch, dict):
+                raise ValidationError(
+                    f"{location}: schema {branch_name} must be an object"
+                )
+            messages.extend(
+                validate_schema_instance(
+                    value,
+                    branch,
+                    root_schema=root,
+                    location=location,
+                )
+            )
+
     if isinstance(value, dict):
         required = schema.get("required", [])
         for key in required:
@@ -393,6 +438,9 @@ def validate_schema_instance(
         minimum = schema.get("minimum")
         if minimum is not None and value < minimum:
             messages.append(f"{location}: value is below minimum {minimum}")
+        maximum = schema.get("maximum")
+        if maximum is not None and value > maximum:
+            messages.append(f"{location}: value is above maximum {maximum}")
     return messages
 
 
@@ -2222,12 +2270,44 @@ def _evidence_basis_mode(item: dict[str, Any]) -> str:
     return "exploratory"
 
 
-def _strong_confirmatory_evidence(item: dict[str, Any]) -> bool:
+def _strong_confirmatory_evidence(
+    paths: StudyPaths,
+    item: dict[str, Any],
+) -> bool:
     basis = item.get("evidence_basis")
     if not isinstance(basis, dict) or basis.get("mode") not in {
         "confirmatory",
         "mixed",
     }:
+        return False
+    campaign = basis.get("confirmation_campaign")
+    campaign_confirmations = (
+        campaign.get("confirmations") if isinstance(campaign, dict) else None
+    )
+    if not isinstance(campaign_confirmations, list) or not campaign_confirmations:
+        return False
+    latest_ref = campaign_confirmations[-1]
+    if not isinstance(latest_ref, dict):
+        return False
+    try:
+        from .confirmation import (
+            confirmation_campaign_records,
+            load_final_confirmation,
+        )
+
+        latest = load_final_confirmation(
+            paths, str(latest_ref.get("confirmation_id", ""))
+        )
+        current_campaign = confirmation_campaign_records(paths, latest)
+    except (OSError, ValidationError, WorkflowError):
+        return False
+    current_latest = current_campaign[-1]
+    if (
+        latest_ref.get("confirmation_id") != current_latest.get("confirmation_id")
+        or latest_ref.get("sha256") != current_latest.get("record_sha256")
+        or latest_ref.get("sequence")
+        != current_latest.get("campaign", {}).get("sequence")
+    ):
         return False
     held_out = basis.get("held_out")
     if not isinstance(held_out, dict):
@@ -2421,7 +2501,7 @@ def _claims_issues(
                         supporting_basis_modes.append(_evidence_basis_mode(item))
                         has_strong_confirmation = (
                             has_strong_confirmation
-                            or _strong_confirmatory_evidence(item)
+                            or _strong_confirmatory_evidence(paths, item)
                         )
                     if group_name == "contradictory" and assessment not in {
                         "contradicts",

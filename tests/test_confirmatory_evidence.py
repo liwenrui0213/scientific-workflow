@@ -60,6 +60,9 @@ class ConfirmatoryEvidenceTests(WorkflowTestCase):
         self,
         confirmation_id: str,
         slot_ids: list[str],
+        *,
+        continuation_kind: str = "replication",
+        invalidity_reason: str | None = None,
     ) -> dict[str, object]:
         draft_path = create_confirmation_draft(
             self.paths,
@@ -68,6 +71,18 @@ class ConfirmatoryEvidenceTests(WorkflowTestCase):
         )
         draft = load_json(draft_path)
         self.assertIsInstance(draft, dict)
+        if draft["campaign"]["sequence"] > 1:
+            draft["campaign"]["continuation_kind"] = continuation_kind
+            draft["campaign"]["rationale"] = (
+                "Continue the same exact Claim-version campaign with full "
+                "disclosure of the preceding Confirmation."
+            )
+            draft["campaign"]["changes"] = [
+                "A new immutable Confirmation and new Run slots are registered."
+            ]
+            if continuation_kind == "corrective_supersession":
+                draft["campaign"]["supersedes"] = draft["campaign"]["predecessor"]
+                draft["campaign"]["invalidity_reason"] = invalidity_reason
         draft["candidates"] = [
             {
                 "candidate_id": "CAND-001",
@@ -171,6 +186,7 @@ class ConfirmatoryEvidenceTests(WorkflowTestCase):
                 "exploratory_run_ids": [run["run_id"]],
                 "confirmatory_run_ids": [],
                 "confirmation": None,
+                "confirmation_campaign": None,
                 "planned_slot_ids": [],
                 "included_slot_ids": [],
                 "missing_slot_ids": [],
@@ -258,9 +274,20 @@ class ConfirmatoryEvidenceTests(WorkflowTestCase):
                 "sha256": confirmation["record_sha256"],
             },
         )
-        self.assertEqual(basis["planned_slot_ids"], ["SLOT-001"])
-        self.assertEqual(basis["included_slot_ids"], ["SLOT-001"])
+        self.assertEqual(
+            basis["planned_slot_ids"], ["CONF-0001/SLOT-001"]
+        )
+        self.assertEqual(
+            basis["included_slot_ids"], ["CONF-0001/SLOT-001"]
+        )
         self.assertEqual(basis["missing_slot_ids"], [])
+        campaign = basis["confirmation_campaign"]
+        self.assertEqual(
+            [item["confirmation_id"] for item in campaign["confirmations"]],
+            ["CONF-0001"],
+        )
+        self.assertEqual(campaign["confirmations"][0]["sequence"], 1)
+        self.assertEqual(len(draft["analysis"]["registered_plans"]), 1)
         self.assertEqual(draft["analysis"]["method"], self.method)
 
         self.populate_evidence(draft_path)
@@ -294,7 +321,9 @@ class ConfirmatoryEvidenceTests(WorkflowTestCase):
         self.assertEqual(basis["mode"], "mixed")
         self.assertEqual(basis["exploratory_run_ids"], [exploratory["run_id"]])
         self.assertEqual(basis["confirmatory_run_ids"], [confirmatory["run_id"]])
-        self.assertEqual(basis["included_slot_ids"], ["SLOT-001"])
+        self.assertEqual(
+            basis["included_slot_ids"], ["CONF-0001/SLOT-001"]
+        )
 
         self.populate_evidence(draft_path)
         finalized = load_json(finalize_evidence(self.paths, draft_path))
@@ -339,33 +368,153 @@ class ConfirmatoryEvidenceTests(WorkflowTestCase):
         )
         self.assertEqual(
             load_json(draft_path)["evidence_basis"]["missing_slot_ids"],
-            ["SLOT-002"],
+            ["CONF-0001/SLOT-002"],
         )
         self.populate_evidence(draft_path)
 
         with self.assertRaisesRegex(
             ValidationError,
-            "cannot finalize with missing Confirmation slots: SLOT-002",
+            "cannot finalize with missing Confirmation slots: CONF-0001/SLOT-002",
         ):
             finalize_evidence(self.paths, draft_path)
         self.assertEqual(load_json(draft_path)["status"], "draft")
 
-    def test_confirmatory_runs_from_multiple_registrations_are_rejected(self) -> None:
-        self.make_confirmation("CONF-0001", ["SLOT-001"])
+    def test_campaign_rejects_latest_only_reporting_and_accepts_full_history(self) -> None:
+        self.argv = [sys.executable, "-c", "raise SystemExit(1)"]
+        first_confirmation = self.make_confirmation("CONF-0001", ["SLOT-001"])
         first = self.confirmatory_run("CONF-0001", "SLOT-001")
-        self.make_confirmation("CONF-0002", ["SLOT-001"])
-        second = self.confirmatory_run("CONF-0002", "SLOT-001")
+        self.assertIn(
+            first["status"], {"succeeded", "failed", "interrupted", "incomplete"}
+        )
 
+        self.argv = [sys.executable, "-c", "print(4)"]
+        second_confirmation = self.make_confirmation(
+            "CONF-0002",
+            ["SLOT-001"],
+            continuation_kind="corrective_supersession",
+            invalidity_reason=(
+                "The first registered command intentionally represented the "
+                "reviewer's failed-attempt fixture."
+            ),
+        )
+        second = self.confirmatory_run("CONF-0002", "SLOT-001")
+        self.assertIn(
+            second["status"], {"succeeded", "failed", "interrupted", "incomplete"}
+        )
+
+        self.assertEqual(
+            second_confirmation["campaign"]["campaign_id"],
+            first_confirmation["campaign"]["campaign_id"],
+        )
+        self.assertEqual(second_confirmation["campaign"]["sequence"], 2)
+        self.assertEqual(
+            second_confirmation["campaign"]["supersedes"],
+            {
+                "confirmation_id": "CONF-0001",
+                "sha256": first_confirmation["record_sha256"],
+            },
+        )
         with self.assertRaisesRegex(
             ValidationError,
-            "multiple Confirmation registrations",
+            "must include every Evidence-eligible terminal Run.*"
+            + str(first["run_id"]),
         ):
             create_evidence_draft(
                 self.paths,
                 "EVID-0001",
                 ["CLAIM-0001"],
-                [str(first["run_id"]), str(second["run_id"])],
+                [str(second["run_id"])],
             )
+
+        draft_path = create_evidence_draft(
+            self.paths,
+            "EVID-0001",
+            ["CLAIM-0001"],
+            [str(first["run_id"]), str(second["run_id"])],
+        )
+        draft = self.populate_evidence(draft_path)
+        draft["runs"][0]["role"] = "failed_direction"
+        atomic_write_json(draft_path, draft)
+        finalized = load_json(finalize_evidence(self.paths, draft_path))
+        campaign = finalized["evidence_basis"]["confirmation_campaign"]
+        self.assertEqual(
+            [item["confirmation_id"] for item in campaign["confirmations"]],
+            ["CONF-0001", "CONF-0002"],
+        )
+        self.assertEqual(
+            finalized["evidence_basis"]["planned_slot_ids"],
+            ["CONF-0001/SLOT-001", "CONF-0002/SLOT-001"],
+        )
+        self.assertEqual(
+            finalized["evidence_basis"]["confirmatory_run_ids"],
+            [first["run_id"], second["run_id"]],
+        )
+        self.assertEqual(len(finalized["analysis"]["registered_plans"]), 2)
+
+    def test_new_confirmation_is_blocked_while_prior_slots_are_unfinished(self) -> None:
+        self.make_confirmation("CONF-0001", ["SLOT-001"])
+
+        with self.assertRaisesRegex(
+            ValidationError,
+            "prior campaign slots are unfinished: CONF-0001/SLOT-001",
+        ):
+            self.make_confirmation("CONF-0002", ["SLOT-001"])
+        self.assertFalse(
+            (self.paths.confirmations / "CONF-0002.json").exists()
+        )
+
+    def test_corrective_supersession_requires_an_invalidity_reason(self) -> None:
+        self.make_confirmation("CONF-0001", ["SLOT-001"])
+        self.confirmatory_run("CONF-0001", "SLOT-001")
+
+        with self.assertRaisesRegex(
+            ValidationError,
+            "predecessor invalidity reason",
+        ):
+            self.make_confirmation(
+                "CONF-0002",
+                ["SLOT-001"],
+                continuation_kind="corrective_supersession",
+                invalidity_reason=None,
+            )
+
+    def test_old_evidence_remains_immutable_but_cannot_support_an_extended_campaign(
+        self,
+    ) -> None:
+        self.make_confirmation("CONF-0001", ["SLOT-001"])
+        first = self.confirmatory_run("CONF-0001", "SLOT-001")
+        first_draft_path = create_evidence_draft(
+            self.paths,
+            "EVID-0001",
+            ["CLAIM-0001"],
+            [str(first["run_id"])],
+        )
+        self.populate_evidence(first_draft_path)
+        first_evidence = load_json(
+            finalize_evidence(self.paths, first_draft_path)
+        )
+        self.support_claim(self.paths, first_evidence)
+        self.assertEqual(
+            load_json(self.paths.claims)["claims"][0]["state"],
+            "numerically_supported",
+        )
+
+        self.make_confirmation("CONF-0002", ["SLOT-001"])
+        issues = errors_only(validate_study(self.paths))
+        messages = [issue.message for issue in issues]
+
+        self.assertFalse(
+            any("Evidence evidence_basis does not match" in message for message in messages),
+            messages,
+        )
+        self.assertTrue(
+            any(
+                "numerically_supported requires fresh held-out or not-applicable "
+                "confirmatory Evidence" in message
+                for message in messages
+            ),
+            messages,
+        )
 
     def test_every_frozen_analysis_field_is_enforced(self) -> None:
         self.make_confirmation("CONF-0001", ["SLOT-001"])
@@ -445,6 +594,9 @@ class ConfirmatoryEvidenceTests(WorkflowTestCase):
         exclusions = draft["evidence_basis"]["excluded_confirmatory_runs"]
         self.assertEqual(len(exclusions), 1)
         self.assertEqual(exclusions[0]["run_id"], excluded["run_id"])
+        self.assertEqual(
+            exclusions[0]["slot_id"], "CONF-0001/SLOT-002"
+        )
         self.assertTrue(exclusions[0]["reason"].strip())
         draft["evidence_basis"]["excluded_confirmatory_runs"] = []
         atomic_write_json(draft_path, draft)

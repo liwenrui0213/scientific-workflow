@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 from typing import Any
 
@@ -297,6 +298,7 @@ def _confirmation_source_index(
                     "confirmation_id": value.get("confirmation_id"),
                     "status": value.get("status"),
                     "record_sha256": value.get("record_sha256"),
+                    "campaign": copy.deepcopy(value.get("campaign")),
                     "path": path.relative_to(paths.root).as_posix(),
                     "sha256": sha256_file(path),
                     "claim_ids": claim_ids,

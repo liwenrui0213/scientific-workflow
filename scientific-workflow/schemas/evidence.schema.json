@@ -12,7 +12,7 @@
     "related_evidence", "record_sha256"
   ],
   "properties": {
-    "schema_version": {"const": 2},
+    "schema_version": {"const": 3},
     "study_id": {"type": "string", "pattern": "^SC-[0-9]{4,}$"},
     "evidence_id": {"type": "string", "pattern": "^EVID-[0-9]{4,}$"},
     "version": {"type": "integer", "minimum": 1},
@@ -32,9 +32,15 @@
     "runs": {"type": "array", "minItems": 1, "maxItems": 256, "uniqueItems": true, "items": {"$ref": "#/$defs/run_ref"}},
     "analysis": {
       "type": "object",
-      "required": ["method", "comparison"],
+      "required": ["method", "registered_plans", "comparison"],
       "properties": {
         "method": {"type": ["string", "null"], "maxLength": 8192},
+        "registered_plans": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/registered_plan"}
+        },
         "primary_outcomes": {
           "type": "array",
           "maxItems": 64,
@@ -111,13 +117,87 @@
       },
       "additionalProperties": false
     },
+    "campaign_confirmation": {
+      "type": "object",
+      "required": [
+        "confirmation_id",
+        "sha256",
+        "sequence",
+        "continuation_kind",
+        "rationale",
+        "changes",
+        "supersedes",
+        "invalidity_reason"
+      ],
+      "properties": {
+        "confirmation_id": {"type": "string", "pattern": "^CONF-[0-9]{4,}$"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "sequence": {"type": "integer", "minimum": 1},
+        "continuation_kind": {
+          "enum": ["initial", "replication", "corrective_supersession"]
+        },
+        "rationale": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "changes": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "maxLength": 2048}
+        },
+        "supersedes": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/confirmation_ref"}
+          ]
+        },
+        "invalidity_reason": {"type": ["string", "null"], "maxLength": 4096}
+      },
+      "additionalProperties": false
+    },
+    "confirmation_campaign": {
+      "type": "object",
+      "required": ["campaign_id", "confirmations"],
+      "properties": {
+        "campaign_id": {
+          "type": "string",
+          "pattern": "^CAMP-[0-9a-f]{64}$"
+        },
+        "confirmations": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/campaign_confirmation"}
+        }
+      },
+      "additionalProperties": false
+    },
+    "registered_plan": {
+      "type": "object",
+      "required": [
+        "confirmation_id",
+        "sha256",
+        "analysis_plan_sha256"
+      ],
+      "properties": {
+        "confirmation_id": {"type": "string", "pattern": "^CONF-[0-9]{4,}$"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "analysis_plan_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "additionalProperties": false
+    },
     "excluded_confirmatory_run": {
       "type": "object",
       "required": ["run_id", "manifest_sha256", "slot_id", "reason"],
       "properties": {
         "run_id": {"type": "string", "pattern": "^RUN-[0-9]{6}$"},
         "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-        "slot_id": {"type": "string", "pattern": "^SLOT-[0-9]{3,}$"},
+        "slot_id": {
+          "type": "string",
+          "pattern": "^CONF-[0-9]{4,}/SLOT-[0-9]{3,}$"
+        },
         "reason": {"type": "string", "minLength": 1, "maxLength": 2048}
       },
       "additionalProperties": false
@@ -136,6 +216,7 @@
       "type": "object",
       "required": [
         "mode", "exploratory_run_ids", "confirmatory_run_ids", "confirmation",
+        "confirmation_campaign",
         "planned_slot_ids", "included_slot_ids", "missing_slot_ids",
         "excluded_confirmatory_runs", "held_out"
       ],
@@ -155,17 +236,23 @@
             {"$ref": "#/$defs/confirmation_ref"}
           ]
         },
+        "confirmation_campaign": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/confirmation_campaign"}
+          ]
+        },
         "planned_slot_ids": {
           "type": "array", "maxItems": 256, "uniqueItems": true,
-          "items": {"type": "string", "pattern": "^SLOT-[0-9]{3,}$"}
+          "items": {"type": "string", "pattern": "^CONF-[0-9]{4,}/SLOT-[0-9]{3,}$"}
         },
         "included_slot_ids": {
           "type": "array", "maxItems": 256, "uniqueItems": true,
-          "items": {"type": "string", "pattern": "^SLOT-[0-9]{3,}$"}
+          "items": {"type": "string", "pattern": "^CONF-[0-9]{4,}/SLOT-[0-9]{3,}$"}
         },
         "missing_slot_ids": {
           "type": "array", "maxItems": 256, "uniqueItems": true,
-          "items": {"type": "string", "pattern": "^SLOT-[0-9]{3,}$"}
+          "items": {"type": "string", "pattern": "^CONF-[0-9]{4,}/SLOT-[0-9]{3,}$"}
         },
         "excluded_confirmatory_runs": {
           "type": "array", "maxItems": 256, "uniqueItems": true,
@@ -181,6 +268,7 @@
               "exploratory_run_ids": {"minItems": 1},
               "confirmatory_run_ids": {"maxItems": 0},
               "confirmation": {"type": "null"},
+              "confirmation_campaign": {"type": "null"},
               "planned_slot_ids": {"maxItems": 0},
               "included_slot_ids": {"maxItems": 0},
               "missing_slot_ids": {"maxItems": 0},
@@ -194,7 +282,8 @@
             "properties": {
               "exploratory_run_ids": {"maxItems": 0},
               "confirmatory_run_ids": {"minItems": 1},
-              "confirmation": {"$ref": "#/$defs/confirmation_ref"}
+              "confirmation": {"$ref": "#/$defs/confirmation_ref"},
+              "confirmation_campaign": {"$ref": "#/$defs/confirmation_campaign"}
             }
           }
         },
@@ -204,7 +293,8 @@
             "properties": {
               "exploratory_run_ids": {"minItems": 1},
               "confirmatory_run_ids": {"minItems": 1},
-              "confirmation": {"$ref": "#/$defs/confirmation_ref"}
+              "confirmation": {"$ref": "#/$defs/confirmation_ref"},
+              "confirmation_campaign": {"$ref": "#/$defs/confirmation_campaign"}
             }
           }
         }

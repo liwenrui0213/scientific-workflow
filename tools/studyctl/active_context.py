@@ -293,26 +293,36 @@ def _confirmation_source_index(paths: StudyPaths) -> dict[str, Any]:
     evidence_drafts: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for evidence_path, item in evidence_index(paths).values():
         basis = item.get("evidence_basis")
-        confirmation = basis.get("confirmation") if isinstance(basis, dict) else None
-        if not isinstance(confirmation, dict):
+        campaign = (
+            basis.get("confirmation_campaign") if isinstance(basis, dict) else None
+        )
+        confirmation_refs = (
+            campaign.get("confirmations") if isinstance(campaign, dict) else None
+        )
+        if not isinstance(confirmation_refs, list):
             continue
-        confirmation_id = confirmation.get("confirmation_id")
-        record_sha256 = confirmation.get("sha256")
-        if not isinstance(confirmation_id, str) or not isinstance(record_sha256, str):
-            continue
-        key = (confirmation_id, record_sha256)
-        if item.get("status") == "finalized":
-            evidence_counts[key] = evidence_counts.get(key, 0) + 1
-        elif item.get("status") == "draft":
-            evidence_drafts.setdefault(key, []).append(
-                {
+        for confirmation in confirmation_refs:
+            if not isinstance(confirmation, dict):
+                continue
+            confirmation_id = confirmation.get("confirmation_id")
+            record_sha256 = confirmation.get("sha256")
+            if not isinstance(confirmation_id, str) or not isinstance(
+                record_sha256, str
+            ):
+                continue
+            key = (confirmation_id, record_sha256)
+            if item.get("status") == "finalized":
+                evidence_counts[key] = evidence_counts.get(key, 0) + 1
+            elif item.get("status") == "draft":
+                locator = {
                     "evidence_id": item.get("evidence_id"),
                     "version": item.get("version"),
                     "path": evidence_path.relative_to(paths.root).as_posix(),
                     "size": evidence_path.stat().st_size,
                     "sha256": sha256_file(evidence_path),
                 }
-            )
+                if locator not in evidence_drafts.setdefault(key, []):
+                    evidence_drafts[key].append(locator)
 
     finalized_paths = (
         sorted(
@@ -379,6 +389,8 @@ def _confirmation_source_index(paths: StudyPaths) -> dict[str, Any]:
             has_running_slot = bool(running_slots)
             history_item = {
                 "confirmation_id": confirmation_id,
+                "campaign_id": record.get("campaign", {}).get("campaign_id"),
+                "campaign_sequence": record.get("campaign", {}).get("sequence"),
                 "path": path.relative_to(paths.root).as_posix(),
                 "size": path.stat().st_size,
                 "sha256": sha256_file(path),

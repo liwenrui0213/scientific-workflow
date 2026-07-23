@@ -1,9 +1,19 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "study_id": null,
   "confirmation_id": null,
   "status": "draft",
   "claims": [],
+  "campaign": {
+    "campaign_id": null,
+    "sequence": 1,
+    "predecessor": null,
+    "continuation_kind": "initial",
+    "rationale": "",
+    "changes": [],
+    "supersedes": null,
+    "invalidity_reason": null
+  },
   "candidates": [
     {
       "candidate_id": "CAND-001",

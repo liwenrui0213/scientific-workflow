@@ -31,6 +31,14 @@ from .locking import serialized_study_authority
 _SLOT_PATTERN = re.compile(r"^SLOT-[0-9]{3,}$")
 _CANDIDATE_PATTERN = re.compile(r"^CAND-[0-9]{3,}$")
 _ACTIVE_FORMAL_STATUSES = {"active", "finalized"}
+_CAMPAIGN_TERMINAL_RUN_STATUSES = {
+    "succeeded",
+    "failed",
+    "interrupted",
+    "incomplete",
+}
+_MAX_CAMPAIGN_CONFIRMATIONS = 256
+_MAX_CAMPAIGN_SLOTS = 256
 
 
 def claim_spec_sha256(claim: dict[str, Any]) -> str:
@@ -70,6 +78,53 @@ def _claim_binding(claim: dict[str, Any]) -> dict[str, Any]:
         "scope": claim.get("scope"),
         "spec_sha256": claim_spec_sha256(claim),
     }
+
+
+def _claim_version_key(
+    claims: Sequence[dict[str, Any]],
+) -> tuple[tuple[str, str], ...]:
+    versions: list[tuple[str, str]] = []
+    for claim in claims:
+        if not isinstance(claim, dict):
+            raise ValidationError("Confirmation claims must be objects")
+        claim_id = require_id("claim", str(claim.get("claim_id", "")))
+        spec_sha256 = claim.get("spec_sha256")
+        if (
+            not isinstance(spec_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", spec_sha256) is None
+        ):
+            raise ValidationError(
+                f"Confirmation Claim version digest is invalid: {claim_id}"
+            )
+        versions.append((claim_id, spec_sha256))
+    if not versions or len(versions) != len(set(versions)):
+        raise ValidationError("Confirmation Claim versions must be non-empty and unique")
+    return tuple(sorted(versions))
+
+
+def confirmation_campaign_id(claims: Sequence[dict[str, Any]]) -> str:
+    """Derive one campaign identity from exact Claim IDs and specifications."""
+
+    payload = [
+        {"claim_id": claim_id, "spec_sha256": spec_sha256}
+        for claim_id, spec_sha256 in _claim_version_key(claims)
+    ]
+    return "CAMP-" + sha256_json(payload)
+
+
+def _confirmation_ref(record: dict[str, Any]) -> dict[str, str]:
+    confirmation_id = require_id(
+        "confirmation", str(record.get("confirmation_id", ""))
+    )
+    record_sha256 = record.get("record_sha256")
+    if (
+        not isinstance(record_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", record_sha256) is None
+    ):
+        raise ValidationError(
+            f"Confirmation {confirmation_id} has an invalid record digest"
+        )
+    return {"confirmation_id": confirmation_id, "sha256": record_sha256}
 
 
 def _safe_source_path(paths: StudyPaths, source: Path) -> Path:
@@ -270,6 +325,251 @@ def _cohort_fields_for_slot(
     return copy.deepcopy(cohort["fields"])
 
 
+def _all_confirmation_records(paths: StudyPaths) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    if not paths.confirmations.is_dir():
+        return records
+    for path in sorted(paths.confirmations.glob("CONF-*.json")):
+        records.append(load_final_confirmation(paths, path.stem))
+    return records
+
+
+def _campaign_sequence_errors(records: Sequence[dict[str, Any]]) -> list[str]:
+    errors: list[str] = []
+    ordered = sorted(
+        records,
+        key=lambda record: int(record.get("campaign", {}).get("sequence", 0)),
+    )
+    for expected_sequence, record in enumerate(ordered, start=1):
+        campaign = record.get("campaign")
+        if not isinstance(campaign, dict):
+            continue
+        confirmation_id = str(record.get("confirmation_id"))
+        if campaign.get("sequence") != expected_sequence:
+            errors.append(
+                f"Confirmation campaign sequence is not contiguous at {confirmation_id}"
+            )
+        expected_predecessor = (
+            None if expected_sequence == 1 else _confirmation_ref(ordered[expected_sequence - 2])
+        )
+        if campaign.get("predecessor") != expected_predecessor:
+            errors.append(
+                f"Confirmation campaign predecessor is invalid at {confirmation_id}"
+            )
+    return errors
+
+
+def confirmation_campaign_records(
+    paths: StudyPaths,
+    confirmation: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Load the complete immutable campaign for one exact Claim version set."""
+
+    campaign = confirmation.get("campaign")
+    if not isinstance(campaign, dict) or not isinstance(
+        campaign.get("campaign_id"), str
+    ):
+        raise ValidationError("Confirmation requires a valid campaign identity")
+    campaign_id = str(campaign["campaign_id"])
+    target_versions = _claim_version_key(confirmation.get("claims", []))
+    records: list[dict[str, Any]] = []
+    for record in _all_confirmation_records(paths):
+        record_versions = _claim_version_key(record.get("claims", []))
+        record_campaign = record.get("campaign")
+        record_campaign_id = (
+            record_campaign.get("campaign_id")
+            if isinstance(record_campaign, dict)
+            else None
+        )
+        overlap = set(target_versions) & set(record_versions)
+        if overlap and record_versions != target_versions:
+            raise ValidationError(
+                "Confirmation campaign Claim versions overlap across different "
+                f"Claim sets: {record.get('confirmation_id')}"
+            )
+        if record_campaign_id == campaign_id:
+            if record_versions != target_versions:
+                raise ValidationError(
+                    f"Confirmation campaign identity collision: {campaign_id}"
+                )
+            records.append(record)
+    if not records:
+        raise ValidationError(f"Confirmation campaign has no records: {campaign_id}")
+    errors = _campaign_sequence_errors(records)
+    if errors:
+        raise ValidationError("; ".join(errors))
+    return sorted(records, key=lambda item: int(item["campaign"]["sequence"]))
+
+
+def _existing_campaign_records(
+    paths: StudyPaths,
+    claims: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    target_versions = _claim_version_key(claims)
+    campaign_id = confirmation_campaign_id(claims)
+    records: list[dict[str, Any]] = []
+    for record in _all_confirmation_records(paths):
+        record_versions = _claim_version_key(record.get("claims", []))
+        overlap = set(target_versions) & set(record_versions)
+        if overlap and record_versions != target_versions:
+            raise ValidationError(
+                "a Claim version cannot participate in different Confirmation "
+                f"campaign Claim sets; conflicting record: {record.get('confirmation_id')}"
+            )
+        record_campaign = record.get("campaign")
+        if (
+            record_versions == target_versions
+            and isinstance(record_campaign, dict)
+            and record_campaign.get("campaign_id") == campaign_id
+        ):
+            records.append(record)
+    errors = _campaign_sequence_errors(records)
+    if errors:
+        raise ValidationError("; ".join(errors))
+    return sorted(records, key=lambda item: int(item["campaign"]["sequence"]))
+
+
+def _campaign_draft_metadata(
+    paths: StudyPaths,
+    claims: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    records = _existing_campaign_records(paths, claims)
+    campaign_id = confirmation_campaign_id(claims)
+    if not records:
+        return {
+            "campaign_id": campaign_id,
+            "sequence": 1,
+            "predecessor": None,
+            "continuation_kind": "initial",
+            "rationale": "Initial frozen Confirmation for this exact Claim version set.",
+            "changes": [],
+            "supersedes": None,
+            "invalidity_reason": None,
+        }
+    predecessor = _confirmation_ref(records[-1])
+    return {
+        "campaign_id": campaign_id,
+        "sequence": len(records) + 1,
+        "predecessor": predecessor,
+        "continuation_kind": None,
+        "rationale": "",
+        "changes": [],
+        "supersedes": None,
+        "invalidity_reason": None,
+    }
+
+
+def _require_prior_campaign_complete(
+    paths: StudyPaths,
+    records: Sequence[dict[str, Any]],
+) -> None:
+    manifests, _ = _authoritative_run_history(paths)
+    attempts: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for _, (_, manifest) in sorted(manifests.items()):
+        from .run_registry import confirmation_binding
+
+        binding = confirmation_binding(manifest)
+        if binding is None:
+            continue
+        key = (binding["confirmation_id"], binding["slot_id"])
+        attempts.setdefault(key, []).append(manifest)
+    unfinished: list[str] = []
+    duplicated: list[str] = []
+    for record in records:
+        confirmation_id = str(record["confirmation_id"])
+        record_sha256 = str(record["record_sha256"])
+        for slot in record["run_slots"]:
+            slot_id = str(slot["slot_id"])
+            slot_attempts = [
+                manifest
+                for manifest in attempts.get((confirmation_id, slot_id), [])
+                if manifest.get("epistemic_role", {}).get("confirmation_sha256")
+                == record_sha256
+            ]
+            label = f"{confirmation_id}/{slot_id}"
+            if len(slot_attempts) > 1:
+                duplicated.append(label)
+                continue
+            if len(slot_attempts) != 1 or slot_attempts[0].get(
+                "status"
+            ) not in _CAMPAIGN_TERMINAL_RUN_STATUSES:
+                unfinished.append(label)
+    if duplicated:
+        raise ValidationError(
+            "prior Confirmation campaign slots have multiple attempts: "
+            + ", ".join(duplicated)
+        )
+    if unfinished:
+        raise ValidationError(
+            "a new Confirmation cannot be finalized while prior campaign slots "
+            "are unfinished: "
+            + ", ".join(unfinished)
+        )
+
+
+def _finalize_campaign_metadata(
+    paths: StudyPaths,
+    claims: Sequence[dict[str, Any]],
+    raw: Any,
+) -> dict[str, Any]:
+    records = _existing_campaign_records(paths, claims)
+    if len(records) >= _MAX_CAMPAIGN_CONFIRMATIONS:
+        raise ValidationError(
+            "Confirmation campaign reached its maximum record count"
+        )
+    campaign_id = confirmation_campaign_id(claims)
+    if not records:
+        return _campaign_draft_metadata(paths, claims)
+    _require_prior_campaign_complete(paths, records)
+    if not isinstance(raw, dict):
+        raise ValidationError(
+            "a continuation Confirmation requires campaign disclosure metadata"
+        )
+    predecessor = _confirmation_ref(records[-1])
+    kind = raw.get("continuation_kind")
+    if kind not in {"replication", "corrective_supersession"}:
+        raise ValidationError(
+            "continuation_kind must be replication or corrective_supersession"
+        )
+    rationale = _require_nonempty_text(
+        raw.get("rationale"), "campaign continuation rationale"
+    )
+    changes = raw.get("changes")
+    if (
+        not isinstance(changes, list)
+        or not changes
+        or any(not isinstance(item, str) or not item.strip() for item in changes)
+        or len(changes) != len(set(changes))
+    ):
+        raise ValidationError(
+            "a continuation Confirmation requires unique non-empty campaign changes"
+        )
+    supersedes = raw.get("supersedes")
+    invalidity_reason = raw.get("invalidity_reason")
+    if kind == "corrective_supersession":
+        if supersedes != predecessor:
+            raise ValidationError(
+                "corrective_supersession must explicitly supersede its predecessor"
+            )
+        invalidity_reason = _require_nonempty_text(
+            invalidity_reason, "predecessor invalidity reason"
+        )
+    elif supersedes is not None or invalidity_reason is not None:
+        raise ValidationError(
+            "replication cannot mark its predecessor invalid or superseded"
+        )
+    return {
+        "campaign_id": campaign_id,
+        "sequence": len(records) + 1,
+        "predecessor": predecessor,
+        "continuation_kind": kind,
+        "rationale": rationale,
+        "changes": list(changes),
+        "supersedes": copy.deepcopy(supersedes),
+        "invalidity_reason": invalidity_reason,
+    }
+
+
 @serialized_study_authority
 def create_confirmation_draft(
     paths: StudyPaths,
@@ -311,6 +611,7 @@ def create_confirmation_draft(
             "created_at": utc_now(),
         }
     )
+    draft["campaign"] = _campaign_draft_metadata(paths, draft["claims"])
     atomic_write_json(draft_path, draft, overwrite=False)
     return draft_path
 
@@ -505,6 +806,16 @@ def finalize_confirmation(paths: StudyPaths, source: Path) -> Path:
     """Freeze an editable draft as one immutable pre-run Confirmation Record."""
 
     _require_fresh_brief(paths)
+    registry_errors = [
+        issue
+        for issue in confirmation_record_issues(paths)
+        if issue.level == "ERROR"
+    ]
+    if registry_errors:
+        raise ValidationError(
+            "Confirmation registry is invalid before finalization:\n"
+            + "\n".join(issue.render() for issue in registry_errors)
+        )
     draft_path = _safe_source_path(paths, source)
     draft = load_json(draft_path)
     if not isinstance(draft, dict):
@@ -524,6 +835,16 @@ def finalize_confirmation(paths: StudyPaths, source: Path) -> Path:
     protocol = _formal_binding(paths, "PROTOCOL.json")
     evaluator = _formal_binding(paths, "EVALUATOR.json")
     manifests, run_high_water_mark = _authoritative_run_history(paths)
+    run_errors = [
+        issue
+        for issue in confirmation_run_issues(paths, manifests)
+        if issue.level == "ERROR"
+    ]
+    if run_errors:
+        raise ValidationError(
+            "existing confirmatory Run history is invalid:\n"
+            + "\n".join(issue.render() for issue in run_errors)
+        )
     held_out = _finalize_held_out(
         paths,
         draft.get("held_out"),
@@ -532,12 +853,22 @@ def finalize_confirmation(paths: StudyPaths, source: Path) -> Path:
     )
     analysis_plan = _finalize_analysis_plan(draft.get("analysis_plan"))
     run_slots = _finalize_slots(paths, draft.get("run_slots"), candidates, held_out)
+    prior_campaign_records = _existing_campaign_records(paths, claims)
+    prior_slot_count = sum(
+        len(record.get("run_slots", [])) for record in prior_campaign_records
+    )
+    if prior_slot_count + len(run_slots) > _MAX_CAMPAIGN_SLOTS:
+        raise ValidationError(
+            "Confirmation campaign exceeds the maximum cumulative slot count"
+        )
+    campaign = _finalize_campaign_metadata(paths, claims, draft.get("campaign"))
     finalized: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "study_id": paths.study_id,
         "confirmation_id": confirmation_id,
         "status": "finalized",
         "claims": claims,
+        "campaign": campaign,
         "candidates": candidates,
         "formal_artifacts": {"protocol": protocol, "evaluator": evaluator},
         "held_out": held_out,
@@ -596,6 +927,64 @@ def _static_record_errors(paths: StudyPaths, path: Path, value: Any) -> list[str
     ]
     if len(claim_ids) != len(set(claim_ids)):
         errors.append("Confirmation Claim IDs must be unique")
+    claims = [item for item in value.get("claims", []) if isinstance(item, dict)]
+    campaign = value.get("campaign")
+    if not isinstance(campaign, dict):
+        errors.append("Confirmation requires campaign metadata")
+    else:
+        try:
+            expected_campaign_id = confirmation_campaign_id(claims)
+        except ValidationError as exc:
+            errors.append(str(exc))
+        else:
+            if campaign.get("campaign_id") != expected_campaign_id:
+                errors.append("Confirmation campaign_id does not match its Claim versions")
+        sequence = campaign.get("sequence")
+        predecessor = campaign.get("predecessor")
+        kind = campaign.get("continuation_kind")
+        rationale = campaign.get("rationale")
+        changes = campaign.get("changes")
+        supersedes = campaign.get("supersedes")
+        invalidity_reason = campaign.get("invalidity_reason")
+        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
+            errors.append("Confirmation campaign sequence is invalid")
+        if not isinstance(rationale, str) or not rationale.strip():
+            errors.append("Confirmation campaign rationale must be non-empty")
+        if not isinstance(changes, list) or any(
+            not isinstance(item, str) or not item.strip() for item in changes
+        ):
+            errors.append("Confirmation campaign changes are invalid")
+        if isinstance(changes, list) and len(changes) != len(set(changes)):
+            errors.append("Confirmation campaign changes must be unique")
+        if sequence == 1:
+            if (
+                predecessor is not None
+                or kind != "initial"
+                or changes != []
+                or supersedes is not None
+                or invalidity_reason is not None
+            ):
+                errors.append("initial Confirmation campaign metadata is invalid")
+        elif isinstance(sequence, int) and sequence > 1:
+            if not isinstance(predecessor, dict):
+                errors.append("continuation Confirmation requires a predecessor")
+            if kind not in {"replication", "corrective_supersession"}:
+                errors.append("Confirmation campaign continuation_kind is invalid")
+            if not isinstance(changes, list) or not changes:
+                errors.append("continuation Confirmation requires explicit changes")
+            if kind == "corrective_supersession":
+                if supersedes != predecessor:
+                    errors.append(
+                        "corrective Confirmation must supersede its predecessor"
+                    )
+                if not isinstance(invalidity_reason, str) or not invalidity_reason.strip():
+                    errors.append(
+                        "corrective Confirmation requires an invalidity reason"
+                    )
+            elif supersedes is not None or invalidity_reason is not None:
+                errors.append(
+                    "replication Confirmation cannot invalidate or supersede its predecessor"
+                )
     candidate_ids = [
         item.get("candidate_id")
         for item in value.get("candidates", [])
@@ -950,6 +1339,7 @@ def confirmation_record_issues(paths: StudyPaths) -> list[ValidationIssue]:
                 "ERROR", str(paths.confirmations), "Confirmation directory is invalid"
             )
         ]
+    valid_records: list[dict[str, Any]] = []
     for entry in sorted(paths.confirmations.iterdir()):
         if entry.is_symlink() or not entry.is_file():
             issues.append(
@@ -968,7 +1358,35 @@ def confirmation_record_issues(paths: StudyPaths) -> list[ValidationIssue]:
             errors = _static_record_errors(paths, entry, value)
         except (OSError, ValidationError, WorkflowError) as exc:
             errors = [str(exc)]
+        if not errors and isinstance(value, dict):
+            valid_records.append(value)
         issues.extend(ValidationIssue("ERROR", str(entry), error) for error in errors)
+    campaign_groups: dict[str, list[dict[str, Any]]] = {}
+    claim_owners: dict[tuple[str, str], str] = {}
+    for record in valid_records:
+        campaign = record["campaign"]
+        campaign_id = str(campaign["campaign_id"])
+        campaign_groups.setdefault(campaign_id, []).append(record)
+        for claim_version in _claim_version_key(record["claims"]):
+            previous = claim_owners.setdefault(claim_version, campaign_id)
+            if previous != campaign_id:
+                issues.append(
+                    ValidationIssue(
+                        "ERROR",
+                        str(paths.confirmations),
+                        "a Claim version participates in multiple Confirmation "
+                        f"campaigns: {claim_version[0]}",
+                    )
+                )
+    for campaign_id, records in sorted(campaign_groups.items()):
+        issues.extend(
+            ValidationIssue(
+                "ERROR",
+                str(paths.confirmations),
+                f"{campaign_id}: {error}",
+            )
+            for error in _campaign_sequence_errors(records)
+        )
     return issues
 
 

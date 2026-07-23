@@ -92,15 +92,24 @@ class ConfirmationRecordTests(WorkflowTestCase):
         self,
         *,
         confirmation_id: str = "CONF-0001",
+        claim_id: str = "CLAIM-0001",
         held_out: Path | None = None,
         before_finalize: Callable[[Path], None] | None = None,
     ) -> dict[str, object]:
         draft_path = create_confirmation_draft(
             self.paths,
             confirmation_id,
-            ["CLAIM-0001"],
+            [claim_id],
         )
         draft = load_json(draft_path)
+        if draft["campaign"]["sequence"] > 1:
+            draft["campaign"]["continuation_kind"] = "replication"
+            draft["campaign"]["rationale"] = (
+                "Register an explicitly disclosed replication in the same campaign."
+            )
+            draft["campaign"]["changes"] = [
+                "A new immutable Confirmation and new Run slots are registered."
+            ]
         draft["candidates"][0].update(
             {
                 "description": "The committed deterministic candidate.",
@@ -178,6 +187,9 @@ class ConfirmationRecordTests(WorkflowTestCase):
         record_path = self.paths.confirmations / "CONF-0001.json"
 
         self.assertEqual(record["record_sha256"], record_digest(record, "record_sha256"))
+        self.assertEqual(record["schema_version"], 2)
+        self.assertEqual(record["campaign"]["sequence"], 1)
+        self.assertTrue(record["campaign"]["campaign_id"].startswith("CAMP-"))
         self.assertEqual(record_path.stat().st_mode & 0o222, 0)
         self.assertEqual(record_path.stat().st_nlink, 1)
         self.assertEqual(
@@ -406,6 +418,12 @@ class ConfirmationRecordTests(WorkflowTestCase):
         self.assertEqual(result["status"], "succeeded")
 
     def test_confirmation_resume_index_is_bounded_and_commits_full_history(self) -> None:
+        for number in range(2, 11):
+            self.add_proposed_claim(
+                self.paths,
+                claim_id=f"CLAIM-{number:04d}",
+            )
+
         def expand_slots(draft_path: Path) -> None:
             draft = load_json(draft_path)
             base_slot = draft["run_slots"][0]
@@ -420,7 +438,10 @@ class ConfirmationRecordTests(WorkflowTestCase):
             before_finalize=expand_slots,
         )
         for number in range(2, 11):
-            self._finalize(confirmation_id=f"CONF-{number:04d}")
+            self._finalize(
+                confirmation_id=f"CONF-{number:04d}",
+                claim_id=f"CLAIM-{number:04d}",
+            )
 
         confirmations = build_active_selector(self.paths)["confirmations"]
         pending = confirmations["pending_finalized"]

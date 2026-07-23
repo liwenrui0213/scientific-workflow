@@ -65,13 +65,14 @@ rendering.
    or external inputs and all new outputs below `object_root`. A `running` or
    `incomplete` Run cannot enter Evidence. Runs default to exploratory.
 6. Create exploratory Evidence only from eligible sealed Runs. Before setting
-   `numerically_supported`, freeze a minimal Confirmation Record for the Claim,
-   candidate, protocol, evaluator, held-out conditions, analysis, and slots;
-   execute new confirmatory Runs; then finalize Evidence with analysis, result,
-   scope, uncertainty, limitations, assessment, and a minimal inference argument
-   covering the observation-to-Claim bridge, auxiliary assumptions, competing
-   explanations, and falsification conditions, plus its applicable Run roles and
-   any Cohort compatibility justification. Do not confirm routine exploration.
+   `numerically_supported`, freeze the Claim version, candidate, protocol,
+   evaluator, held-out conditions, analysis, and slots. Continue its derived
+   campaign only after predecessor slots terminate, disclosing replication or
+   corrective-supersession reasons and differences. Run new slots, then finalize
+   campaign-complete Evidence with roles, analysis, result, scope, uncertainty,
+   limitations, assessment, Cohort justification, and the required inference
+   bridge, assumptions, alternatives, and falsifiers. Do not confirm routine
+   exploration.
 7. Update Claims only with finalized `{evidence_id, version, sha256}` refs and
    preserve contradictions. Current Claims use lifecycle `active`. Remove one
    from the Frontier only by marking it `retired`, or create a replacement ID
@@ -100,7 +101,7 @@ rendering.
 - Numerical success is not proof; implementation acceptance is not scientific
   acceptance. Do not upgrade a Claim beyond finalized Evidence.
 - Never relabel an exploratory or legacy Run as confirmatory. Confirmatory
-  Evidence accounts for every planned slot and visible attempt; mixed Evidence
+  Evidence covers every current-campaign slot and attempt; mixed Evidence
   labels both bases.
 
 ## Output and handoff

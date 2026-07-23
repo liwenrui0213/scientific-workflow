@@ -443,9 +443,10 @@ strong test, use this one-way sequence:
 ```text
 explore freely
 -> select a candidate and explicit Claim
--> freeze one minimal Confirmation Record
+-> start one minimal Confirmation campaign for the exact Claim version
+-> freeze its first Confirmation Record
 -> execute new confirmatory Runs in its planned slots
--> create confirmatory Evidence
+-> create campaign-complete confirmatory Evidence
 -> promote the Claim
 ```
 
@@ -459,10 +460,12 @@ python -m tools.studyctl confirmation-new SC-0001 \
 
 Edit only the author-owned fields in the returned draft: candidate descriptions
 and paths; held-out status, rationale, and paths; analysis and decision rules;
-stopping and exclusion rules; and every planned slot. Leave `bindings`, code
-state, formal-artifact bindings, freshness, watermarks, freeze time, and digests
-out of the draft: finalization derives and adds them from live files and
-verified Run history. Do not edit the generated `created_at` or Claim bindings.
+stopping and exclusion rules; and every planned slot. For a continuation, also
+fill the generated campaign disclosure fields described below. Leave
+`campaign_id`, campaign sequence, predecessor, `bindings`, code state,
+formal-artifact bindings, freshness, watermarks, freeze time, and digests out of
+the draft: finalization derives and adds them from live files and verified Run
+history. Do not edit the generated `created_at` or Claim bindings.
 The compact draft is authoring input; `confirmation.schema.json` validates only
 the derived immutable record produced by finalization.
 The conservative draft default is `not_held_out`, so `not_applicable` must be
@@ -509,14 +512,53 @@ retried by hiding a failure; change the design explicitly and freeze a new
 Confirmation Record instead. Exploratory and legacy Runs cannot be edited or
 re-labeled into confirmatory Runs.
 
+All Confirmations for the same exact Claim version belong to one derived
+campaign. Let \(I\) be a Claim ID, let \(S\) be its statement, let \(Q\) be its
+scope, and define the version digest
+\(h=\operatorname{SHA256}(\operatorname{canonicalJSON}(\{S,Q\}))\). The
+campaign identity is derived from the sorted set of pairs \((I,h)\) frozen by
+the Confirmation; it is not chosen by the author. A Claim version cannot be
+placed into a second campaign by adding or removing another Claim from the
+Confirmation set.
+
+A later Confirmation can be finalized only after every slot in all preceding
+campaign records has exactly one terminal attempt. Its draft must then disclose
+one of two transitions:
+
+- `replication`: give a non-empty rationale and an explicit list of differences;
+  it does not invalidate or supersede the predecessor.
+- `corrective_supersession`: give the rationale and differences, set
+  `supersedes` to the generated predecessor reference, and state a non-empty
+  `invalidity_reason`.
+
+The predecessor, sequence, and campaign identity are recomputed at finalization,
+so editing those fields cannot detach a retry from its history. A frozen but
+unexecuted predecessor remains pending; creating a new record is not an
+administrative way to cancel its slots.
+
 Confirmatory Evidence may be authored after results are available, but its
-result-independent fields are recomputed from the frozen record. It must include
-every Evidence-eligible terminal attempt, account for every planned slot, and
-list integrity-ineligible attempts as explicit exclusions. Missing slots,
-omitted eligible attempts, changed Claim scope, stale candidate/protocol/
-evaluator bindings, any changed frozen analysis-plan field, or Runs from multiple
-Confirmation Records prevent finalization. Evidence containing both roles is
-`mixed` and records the exploratory and confirmatory Run IDs separately.
+result-independent fields are recomputed from the complete campaign, not only
+from the Confirmation named by the selected Run. It must include every
+Evidence-eligible terminal attempt across every campaign record, account for
+every planned slot, and list integrity-ineligible attempts as explicit
+exclusions. Slot locators are qualified, for example
+`CONF-0001/SLOT-001`, so repeated local slot names cannot collide. The
+`confirmation_campaign` projection records every immutable Confirmation hash,
+sequence, transition rationale, differences, supersession, and invalidity
+reason; `analysis.registered_plans` binds every frozen analysis-plan digest.
+Missing slots, omitted eligible attempts, changed Claim scope, stale
+candidate/protocol/evaluator bindings, a changed current frozen analysis-plan
+field, or Runs from different campaigns prevent finalization. Every included
+confirmatory Run must be classified as supporting, contradictory, or a failed
+direction rather than left as context. Evidence containing both exploratory and
+confirmatory roles is `mixed` and records the two Run sets separately.
+
+A finalized Evidence record keeps the campaign high-water sequence it actually
+audited, so extending the campaign does not mutate or invalidate that historical
+Evidence. However, after a new Confirmation is frozen, older Evidence no longer
+covers the current campaign and cannot by itself satisfy the
+`numerically_supported` gate. Promotion becomes valid again only after new
+Evidence discloses the now-complete campaign.
 
 Create an Evidence draft from terminal Runs:
 
@@ -537,7 +579,7 @@ python -m tools.studyctl evidence-finalize SC-0001 \
 
 Update `CLAIMS.json` with the finalized `{evidence_id, version, sha256}` reference. Do not omit contradictory Evidence.
 
-Evidence schema V2 enforces this argument without introducing a separate
+The current Evidence schema enforces this argument without introducing a separate
 artifact type. A result may be exact while its interpretation still depends on
 an implementation mapping, measurement validity, model assumptions, or an
 exclusion of alternative mechanisms. The reasoning bridge must therefore
