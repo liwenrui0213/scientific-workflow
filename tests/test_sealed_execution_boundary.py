@@ -12,7 +12,6 @@ from tools.studyctl.hashing import file_record, sha256_json
 from tools.studyctl.models import ValidationError
 from tools.studyctl.execution_backends import _bubblewrap_device_paths
 from tools.studyctl.run_registry import (
-    _capsule_command,
     _capsule_environment,
     _capsule_plan,
 )
@@ -111,7 +110,7 @@ class SealedExecutionBoundaryTests(unittest.TestCase):
             ), patch(
                 "tools.studyctl.execution_backends._probe"
             ):
-                wrapped, environment, boundary = _capsule_command(
+                plan = _capsule_plan(
                     root=root,
                     configured_cwd=root,
                     profile={
@@ -130,6 +129,9 @@ class SealedExecutionBoundaryTests(unittest.TestCase):
                     output_paths=[output.relative_to(root).as_posix()],
                     capsule_home=capsule_home,
                 )
+                wrapped = plan.argv
+                environment = plan.environment
+                boundary = plan.boundary
 
             policy = (capsule_home / "sandbox.sb").read_text(encoding="utf-8")
 
@@ -166,7 +168,7 @@ class SealedExecutionBoundaryTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     ValidationError, "requires a supported isolation backend"
                 ):
-                    _capsule_command(
+                    _capsule_plan(
                         root=root,
                         configured_cwd=root,
                         profile={
@@ -519,7 +521,7 @@ class SealedExecutionBoundaryTests(unittest.TestCase):
                 "p.write_text(\"RESULT = 'unapproved'\\n\"); "
                 f"Path({str(output)!r}).write_text('made with changed code')"
             )
-            wrapped, environment, _ = _capsule_command(
+            plan = _capsule_plan(
                 root=root,
                 configured_cwd=root,
                 profile={
@@ -535,6 +537,8 @@ class SealedExecutionBoundaryTests(unittest.TestCase):
                 output_paths=[output.relative_to(root).as_posix()],
                 capsule_home=capsule_home,
             )
+            wrapped = plan.argv
+            environment = plan.environment
 
             completed = subprocess.run(
                 wrapped,

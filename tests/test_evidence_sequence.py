@@ -1,15 +1,12 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stderr, redirect_stdout
-import io
 from unittest.mock import patch
 import unittest
 
 from tests.helpers import WorkflowTestCase
 from tools.studyctl.active_context import compaction_pressure
-from tools.studyctl.cli import main as studyctl_main
-from tools.studyctl.evidence import create_evidence_draft, migrate_evidence_sequence
+from tools.studyctl.evidence import create_evidence_draft
 from tools.studyctl.evidence_sequence import (
     empty_evidence_sequence,
     load_evidence_sequence,
@@ -28,14 +25,27 @@ class EvidenceSequenceTests(WorkflowTestCase):
 
         self.assertIsNotNone(sequence)
         assert sequence is not None
+        self.assertEqual(sequence["schema_version"], 2)
         self.assertEqual(sequence["study_id"], paths.study_id)
         self.assertEqual(sequence["high_water_mark"], 0)
-        self.assertEqual(sequence["origin"]["kind"], "native")
         self.assertEqual(
             sequence["sequence_sha256"],
             record_digest(sequence, "sequence_sha256"),
         )
         self.assertEqual(evidence_sequence_issues(paths), [])
+
+    def test_pre_clean_break_sequence_schema_is_rejected_explicitly(self) -> None:
+        paths = self.initialize()
+        sequence = load_evidence_sequence(paths)
+        assert sequence is not None
+        sequence["schema_version"] = 1
+        sequence["sequence_sha256"] = record_digest(
+            sequence, "sequence_sha256"
+        )
+        atomic_write_json(paths.evidence_sequence, sequence, mode=0o444)
+
+        with self.assertRaisesRegex(ValidationError, "schema_version is unsupported"):
+            load_evidence_sequence(paths)
 
     def test_deletion_and_retry_cannot_reduce_pressure_high_water_mark(self) -> None:
         paths = self.initialize_approved_with_claim()
@@ -122,13 +132,15 @@ class EvidenceSequenceTests(WorkflowTestCase):
         create_evidence_draft(
             paths, "EVID-0001", ["CLAIM-0001"], [manifest["run_id"]]
         )
+        sequence = load_evidence_sequence(paths)
+        assert sequence is not None
 
         paths.evidence_sequence.unlink()
         with self.assertRaisesRegex(ValidationError, "Evidence sequence is missing"):
             compaction_pressure(paths)
         self.assertTrue(evidence_sequence_issues(paths))
 
-        migrate_evidence_sequence(paths)
+        write_evidence_sequence(paths, sequence, overwrite=False)
         corrupted = load_json(paths.evidence_sequence)
         corrupted["sequence_sha256"] = "0" * 64
         atomic_write_json(paths.evidence_sequence, corrupted)
@@ -143,44 +155,6 @@ class EvidenceSequenceTests(WorkflowTestCase):
             "Evidence sequence high_water_mark is below the visible Evidence record count",
             messages,
         )
-
-    def test_explicit_legacy_migration_records_assurance_gap_and_rejects_gap(self) -> None:
-        paths = self.initialize_approved_with_claim()
-        manifest = self.successful_run(paths)
-        draft = create_evidence_draft(
-            paths, "EVID-0001", ["CLAIM-0001"], [manifest["run_id"]]
-        )
-        paths.evidence_sequence.unlink()
-
-        stdout = io.StringIO()
-        stderr = io.StringIO()
-        with redirect_stdout(stdout), redirect_stderr(stderr):
-            exit_code = studyctl_main(
-                [
-                    "--root",
-                    str(self.root),
-                    "migrate-evidence-sequence",
-                    paths.study_id,
-                ]
-            )
-        self.assertEqual(exit_code, 0, stderr.getvalue())
-        migrated = load_evidence_sequence(paths)
-        self.assertEqual(migrated["high_water_mark"], 1)
-        self.assertEqual(migrated["origin"]["kind"], "legacy_migration")
-        self.assertEqual(
-            migrated["origin"]["pre_migration_deletion_assurance"],
-            "unverifiable_before_sequence_initialization",
-        )
-
-        paths.evidence_sequence.unlink()
-        item = load_json(draft)
-        item["version"] = 2
-        gap_path = paths.evidence / "EVID-0001.v0002.json"
-        atomic_write_json(gap_path, item)
-        draft.unlink()
-        with self.assertRaisesRegex(ValidationError, "version gap"):
-            migrate_evidence_sequence(paths)
-
 
 if __name__ == "__main__":
     unittest.main()

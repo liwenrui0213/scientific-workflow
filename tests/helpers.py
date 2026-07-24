@@ -320,7 +320,6 @@ class WorkflowTestCase(unittest.TestCase):
         claim["uncertainty"] = "Limited to the deterministic fixture scope."
         claim["updated_at"] = utc_now()
         claims["frontier"]["summary"] = "The fixture Claim is numerically supported; review scope."
-        claims["frontier"]["next_actions"] = ["Run independent review."]
         claims["revision"] += 1
         claims["updated_at"] = utc_now()
         atomic_write_json(paths.claims, claims)

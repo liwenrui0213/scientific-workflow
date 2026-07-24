@@ -1,18 +1,20 @@
 ---
 name: research-compaction
-description: Compact a scientific Study into finite active context without deleting history. Use when history has grown, the Frontier needs clarification, Claims or Evidence need updates, representative failures need preservation, or a new immutable Checkpoint is needed. Do not use for status summaries or garbage collection.
+description: Compact a scientific Study into finite active context without deleting history. Use for compaction pressure, Frontier clarification, or a new immutable Checkpoint; not for status summaries or garbage collection.
 ---
 
 # Research Compaction
 
 ## Authoritative inputs
 
-Validate the repository profile, then run `studyctl check-changes`, `status`,
-and `compact-prepare`. Invoke this Skill whenever status reports soft or hard
-compaction pressure, as well as at an explicit scientific checkpoint. Treat
-Treat generated files as bounded indexes; an unlisted item is not absent.
-Inspect only question-selected Runs, Observations, Evidence, Claims, failures,
-formal artifacts, Checkpoint, and work sources. Read authority by ID.
+Validate the repository profile, then run
+`python -m tools.studyctl check-changes <STUDY_ID>`,
+`python -m tools.studyctl status <STUDY_ID>`, and
+`python -m tools.studyctl compact-prepare <STUDY_ID>`. Use this Skill at soft/hard pressure
+or an explicit scientific checkpoint. Generated files are bounded indexes;
+read question-selected authority by ID, including graph records and sequence,
+Runs/Artifacts, Observations, Evidence, Claims, failures, formal artifacts,
+Checkpoint, and Workspace sources.
 
 Read [semantic compaction](references/semantic-compaction.md) before selecting
 decisive Evidence, representative failures, Claim revisions, or the new
@@ -20,43 +22,33 @@ Frontier.
 
 ## Workflow
 
-1. Keep simple observations inline; inspect the active promotion-trigger
-   Registry and promote only when a registered condition applies. Preserve every
-   source Run, exclusion, anomaly, failure, uncertainty, assumption, and limitation.
+1. Keep simple observations inline. Promote only under a registered trigger,
+   preserving source Runs, exclusions, anomalies, failures, uncertainty,
+   assumptions, and limitations.
 2. Update draft or new-version Evidence and Claims without inventing results.
-   Pin exact Observation versions when used. Preserve decisive
-   support, contradictions, anomalies, and representative failures. Evidence
-   basis is immutable; preserve its inference argument
-   without rewriting finalized history. Claim basis is
-   recomputed from its supporting Evidence; compaction cannot relabel
-   exploratory or mixed support as confirmatory. Mark no-longer-current
-   Claims `retired`, or mark them `superseded` with a new active Claim ID. The
-   new Checkpoint seals these lifecycle decisions; never reactivate them after
-   that boundary.
+   Pin exact Observations; preserve decisive support, contradiction, anomalies,
+   failures, and inference arguments. Never rewrite finalized history or
+   relabel exploratory/mixed support as confirmatory. Mark obsolete Claims
+   `retired` or `superseded` by a new active Claim.
 3. When total or terminal Claim pressure remains high, seal explicit
-   `retired`/`superseded` lifecycles first. Only after that Checkpoint succeeds
-   may a later compaction remove those terminal records from current
-   `CLAIMS.json`; first verify that finalization created the immutable full
-   Claim record referenced by the Checkpoint under `checkpoints/claim-records/`.
-   A sealed terminal Claim is immutable in full, not only in lifecycle. Never
-   rewrite it under the same ID, break a historical supersession chain, drop an
-   active Claim, remove a referenced record, or auto-select a lifecycle.
+   lifecycles first. A later compaction may remove them from `CLAIMS.json` only
+   after a Checkpoint created their immutable full records. Never rewrite those
+   records, break supersession, drop an active Claim, or auto-select lifecycle.
 4. Keep the Frontier limited to Claims under active test, unresolved questions,
-   immediate next actions, and genuinely blocking human decisions. Move
-   resolved history into Evidence, failed directions, or Checkpoints.
-5. After all Observation, Evidence, and Claim edits, rerun `compact-prepare`, then write a
-   schema-valid compaction plan outside `work/active/`. Bind it to that final
-   preparation input, Claims hash, and constant-size Evidence inventory binding
-   (`total_count` plus full `inventory_sha256`), and name every scratch file
-   proposed for archival explicitly. Never copy the full Evidence path/hash map
-   into the plan.
-6. Keep `work/active/` unchanged, then run `studyctl compact-finalize`. If the
+   and genuinely blocking human decisions. Represent structured future work
+   through an ExperimentIntent and ControlGraphSpec rather than an action list
+   inside the Frontier. Move resolved history into Evidence, failed directions,
+   or Checkpoints.
+5. Rerun `python -m tools.studyctl compact-prepare <STUDY_ID>`, then write a
+   schema-valid plan outside `work/active/`. Bind the preparation input, Claims
+   hash, and constant-size Evidence inventory. Carry Frontier once, name every
+   proposed scratch archive, and never copy the full Evidence path/hash map.
+6. Keep `work/active/` unchanged, then run
+   `python -m tools.studyctl compact-finalize <STUDY_ID> --plan <PATH>`. If the
    profile, host fingerprint, inventory, binding, hash, or reference changed,
    prepare again.
-7. When an index is truncated, inspect and compact one relevant batch, finalize
-   without deleting history, then rerun `compact-prepare` for the next batch.
-   Finalization recomputes the full inventory hash, including entries omitted
-   from the bounded projection.
+7. For a truncated index, inspect one relevant batch, finalize without deleting
+   history, and prepare again. Finalization still hashes the full inventory.
 
 ## Hard gates
 
@@ -64,26 +56,22 @@ Frontier.
 - Compaction is semantic organization, never deletion or a way to make
   contradictory results disappear.
 - Archive only selected Study scratch files. Never archive authoritative
-  records, adopted host source or tests, Runs, Observations, Evidence, output
-  objects, unique anomalies, or referenced material.
+  graph records/sequence, active PLAN, adopted host files, Runs/Artifacts,
+  Observations, Evidence, output objects, unique anomalies, or references.
 - Never treat generated projections as sources of truth or silently widen a
   Claim while summarizing it.
-- Never omit a confirmatory attempt from Confirmation/Evidence accounting or
-  treat an unlisted bounded locator as absent. Never collapse exploratory and
-  confirmatory Evidence into one unlabeled result or override the Claim basis
-  recomputed from its current supporting Evidence.
+- Never omit a confirmatory attempt, treat an unlisted locator as absent, or
+  collapse exploratory and confirmatory Evidence into one unlabeled result.
 - Observation has no Claim assessment; never mutate it or hide exclusions.
 - Never change a protected condition or authorized Claim scope through
   compaction. Open the normal human-authorized revision path instead.
 
 ## Output and handoff
 
-Produce one immutable Checkpoint with only the Frontier-selected active Claim
-snapshots, compact hash references for non-Frontier Claims, decisive and
-contradictory Evidence, exact locators for the Observations reached through that
-Evidence, a small diverse Frontier, open questions, next actions, pressure
-watermarks, budget state, and the previous Checkpoint link. Regenerate status through
-`studyctl`; return the archived scratch list and any human decision required.
+Produce one immutable Checkpoint with Frontier-selected Claim snapshots,
+non-Frontier Claim refs, decisive/contradictory Evidence, reached Observations,
+one Frontier object, watermarks, budget, and the previous link. Regenerate
+status; return archived scratch and required human decisions.
 Hand the compacted state back to `scientific-study`, or prepare the explicit
 fresh-session `scientific-review` handoff when the review boundary is ready. Do
 not invoke garbage collection as part of compaction.

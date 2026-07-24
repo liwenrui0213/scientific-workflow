@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 import unittest
 
 from tests.helpers import WorkflowTestCase
@@ -10,13 +11,21 @@ from tools.studyctl.compaction import (
     prepare_compaction,
 )
 from tools.studyctl.evidence import create_evidence_draft
+from tools.studyctl.graph_records import (
+    create_control_graph_draft,
+    create_experiment_intent_draft,
+    finalize_control_graph,
+    finalize_experiment_intent,
+)
 from tools.studyctl.hashing import atomic_write_json, load_json, sha256_file
 from tools.studyctl.models import (
     CHECKPOINT_SCHEMA_VERSION,
     CLAIMS_SCHEMA_VERSION,
+    COMPACTION_PLAN_SCHEMA_VERSION,
+    CONTROL_GRAPH_SCHEMA_VERSION,
     EVIDENCE_SCHEMA_VERSION,
+    EXPERIMENT_INTENT_SCHEMA_VERSION,
     OBSERVATION_SCHEMA_VERSION,
-    SCHEMA_VERSION,
     StudyPaths,
 )
 from tools.studyctl.observation import create_observation_draft
@@ -37,7 +46,7 @@ class CurrentSchemaContractTests(WorkflowTestCase):
         prepared = load_json(compaction_input)
         claims = load_json(paths.claims)
         plan = {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": COMPACTION_PLAN_SCHEMA_VERSION,
             "study_id": paths.study_id,
             "compaction_input_sha256": sha256_file(compaction_input),
             "claims_sha256": sha256_file(paths.claims),
@@ -46,8 +55,6 @@ class CurrentSchemaContractTests(WorkflowTestCase):
             "decisive_evidence": [],
             "contradictory_evidence": [],
             "frontier": claims["frontier"],
-            "open_questions": list(claims["frontier"]["open_questions"]),
-            "next_actions": list(claims["frontier"]["next_actions"]),
             "representative_failures": [],
             "budget_state": prepared["budget_totals"],
         }
@@ -74,6 +81,50 @@ class CurrentSchemaContractTests(WorkflowTestCase):
             ["CLAIM-0001"],
             [manifest["run_id"]],
         )
+        intent_draft_path = create_experiment_intent_draft(
+            paths,
+            "INTENT-0001",
+            evidence_gap_id="GAP-0001",
+            evidence_gap="The current-schema fixture lacks an exact observation.",
+            objective="Record and assess the exact fixture value.",
+            requested_observations=["fixture_value"],
+            evidence_requirements=["One provenance-bound exact value."],
+            claim_id="CLAIM-0001",
+        )
+        intent_draft = load_json(intent_draft_path)
+        intent_draft["assessment_semantics"]["criteria"] = [
+            {
+                "criterion_id": "CRIT-001",
+                "observation": "fixture_value",
+                "operator": "eq",
+                "target": 4,
+                "unit": None,
+                "on_pass": "supports",
+                "on_fail": "contradicts",
+            }
+        ]
+        intent_draft["scope"] = "The deterministic current-schema fixture."
+        atomic_write_json(intent_draft_path, intent_draft)
+        intent_path = finalize_experiment_intent(paths, intent_draft_path)
+        plan_draft_path = create_control_graph_draft(
+            paths,
+            "CG-0001",
+            intent_id="INTENT-0001",
+            intent_version=1,
+        )
+        plan_draft = load_json(plan_draft_path)
+        plan_draft["nodes"] = [
+            {
+                "node_id": "run_fixture",
+                "kind": "task",
+                "purpose": "Run the deterministic schema fixture.",
+                "command": [sys.executable, "-c", "print(4)"],
+                "loop_contract": None,
+            }
+        ]
+        plan_draft["completion"]["required_node_ids"] = ["run_fixture"]
+        atomic_write_json(plan_draft_path, plan_draft)
+        control_graph_path = finalize_control_graph(paths, plan_draft_path)
 
         artifacts = (
             ("claims", paths.claims, CLAIMS_SCHEMA_VERSION),
@@ -84,6 +135,12 @@ class CurrentSchemaContractTests(WorkflowTestCase):
             ),
             ("evidence", evidence_path, EVIDENCE_SCHEMA_VERSION),
             ("checkpoint", checkpoint_path, CHECKPOINT_SCHEMA_VERSION),
+            (
+                "experiment_intent",
+                intent_path,
+                EXPERIMENT_INTENT_SCHEMA_VERSION,
+            ),
+            ("control_graph", control_graph_path, CONTROL_GRAPH_SCHEMA_VERSION),
         )
         for name, path, expected_version in artifacts:
             with self.subTest(schema=name):
@@ -101,6 +158,8 @@ class CurrentSchemaContractTests(WorkflowTestCase):
             "observation": OBSERVATION_SCHEMA_VERSION,
             "evidence": EVIDENCE_SCHEMA_VERSION,
             "checkpoint": CHECKPOINT_SCHEMA_VERSION,
+            "experiment_intent": EXPERIMENT_INTENT_SCHEMA_VERSION,
+            "control_graph": CONTROL_GRAPH_SCHEMA_VERSION,
         }
         for name, current_version in current_versions.items():
             for raw_version in (None, True, 0, current_version + 1):

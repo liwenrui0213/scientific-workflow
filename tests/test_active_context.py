@@ -52,7 +52,7 @@ class ActiveContextTests(WorkflowTestCase):
         state = load_json(compaction_input)
         claims = load_json(paths.claims)
         plan = {
-            "schema_version": 1,
+            "schema_version": 2,
             "study_id": paths.study_id,
             "compaction_input_sha256": sha256_file(compaction_input),
             "claims_sha256": sha256_file(paths.claims),
@@ -61,8 +61,6 @@ class ActiveContextTests(WorkflowTestCase):
             "decisive_evidence": [],
             "contradictory_evidence": [],
             "frontier": claims["frontier"],
-            "open_questions": list(claims["frontier"]["open_questions"]),
-            "next_actions": list(claims["frontier"]["next_actions"]),
             "representative_failures": [],
             "budget_state": state["budget_totals"],
         }

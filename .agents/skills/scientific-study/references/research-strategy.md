@@ -35,6 +35,13 @@ Do not optimize only the easiest visible metric. A performance improvement is
 not eligible when it is obtained by weakening accuracy, convergence, invariants,
 data comparability, or another protected condition.
 
+When the next experiment warrants structure, first express its cognitive
+purpose as an ExperimentIntent: the EvidenceGap it addresses, requested
+observations, evidence requirements, scope, and assessment semantics. Then let
+the Agent design a ControlGraphSpec for how to obtain those observations.
+Alternative Plans may realize the same Intent, but a Plan must bind the exact
+finalized Intent and cannot own or silently change the scientific threshold.
+
 ## Build discriminating Evidence
 
 Select controls according to the proposed mechanism:
@@ -60,13 +67,15 @@ consumed by the search when the scientific setting admits a held-out test. A
 confirmation that reuses an observed condition is still auditable but must not
 be described as fresh held-out support.
 
-Promote Runs into Evidence when they answer a named question with eligible,
-reproducible observations and an explicit analysis, scope, uncertainty, and
-limitations. State how the observations bear on the exact Claim, the auxiliary
-assumptions required by that inference, live competing explanations, and
-concrete conditions that would overturn the assessment. Do not promote every
-Run merely because it completed, and do not leave a result that changes an
-active Claim or important boundary only in raw logs.
+Treat a Run and its Artifacts as execution/provenance facts. Convert them into
+an inline Observation in one Evidence Argument, or into a finalized Observation
+Record when a registered promotion trigger applies. Then state in
+Claim-specific Evidence how that Observation bears on the exact Claim, the
+auxiliary assumptions required by the inference, live competing explanations,
+scope, uncertainty, limitations, and concrete conditions that would overturn
+the assessment. Do not promote every Run merely because it completed, and do
+not leave a result that changes an active Claim or important boundary only in
+raw logs.
 
 ## Separate correctness questions
 

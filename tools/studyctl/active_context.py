@@ -32,7 +32,6 @@ PRESSURE_METRICS = (
     "terminal_claims",
     "claims_source_bytes",
     "frontier_open_questions",
-    "frontier_next_actions",
     "frontier_human_decisions",
     "active_selector_bytes",
     "runs_since_checkpoint",
@@ -549,7 +548,6 @@ def _frontier_selector(frontier: Mapping[str, Any]) -> dict[str, Any]:
         "summary": _text_preview(frontier.get("summary")),
         "claim_ids": claim_ids,
         "open_questions": _bounded_text_index(frontier.get("open_questions")),
-        "next_actions": _bounded_text_index(frontier.get("next_actions")),
         "human_decisions_required": _bounded_text_index(
             frontier.get("human_decisions_required")
         ),
@@ -688,6 +686,8 @@ def build_active_selector(
             ),
         }
 
+    from .graph_records import current_graph_record_locators
+
     selector = {
         "schema_version": 1,
         "study_id": paths.study_id,
@@ -711,6 +711,7 @@ def build_active_selector(
         ),
         "active_formal_artifacts": formal,
         "confirmations": _confirmation_source_index(paths),
+        "graph_records": current_graph_record_locators(paths),
         "latest_checkpoint": checkpoint_summary,
         "selector_sha256": "",
     }
@@ -1059,7 +1060,6 @@ def compaction_pressure(
         "terminal_claims": terminal_claim_count,
         "claims_source_bytes": paths.claims.stat().st_size,
         "frontier_open_questions": len(frontier.get("open_questions", [])),
-        "frontier_next_actions": len(frontier.get("next_actions", [])),
         "frontier_human_decisions": len(
             frontier.get("human_decisions_required", [])
         ),

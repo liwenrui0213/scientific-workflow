@@ -45,7 +45,7 @@ class _CompactionPlanMixin:
         compaction_state = load_json(compaction_input)
         claims = load_json(paths.claims)
         plan = {
-            "schema_version": 1,
+            "schema_version": 2,
             "study_id": paths.study_id,
             "compaction_input_sha256": sha256_file(compaction_input),
             "claims_sha256": sha256_file(paths.claims),
@@ -54,8 +54,6 @@ class _CompactionPlanMixin:
             "decisive_evidence": decisive_evidence or [],
             "contradictory_evidence": [],
             "frontier": claims["frontier"],
-            "open_questions": list(claims["frontier"]["open_questions"]),
-            "next_actions": list(claims["frontier"]["next_actions"]),
             "representative_failures": representative_failures or [],
             "budget_state": compaction_state["budget_totals"],
         }
@@ -65,6 +63,38 @@ class _CompactionPlanMixin:
 
 
 class CompactionTests(_CompactionPlanMixin, WorkflowTestCase):
+    def _remove_graph_records_from_prepared_input(
+        self,
+        paths: StudyPaths,
+        plan: Path,
+    ) -> None:
+        """Remove a required graph-record binding."""
+
+        compaction_input = paths.generated / "COMPACTION_INPUT.json"
+        state = load_json(compaction_input)
+        state.pop("graph_records")
+        atomic_write_json(compaction_input, state)
+        plan_payload = load_json(plan)
+        plan_payload["compaction_input_sha256"] = sha256_file(compaction_input)
+        atomic_write_json(plan, plan_payload)
+
+    def test_finalize_rejects_prepared_input_without_graph_record_binding(
+        self,
+    ) -> None:
+        paths = self.initialize_approved_with_claim()
+        plan = self.write_compaction_plan(
+            paths,
+            [],
+            name="missing-graph-binding-plan.json",
+        )
+        self._remove_graph_records_from_prepared_input(paths, plan)
+
+        with self.assertRaisesRegex(
+            ValidationError,
+            "lacks graph-record bindings",
+        ):
+            finalize_compaction(paths, plan)
+
     def test_prepare_rejects_blocked_host_change_scope(self) -> None:
         paths = self.initialize_approved_with_claim()
         rogue = self.root / "unclassified-host-change.txt"
@@ -266,7 +296,6 @@ class CompactionTests(_CompactionPlanMixin, WorkflowTestCase):
             "summary": "f" * 4096,
             "claim_ids": [f"CLAIM-{index:04d}" for index in range(1, 33)],
             "open_questions": ["q" * 1024 for _ in range(64)],
-            "next_actions": ["a" * 1024 for _ in range(64)],
             "human_decisions_required": ["d" * 1024 for _ in range(32)],
         }
         claims["revision"] += 1
@@ -840,13 +869,13 @@ class ReviewTests(_CompactionPlanMixin, WorkflowTestCase):
             trigger_registry["size"],
             trigger_registry_path.stat().st_size,
         )
-        self.assertEqual(packet["evidence"][0]["object"]["record_sha256"], evidence["record_sha256"])
-        self.assertEqual(packet["decisive_run_manifests"][0]["run_id"], manifest["run_id"])
+        self.assertEqual(packet["evidence"][0]["summary"]["record_sha256"], evidence["record_sha256"])
+        self.assertEqual(packet["decisive_run_sources"][0]["run_id"], manifest["run_id"])
         self.assertEqual(
             packet["cohort_fingerprints"][manifest["run_id"]],
             manifest["cohort"]["fingerprint_sha256"],
         )
-        run_source = packet["decisive_run_manifests"][0]
+        run_source = packet["decisive_run_sources"][0]
         self.assertEqual(
             run_source["path"],
             (paths.runs / manifest["run_id"] / "manifest.json")

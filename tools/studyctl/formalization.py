@@ -75,6 +75,15 @@ def artifact_ready(paths: StudyPaths, artifact: str) -> bool:
     policy = load_policy(paths)
     relative = policy["formal_artifacts"][artifact]
     path = paths.study / relative
+    if artifact == "PLAN":
+        if not path.is_file():
+            return False
+        try:
+            from .graph_records import active_control_graph
+
+            return active_control_graph(paths) is not None
+        except (OSError, ValidationError):
+            return False
     return _markdown_ready(path) if path.suffix.lower() == ".md" else _json_ready(path)
 
 
@@ -227,29 +236,6 @@ def check_formalization(paths: StudyPaths, options: dict[str, Any] | None = None
             "Claim scope crosses the active Brief boundary; start a new Brief version and obtain approval",
         )
 
-    try:
-        claims = load_json(paths.claims)
-    except ValidationError:
-        claims = {}
-    raw_debt = claims.get("formalization_debt", []) if isinstance(claims, dict) else []
-    if not isinstance(raw_debt, list):
-        raw_debt = []
-    for debt in raw_debt:
-        level = debt.get("level")
-        applicable = (
-            level == "blocking_now"
-            or (level == "required_before_expensive_run" and (expensive_gpu or expensive_cpu))
-            or (level == "required_before_evidence" and options.get("for_evidence"))
-            or (level == "required_before_review" and options.get("for_review"))
-        )
-        if applicable:
-            _add_requirement(
-                requirements,
-                str(level),
-                str(debt.get("artifact", "BRIEF")),
-                str(debt.get("reason", "unresolved formalization debt")),
-            )
-
     # Keep the smallest artifact per rule target, retaining the strictest level.
     deduplicated: dict[str, dict[str, str]] = {}
     for requirement in requirements:
@@ -277,16 +263,8 @@ def check_formalization(paths: StudyPaths, options: dict[str, Any] | None = None
 
 def collect_formalization_debt(paths: StudyPaths) -> list[dict[str, Any]]:
     debt: list[dict[str, Any]] = []
-    try:
-        claims = load_json(paths.claims)
-    except ValidationError:
-        claims = {}
-    if isinstance(claims, dict):
-        recorded = claims.get("formalization_debt", [])
-        if isinstance(recorded, list):
-            debt.extend(recorded)
+    policy = load_policy(paths)
     for artifact in ("METHOD", "PROTOCOL", "EVALUATOR", "PLAN"):
-        policy = load_policy(paths)
         path = paths.study / policy["formal_artifacts"][artifact]
         if path.exists() and not artifact_ready(paths, artifact):
             debt.append(

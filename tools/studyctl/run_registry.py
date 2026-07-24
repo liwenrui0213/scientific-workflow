@@ -657,6 +657,14 @@ def _capture_formal_artifacts(
 ) -> list[tuple[Path, str, str, bytes]]:
     if not paths.formal.is_dir():
         return []
+    plan_path = paths.formal / "PLAN.json"
+    if plan_path.is_file() and not plan_path.is_symlink():
+        from .graph_records import active_control_graph
+
+        if active_control_graph(paths) is None:
+            raise ValidationError(
+                "formal/PLAN.json must be an activated ControlGraphSpec"
+            )
     known_kinds = {
         (paths.study / str(relative)).resolve(): str(kind)
         for kind, relative in policy.get("formal_artifacts", {}).items()
@@ -1157,32 +1165,6 @@ def _capsule_plan(
         backend=execution_backend,
         preference=preference,
     )
-
-
-def _capsule_command(
-    *,
-    root: Path,
-    configured_cwd: Path,
-    profile: dict[str, Any],
-    command: list[str],
-    inputs: Sequence[tuple[Path, dict[str, Any]]],
-    output_paths: Sequence[str | os.PathLike[str]] | None,
-    capsule_home: Path,
-    execution_backend: str = "auto",
-) -> tuple[list[str], dict[str, str], dict[str, Any]]:
-    """Compatibility wrapper returning the command-facing parts of a plan."""
-
-    plan = _capsule_plan(
-        root=root,
-        configured_cwd=configured_cwd,
-        profile=profile,
-        command=command,
-        inputs=inputs,
-        output_paths=output_paths,
-        capsule_home=capsule_home,
-        execution_backend=execution_backend,
-    )
-    return plan.argv, plan.environment, plan.boundary
 
 
 def _input_records(

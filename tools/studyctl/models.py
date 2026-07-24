@@ -13,8 +13,11 @@ from typing import Iterable
 SCHEMA_VERSION = 1
 OBSERVATION_SCHEMA_VERSION = 2
 EVIDENCE_SCHEMA_VERSION = 4
-CLAIMS_SCHEMA_VERSION = 2
-CHECKPOINT_SCHEMA_VERSION = 3
+CLAIMS_SCHEMA_VERSION = 3
+CHECKPOINT_SCHEMA_VERSION = 4
+COMPACTION_PLAN_SCHEMA_VERSION = 2
+EXPERIMENT_INTENT_SCHEMA_VERSION = 1
+CONTROL_GRAPH_SCHEMA_VERSION = 1
 
 ID_PATTERNS = {
     "study": re.compile(r"^SC-[0-9]{4,}$"),
@@ -23,6 +26,9 @@ ID_PATTERNS = {
     "evidence": re.compile(r"^EVID-[0-9]{4,}$"),
     "claim": re.compile(r"^CLAIM-[0-9]{4,}$"),
     "confirmation": re.compile(r"^CONF-[0-9]{4,}$"),
+    "experiment_intent": re.compile(r"^INTENT-[0-9]{4,}$"),
+    "control_graph": re.compile(r"^CG-[0-9]{4,}$"),
+    "evidence_gap": re.compile(r"^GAP-[0-9]{4,}$"),
     "cohort": re.compile(r"^COHORT-[0-9]{3,}$"),
     "checkpoint": re.compile(r"^CHECKPOINT-[0-9]{6}$"),
     "verdict": re.compile(r"^VERDICT-[0-9]{4,}$"),
@@ -42,15 +48,6 @@ HUMAN_SCIENTIFIC_VERDICTS = {
     "rejected",
     "requires_more_evidence",
 }
-
-FORMALIZATION_LEVELS = {
-    "advisory",
-    "required_before_expensive_run",
-    "required_before_evidence",
-    "required_before_review",
-    "blocking_now",
-}
-
 
 class WorkflowError(RuntimeError):
     """Expected workflow failure suitable for a concise CLI message."""
@@ -160,6 +157,18 @@ class StudyPaths:
         )
 
     @property
+    def experiment_intents(self) -> Path:
+        return self._safe_study_path(
+            Path("intents"), label="Experiment Intent directory"
+        )
+
+    @property
+    def control_graphs(self) -> Path:
+        return self._safe_study_path(
+            Path("control-plans"), label="Control Graph directory"
+        )
+
+    @property
     def work(self) -> Path:
         return self._safe_study_path(Path("work"), label="work directory")
 
@@ -194,6 +203,13 @@ class StudyPaths:
     def checkpoint_sequence(self) -> Path:
         return self._safe_study_path(
             Path("CHECKPOINTS.sequence.json"), label="CHECKPOINTS.sequence.json"
+        )
+
+    @property
+    def graph_record_sequence(self) -> Path:
+        return self._safe_study_path(
+            Path("GRAPH_RECORDS.sequence.json"),
+            label="GRAPH_RECORDS.sequence.json",
         )
 
     @property
@@ -248,6 +264,8 @@ class StudyPaths:
 
         for directory in (
             self.formal,
+            self.experiment_intents,
+            self.control_graphs,
             self.work,
             self.runs,
             self.observations,
@@ -280,6 +298,7 @@ class StudyPaths:
             self.observation_sequence,
             self.evidence_sequence,
             self.checkpoint_sequence,
+            self.graph_record_sequence,
             self.verdict,
         ):
             if artifact.exists() and not artifact.is_file():

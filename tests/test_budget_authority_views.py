@@ -89,7 +89,7 @@ class BudgetAuthorityViewTests(WorkflowTestCase):
         atomic_write_json(
             plan_path,
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "study_id": paths.study_id,
                 "compaction_input_sha256": sha256_file(prepared_path),
                 "claims_sha256": sha256_file(paths.claims),
@@ -98,8 +98,6 @@ class BudgetAuthorityViewTests(WorkflowTestCase):
                 "decisive_evidence": [],
                 "contradictory_evidence": [],
                 "frontier": claims["frontier"],
-                "open_questions": claims["frontier"]["open_questions"],
-                "next_actions": claims["frontier"]["next_actions"],
                 "representative_failures": [],
                 "budget_state": prepared["budget_totals"],
             },

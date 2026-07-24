@@ -1,0 +1,166 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/scientific-workflow/experiment-intent.schema.json",
+  "title": "Versioned scientific Experiment Intent",
+  "type": "object",
+  "x-maxCanonicalBytes": 65536,
+  "required": [
+    "schema_version",
+    "record_type",
+    "study_id",
+    "intent_id",
+    "version",
+    "status",
+    "created_at",
+    "updated_at",
+    "previous_ref",
+    "governance",
+    "addresses",
+    "objective",
+    "requested_observations",
+    "evidence_requirements",
+    "assessment_semantics",
+    "scope",
+    "assumptions",
+    "limitations",
+    "record_sha256"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "record_type": {"const": "experiment_intent"},
+    "study_id": {"type": "string", "pattern": "^SC-[0-9]{4,}$"},
+    "intent_id": {"type": "string", "pattern": "^INTENT-[0-9]{4,}$"},
+    "version": {"type": "integer", "minimum": 1},
+    "status": {"enum": ["draft", "finalized"]},
+    "created_at": {"type": "string", "minLength": 1, "maxLength": 64},
+    "updated_at": {"type": "string", "minLength": 1, "maxLength": 64},
+    "previous_ref": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "required": ["intent_id", "version", "sha256"],
+          "properties": {
+            "intent_id": {"type": "string", "pattern": "^INTENT-[0-9]{4,}$"},
+            "version": {"type": "integer", "minimum": 1},
+            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "governance": {
+      "type": "object",
+      "required": ["brief_sha256", "approval_sha256"],
+      "properties": {
+        "brief_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "approval_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "addresses": {
+      "type": "object",
+      "required": ["evidence_gap", "target_claim"],
+      "properties": {
+        "evidence_gap": {
+          "type": "object",
+          "required": ["gap_id", "description"],
+          "properties": {
+            "gap_id": {"type": "string", "pattern": "^GAP-[0-9]{4,}$"},
+            "description": {"type": "string", "minLength": 1, "maxLength": 4096}
+          },
+          "additionalProperties": false
+        },
+        "target_claim": {
+          "oneOf": [
+            {"type": "null"},
+            {
+              "type": "object",
+              "required": ["claim_id", "statement", "scope", "spec_sha256"],
+              "properties": {
+                "claim_id": {"type": "string", "pattern": "^CLAIM-[0-9]{4,}$"},
+                "statement": {"type": "string", "minLength": 1, "maxLength": 8192},
+                "scope": {"type": ["string", "null"], "maxLength": 8192},
+                "spec_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+              },
+              "additionalProperties": false
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "objective": {"type": "string", "minLength": 1, "maxLength": 4096},
+    "requested_observations": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1, "maxLength": 256}
+    },
+    "evidence_requirements": {
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1, "maxLength": 4096}
+    },
+    "assessment_semantics": {
+      "type": "object",
+      "required": ["aggregation", "criteria", "default_outcome"],
+      "properties": {
+        "aggregation": {"enum": ["all_required", "any_sufficient", "manual_synthesis"]},
+        "criteria": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "required": [
+              "criterion_id",
+              "observation",
+              "operator",
+              "target",
+              "unit",
+              "on_pass",
+              "on_fail"
+            ],
+            "properties": {
+              "criterion_id": {"type": "string", "pattern": "^CRIT-[0-9]{3,}$"},
+              "observation": {"type": "string", "minLength": 1, "maxLength": 256},
+              "operator": {
+                "enum": ["eq", "ne", "lt", "lte", "gt", "gte"]
+              },
+              "target": {"type": ["number", "string", "boolean"]},
+              "unit": {
+                "oneOf": [
+                  {"type": "null"},
+                  {"type": "string", "minLength": 1, "maxLength": 128}
+                ]
+              },
+              "on_pass": {"enum": ["supports", "contradicts", "inconclusive", "no_update"]},
+              "on_fail": {"enum": ["supports", "contradicts", "inconclusive", "no_update"]}
+            },
+            "additionalProperties": false
+          }
+        },
+        "default_outcome": {"enum": ["inconclusive", "requires_human_review"]}
+      },
+      "additionalProperties": false
+    },
+    "scope": {"type": ["string", "null"], "maxLength": 8192},
+    "assumptions": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {"type": "string", "minLength": 1, "maxLength": 4096}
+    },
+    "limitations": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {"type": "string", "minLength": 1, "maxLength": 4096}
+    },
+    "record_sha256": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  },
+  "additionalProperties": false
+}

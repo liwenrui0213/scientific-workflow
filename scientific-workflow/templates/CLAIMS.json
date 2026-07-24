@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "study_id": "{{STUDY_ID}}",
   "revision": 1,
   "updated_at": "{{TIMESTAMP}}",
@@ -8,8 +8,6 @@
     "summary": null,
     "claim_ids": [],
     "open_questions": [],
-    "next_actions": [],
     "human_decisions_required": []
-  },
-  "formalization_debt": []
+  }
 }

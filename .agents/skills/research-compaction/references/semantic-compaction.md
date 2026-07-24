@@ -5,14 +5,15 @@ ranking of attractive results and not a deletion policy.
 
 ## Promote observations only when useful
 
-Treat `Run -> Evidence` as the default. Create an Observation Record only when
-at least one condition in the active versioned promotion-trigger Registry
-applies. Inspect it with `python -m tools.studyctl observation-trigger-list
-STUDY_ID`; do not invent an unregistered trigger or use independent review as a
-generic escape hatch. The initial Registry covers aggregation across Runs,
-multi-Claim reuse, complex analysis, Cohort crossings, anomalies or failures,
-Frontier or confirmatory use, independent review, cross-Checkpoint reuse, and
-material context deduplication.
+Treat `Run / Artifact -> inline Observation -> Claim-specific Evidence` as the
+default. Create a standalone Observation Record only when at least one
+condition in the active versioned promotion-trigger Registry applies. Inspect
+it with `python -m tools.studyctl observation-trigger-list STUDY_ID`; do not
+invent an unregistered trigger or use independent review as a generic escape
+hatch. The initial Registry covers aggregation across Runs, multi-Claim reuse,
+complex analysis, Cohort crossings, anomalies or failures, Frontier or
+confirmatory use, independent review, cross-Checkpoint reuse, and material
+context deduplication.
 
 If a materially distinct reason is not registered, record it as a proposal and
 stop promotion. Explain why existing triggers are insufficient, the expected
@@ -63,6 +64,13 @@ questions that are active and non-redundant. Preserve alternatives with distinct
 strengths, risks, mechanisms, or scope, including a candidate that is important
 because it may falsify the current direction.
 
+The Frontier stores its summary, active Claim IDs, open questions, and blocking
+human decisions. Represent a structured evidence request as an
+ExperimentIntent and its execution design as a ControlGraphSpec rather than
+placing executable actions in the Frontier. A compaction plan carries the
+current Frontier object once and must not duplicate its open questions
+elsewhere.
+
 When several candidates differ across multiple objectives, avoid collapsing
 them into one scalar score unless the Brief defines that utility. A candidate is
 strictly dominated only when another candidate is at least as good on every
@@ -82,8 +90,9 @@ authorized objective and better on at least one, under compatible Evidence.
 Archive a `work/active/` file only when its durable content has been promoted to
 an authoritative artifact or it is no longer needed to reproduce an active
 decision. The plan must identify the exact file. Generated projections, adopted
-host code, Runs, Observations, Evidence, Claims, formal artifacts, and human
-records are not scratch.
+host code, finalized ExperimentIntents or ControlGraphSpecs, the graph-record
+sequence, active PLAN, Runs, Artifacts, Observations, Evidence, Claims, formal
+artifacts, and human records are not scratch.
 
 ## Compaction self-check
 
@@ -94,4 +103,5 @@ Before finalizing, ask:
 3. Is every unique anomaly or failure boundary still discoverable?
 4. Does the Frontier contain only live, distinct choices?
 5. Did any wording become stronger while detail was removed?
-6. Would a fresh Agent know the next action and why it matters?
+6. Would a fresh Agent know which EvidenceGap remains and whether it needs a new
+   ExperimentIntent, a ControlGraphSpec, or a human decision?

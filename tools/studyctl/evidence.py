@@ -10,9 +10,6 @@ from typing import Any, Iterator
 
 from .active_context import active_claims, require_growth_allowed
 from .evidence_sequence import (
-    evidence_sequence_temporary_paths,
-    load_evidence_sequence,
-    migrate_legacy_evidence_sequence,
     reserve_evidence_creation,
 )
 from .formalization import check_formalization
@@ -38,8 +35,6 @@ from .run_registry import confirmation_binding, effective_run_mode
 from .validation import (
     brief_approval_issues,
     brief_content_issues,
-    checkpoint_paths,
-    evidence_paths,
     errors_only,
     object_schema_issues,
     run_index,
@@ -692,132 +687,6 @@ def _versions(paths: StudyPaths, evidence_id: str) -> list[tuple[int, Path, dict
             raise ValidationError(f"Evidence has invalid status: {path}")
         versions.append((version, path, item))
     return versions
-
-
-@serialized_study_authority
-def migrate_evidence_sequence(paths: StudyPaths) -> Path:
-    """Explicitly establish a counter for one intact legacy Evidence history."""
-
-    if load_evidence_sequence(paths) is not None:
-        raise ValidationError("Evidence sequence already exists")
-    sequence_temps = evidence_sequence_temporary_paths(paths)
-    if sequence_temps:
-        raise ValidationError(
-            "legacy Evidence migration refuses unfinished sequence temporary state: "
-            + ", ".join(path.name for path in sequence_temps)
-        )
-
-    canonical = re.compile(r"^(EVID-[0-9]{4,})\.v([0-9]{4,})\.json$")
-    versions_by_id: dict[str, list[tuple[int, str]]] = {}
-    for path in evidence_paths(paths):
-        if path.is_symlink() or not path.is_file():
-            raise ValidationError(
-                f"legacy Evidence must be a regular, non-symbolic-link file: {path}"
-            )
-        match = canonical.fullmatch(path.name)
-        if match is None:
-            raise ValidationError(
-                f"legacy Evidence history contains a non-canonical filename: {path.name}"
-            )
-        evidence_id = match.group(1)
-        version = int(match.group(2))
-        require_id("evidence", evidence_id)
-        if version < 1 or path.name != f"{evidence_id}.v{version:04d}.json":
-            raise ValidationError(
-                f"legacy Evidence history contains a non-canonical filename: {path.name}"
-            )
-        item = load_json(path)
-        if not isinstance(item, dict):
-            raise ValidationError(f"legacy Evidence must be an object: {path}")
-        schema_issues = errors_only(
-            object_schema_issues(paths.root, "evidence", path, item)
-        )
-        if schema_issues:
-            raise ValidationError(
-                _invalid_object_message(f"legacy Evidence {path.name}", schema_issues)
-            )
-        if item.get("study_id") != paths.study_id:
-            raise ValidationError(f"legacy Evidence belongs to another Study: {path}")
-        if item.get("evidence_id") != evidence_id or item.get("version") != version:
-            raise ValidationError(
-                f"legacy Evidence identity/version does not match filename: {path}"
-            )
-        status = item.get("status")
-        if status == "finalized":
-            if item.get("record_sha256") != record_digest(item, "record_sha256"):
-                raise ValidationError(f"legacy Evidence digest is invalid: {path}")
-        elif status == "draft":
-            if item.get("record_sha256") is not None:
-                raise ValidationError(f"legacy draft Evidence is already sealed: {path}")
-        else:  # schema validation normally reports this first
-            raise ValidationError(f"legacy Evidence has invalid status: {path}")
-        versions_by_id.setdefault(evidence_id, []).append((version, str(status)))
-
-    for evidence_id, version_records in sorted(versions_by_id.items()):
-        numbers = sorted(number for number, _ in version_records)
-        expected = list(range(1, numbers[-1] + 1))
-        if numbers != expected:
-            raise ValidationError(
-                f"legacy Evidence history is not intact: {evidence_id} has a version gap"
-            )
-        drafts = [number for number, status in version_records if status == "draft"]
-        if len(drafts) > 1 or (drafts and drafts[0] != numbers[-1]):
-            raise ValidationError(
-                f"legacy Evidence history is not intact: {evidence_id} has an invalid draft sequence"
-            )
-
-    if paths.evidence.is_dir():
-        ambiguous = sorted(
-            path
-            for path in paths.evidence.iterdir()
-            if path.name.startswith(".EVID-")
-            and (path.name.endswith(".tmp") or path.name.endswith(".lock"))
-        )
-        if ambiguous:
-            raise ValidationError(
-                "legacy Evidence migration refuses unfinished lock/temporary state: "
-                + ", ".join(path.name for path in ambiguous)
-            )
-
-    checkpoint_high_water_mark = 0
-    for checkpoint_path in checkpoint_paths(paths):
-        if checkpoint_path.is_symlink() or not checkpoint_path.is_file():
-            raise ValidationError(
-                f"legacy Checkpoint must be a regular, non-symbolic-link file: {checkpoint_path}"
-            )
-        checkpoint = load_json(checkpoint_path)
-        if not isinstance(checkpoint, dict):
-            raise ValidationError(f"legacy Checkpoint must be an object: {checkpoint_path}")
-        if checkpoint.get("study_id") != paths.study_id:
-            raise ValidationError(
-                f"legacy Checkpoint belongs to another Study: {checkpoint_path}"
-            )
-        watermarks = checkpoint.get("active_context_watermarks")
-        if watermarks is None:
-            continue
-        if not isinstance(watermarks, dict):
-            raise ValidationError(
-                f"legacy Checkpoint has invalid active-context watermarks: {checkpoint_path}"
-            )
-        raw_watermark = watermarks.get("evidence_record_count")
-        if (
-            isinstance(raw_watermark, bool)
-            or not isinstance(raw_watermark, int)
-            or raw_watermark < 0
-        ):
-            raise ValidationError(
-                f"legacy Checkpoint has an invalid Evidence watermark: {checkpoint_path}"
-            )
-        checkpoint_high_water_mark = max(
-            checkpoint_high_water_mark, raw_watermark
-        )
-
-    migrate_legacy_evidence_sequence(
-        paths,
-        visible_record_count=sum(len(items) for items in versions_by_id.values()),
-        checkpoint_high_water_mark=checkpoint_high_water_mark,
-    )
-    return paths.evidence_sequence
 
 
 @serialized_study_authority

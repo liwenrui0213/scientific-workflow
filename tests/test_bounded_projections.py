@@ -4,6 +4,7 @@ from contextlib import redirect_stdout
 import io
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 from tests.helpers import WorkflowTestCase
 from tools.studyctl.active_context import (
@@ -15,11 +16,16 @@ from tools.studyctl.active_context import (
 )
 from tools.studyctl.cli import main as studyctl_main
 from tools.studyctl.evidence import create_evidence_draft, finalize_evidence
+from tools.studyctl.graph_records import (
+    GRAPH_RECORD_LOCATOR_BUDGET_BYTES,
+    _bounded_graph_record_projection,
+)
 from tools.studyctl.hashing import (
     atomic_write_json,
     canonical_json_bytes,
     load_json,
     sha256_file,
+    sha256_json,
 )
 from tools.studyctl.models import StudyPaths, ValidationError, utc_now
 from tools.studyctl.rendering import render_status
@@ -32,6 +38,16 @@ from tools.studyctl.validation import (
 
 
 class BoundedProjectionTests(WorkflowTestCase):
+    @staticmethod
+    def graph_sequence_locator() -> dict[str, object]:
+        return {
+            "path": "studies/SC-0001/GRAPH_RECORDS.sequence.json",
+            "size": 512,
+            "file_sha256": "a" * 64,
+            "high_water_mark": 0,
+            "inventory_sha256": sha256_json([]),
+        }
+
     def set_run_pressure(self, *, soft: int, hard: int) -> None:
         policy_path = self.root / "scientific-workflow" / "policy.json"
         policy = load_json(policy_path)
@@ -72,6 +88,118 @@ class BoundedProjectionTests(WorkflowTestCase):
         claims["revision"] += 1
         atomic_write_json(paths.claims, claims)
         return finalized
+
+    def set_maximal_valid_frontier(self, paths: StudyPaths) -> dict[str, object]:
+        claims = load_json(paths.claims)
+        claim_records = []
+        claim_ids = []
+        for index in range(64):
+            claim_id = f"CLAIM-{index + 1:04d}"
+            claim_ids.append(claim_id)
+            claim_records.append(
+                {
+                    "claim_id": claim_id,
+                    "statement": "s" * 4060 + f"-STATEMENT-TAIL-{index:02d}",
+                    "scope": "c" * 4060 + f"-SCOPE-TAIL-{index:02d}",
+                    "state": "proposed",
+                    "evidence_basis": "none",
+                    "lifecycle": "active",
+                    "supporting_evidence": [],
+                    "contradictory_evidence": [],
+                    "other_evidence": [],
+                    "uncertainty": "u" * 4096,
+                    "limitations": ["l" * 1024 for _ in range(32)],
+                    "updated_at": utc_now(),
+                }
+            )
+        claims["claims"] = claim_records
+        claims["frontier"] = {
+            "summary": "m" * 4096,
+            "claim_ids": claim_ids,
+            "open_questions": [
+                "q" * 1010 + f"-QUESTION-{index:02d}" for index in range(64)
+            ],
+            "human_decisions_required": [
+                "d" * 1010 + f"-DECISION-{index:02d}" for index in range(32)
+            ],
+        }
+        claims["revision"] += 1
+        claims["updated_at"] = utc_now()
+        atomic_write_json(paths.claims, claims)
+        return claims
+
+    @staticmethod
+    def graph_locator_fixture(
+        *, current_count: int, versions: int
+    ) -> tuple[
+        list[dict[str, object]],
+        list[dict[str, object]],
+        list[dict[str, object]],
+        list[dict[str, object]],
+        list[dict[str, object]],
+    ]:
+        if current_count < 1 or versions < 1:
+            raise ValueError("current_count and versions must both be positive")
+        intent_history: list[dict[str, object]] = []
+        intent_items: list[dict[str, object]] = []
+        plan_history: list[dict[str, object]] = []
+        plan_items: list[dict[str, object]] = []
+        draft_items: list[dict[str, object]] = []
+        for index in range(1, current_count + 1):
+            intent_id = f"INTENT-{index:04d}"
+            control_graph_id = f"CG-{index:04d}"
+            for version in range(1, versions + 1):
+                intent_digest = f"{index * 10_000 + version:064x}"
+                intent = {
+                    "intent_id": intent_id,
+                    "version": version,
+                    "sha256": intent_digest,
+                    "path": (
+                        f"studies/SC-0001/intents/{intent_id}.v{version:04d}.json"
+                    ),
+                    "size": 4096,
+                }
+                intent_history.append(intent)
+                plan = {
+                    "control_graph_id": control_graph_id,
+                    "version": version,
+                    "sha256": f"{1_000_000 + index * 10_000 + version:064x}",
+                    "realizes_intent": {
+                        "intent_id": intent_id,
+                        "version": version,
+                        "sha256": intent_digest,
+                    },
+                    "path": (
+                        "studies/SC-0001/control-plans/"
+                        f"{control_graph_id}.v{version:04d}.json"
+                    ),
+                    "size": 4096,
+                }
+                plan_history.append(plan)
+            intent_items.append(intent_history[-1])
+            plan_items.append(plan_history[-1])
+            draft_items.append(
+                {
+                    "kind": "experiment_intent",
+                    "id": intent_id,
+                    "version": versions + 1,
+                    "path": (
+                        "studies/SC-0001/work/active/"
+                        f"{intent_id}.v{versions + 1:04d}."
+                        "experiment-intent.draft.json"
+                    ),
+                    "size": 4096,
+                    "file_sha256": f"{2_000_000 + index:064x}",
+                    "assurance": "mutable_non_authoritative",
+                }
+            )
+        return (
+            intent_history,
+            intent_items,
+            plan_history,
+            plan_items,
+            draft_items,
+        )
 
     def test_active_selector_indexes_large_sources_without_embedding_them(self) -> None:
         paths = self.initialize_approved_with_claim()
@@ -119,41 +247,7 @@ class BoundedProjectionTests(WorkflowTestCase):
 
     def test_maximal_valid_frontier_still_produces_a_bounded_selector(self) -> None:
         paths = self.initialize_approved_with_claim()
-        claims = load_json(paths.claims)
-        claim_records = []
-        claim_ids = []
-        for index in range(64):
-            claim_id = f"CLAIM-{index + 1:04d}"
-            claim_ids.append(claim_id)
-            claim_records.append(
-                {
-                    "claim_id": claim_id,
-                    "statement": "s" * 4060 + f"-STATEMENT-TAIL-{index:02d}",
-                    "scope": "c" * 4060 + f"-SCOPE-TAIL-{index:02d}",
-                    "state": "proposed",
-                    "evidence_basis": "none",
-                    "lifecycle": "active",
-                    "supporting_evidence": [],
-                    "contradictory_evidence": [],
-                    "other_evidence": [],
-                    "uncertainty": "u" * 4096,
-                    "limitations": ["l" * 1024 for _ in range(32)],
-                    "updated_at": utc_now(),
-                }
-            )
-        claims["claims"] = claim_records
-        claims["frontier"] = {
-            "summary": "m" * 4096,
-            "claim_ids": claim_ids,
-            "open_questions": ["q" * 1010 + f"-QUESTION-{i:02d}" for i in range(64)],
-            "next_actions": ["a" * 1012 + f"-ACTION-{i:02d}" for i in range(64)],
-            "human_decisions_required": [
-                "d" * 1010 + f"-DECISION-{i:02d}" for i in range(32)
-            ],
-        }
-        claims["revision"] += 1
-        claims["updated_at"] = utc_now()
-        atomic_write_json(paths.claims, claims)
+        claims = self.set_maximal_valid_frontier(paths)
 
         issues = object_schema_issues(paths.root, "claims", paths.claims, claims)
         self.assertEqual([issue.render() for issue in issues], [])
@@ -181,7 +275,6 @@ class BoundedProjectionTests(WorkflowTestCase):
                     claim["limitations"] = [fill * 1024 for _ in range(32)]
                 claims["frontier"]["summary"] = fill * 4096
                 claims["frontier"]["open_questions"] = [fill * 1024 for _ in range(64)]
-                claims["frontier"]["next_actions"] = [fill * 1024 for _ in range(64)]
                 claims["frontier"]["human_decisions_required"] = [
                     fill * 1024 for _ in range(32)
                 ]
@@ -203,6 +296,128 @@ class BoundedProjectionTests(WorkflowTestCase):
                         for field in ("statement", "scope")
                     )
                 )
+
+    def test_small_graph_locator_inventories_remain_complete(self) -> None:
+        (
+            intent_history,
+            intent_items,
+            plan_history,
+            plan_items,
+            draft_items,
+        ) = self.graph_locator_fixture(current_count=1, versions=1)
+
+        projection = _bounded_graph_record_projection(
+            sequence_locator=self.graph_sequence_locator(),
+            intent_history=intent_history,
+            intent_items=intent_items,
+            plan_history=plan_history,
+            plan_items=plan_items,
+            draft_items=draft_items,
+        )
+
+        for name in ("experiment_intents", "control_graphs", "workspace_drafts"):
+            with self.subTest(index=name):
+                index = projection[name]
+                self.assertEqual(index["selected_count"], 1)
+                self.assertEqual(len(index["items"]), 1)
+                self.assertFalse(index["truncated"])
+        self.assertLessEqual(
+            len(canonical_json_bytes(projection)),
+            GRAPH_RECORD_LOCATOR_BUDGET_BYTES,
+        )
+
+    def test_maximal_frontier_and_large_graph_inventories_fit_active_context(
+        self,
+    ) -> None:
+        paths = self.initialize_approved_with_claim()
+        claims = self.set_maximal_valid_frontier(paths)
+        self.assertEqual(
+            [
+                issue.render()
+                for issue in object_schema_issues(
+                    paths.root, "claims", paths.claims, claims
+                )
+            ],
+            [],
+        )
+        (
+            intent_history,
+            intent_items,
+            plan_history,
+            plan_items,
+            draft_items,
+        ) = self.graph_locator_fixture(current_count=64, versions=4)
+        projection = _bounded_graph_record_projection(
+            sequence_locator=self.graph_sequence_locator(),
+            intent_history=intent_history,
+            intent_items=intent_items,
+            plan_history=plan_history,
+            plan_items=plan_items,
+            draft_items=draft_items,
+        )
+
+        with patch(
+            "tools.studyctl.graph_records.current_graph_record_locators",
+            return_value=projection,
+        ):
+            selector_path = write_active_selector(paths)
+        selector = load_json(selector_path)
+
+        self.assertLess(selector_path.stat().st_size, 98_304)
+        self.assertEqual(projection["sequence"], self.graph_sequence_locator())
+        self.assertLessEqual(
+            len(canonical_json_bytes(projection)),
+            GRAPH_RECORD_LOCATOR_BUDGET_BYTES,
+        )
+        self.assertEqual(selector["graph_records"], projection)
+        expected = (
+            (
+                "experiment_intents",
+                intent_history,
+                intent_items,
+                "current_count",
+            ),
+            ("control_graphs", plan_history, plan_items, "current_count"),
+            ("workspace_drafts", draft_items, draft_items, "total_count"),
+        )
+        for name, history, current, current_count_field in expected:
+            with self.subTest(index=name):
+                index = projection[name]
+                self.assertEqual(index["total_count"], len(history))
+                self.assertEqual(index[current_count_field], len(current))
+                self.assertEqual(index["inventory_sha256"], sha256_json(history))
+                self.assertGreater(index["selected_count"], 0)
+                self.assertLess(index["selected_count"], len(current))
+                self.assertTrue(index["truncated"])
+                self.assertEqual(
+                    index["items"],
+                    current[: index["selected_count"]],
+                )
+
+    def test_graph_locator_projection_rejects_impossible_metadata_budget(
+        self,
+    ) -> None:
+        (
+            intent_history,
+            intent_items,
+            plan_history,
+            plan_items,
+            draft_items,
+        ) = self.graph_locator_fixture(current_count=1, versions=1)
+
+        with self.assertRaisesRegex(
+            ValidationError,
+            "metadata alone exceeds its canonical byte budget",
+        ):
+            _bounded_graph_record_projection(
+                sequence_locator=self.graph_sequence_locator(),
+                intent_history=intent_history,
+                intent_items=intent_items,
+                plan_history=plan_history,
+                plan_items=plan_items,
+                draft_items=draft_items,
+                max_bytes=1,
+            )
 
     def test_overlong_claim_id_is_rejected_and_cannot_expand_context(self) -> None:
         paths = self.initialize_approved_with_claim()
@@ -294,9 +509,9 @@ class BoundedProjectionTests(WorkflowTestCase):
             item for item in packet["evidence"] if item["role"] == "other"
         )
         self.assertEqual(source["assessment"], "inconclusive")
-        self.assertEqual(source["object"]["record_sha256"], finalized["record_sha256"])
+        self.assertEqual(source["summary"]["record_sha256"], finalized["record_sha256"])
         self.assertEqual(
-            source["object"]["inference"],
+            source["summary"]["inference"],
             {
                 "observation_to_claim_present": True,
                 "auxiliary_assumption_count": 1,
@@ -304,8 +519,8 @@ class BoundedProjectionTests(WorkflowTestCase):
                 "falsification_condition_count": 1,
             },
         )
-        self.assertNotIn("result", source["object"])
-        self.assertNotIn("scope", source["object"])
+        self.assertNotIn("result", source["summary"])
+        self.assertNotIn("scope", source["summary"])
         run_source = packet["other_run_sources"][0]
         self.assertNotIn("execution", run_source)
         self.assertNotIn("inputs", run_source)

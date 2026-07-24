@@ -6,17 +6,32 @@ proof of correctness.
 
 ## Review each link independently
 
-Trace:
+Trace the cognitive graph:
 
 ```text
-Brief requirement
--> formal method or protocol
--> source symbol and test
--> sealed Run
--> optional finalized Observation
+EvidenceGap
+-> exact ExperimentIntent
+-> inline or finalized Observation
 -> finalized Evidence
 -> scoped Claim
 ```
+
+Trace the control graph separately:
+
+```text
+exact ExperimentIntent reference
+-> finalized ControlGraphSpec
+-> byte-identical active PLAN
+-> formal method or protocol
+-> source symbol and test
+-> sealed Run / Artifact
+```
+
+Finally, verify the provenance bridge from each Run/Artifact to the Observation
+used by Evidence. A successful control path is an execution fact, not support
+for a Claim. The current runtime does not yet deterministically bind every Run
+to a ControlGraph node, so treat node-level execution coverage as unavailable
+rather than inferring it from names or ordering.
 
 At every link, check both identity and meaning. Matching IDs and hashes show
 which object was used; they do not prove that a mathematical derivation,

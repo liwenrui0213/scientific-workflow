@@ -1,6 +1,6 @@
 ---
 name: scientific-review
-description: Independently review and try to falsify a Claim-to-Evidence scientific Study. Use after `studyctl review-packet` when checking protected conditions, mathematical or algorithmic implementation mapping, experiment fairness, Cohort compatibility, contradictory Evidence, reproducibility, formalization debt, or overclaiming before a human Verdict.
+description: Independently review and try to falsify a Claim-to-Evidence scientific Study before a human Verdict. Use after `python -m tools.studyctl review-packet STUDY_ID`.
 ---
 
 # Scientific Review
@@ -11,34 +11,29 @@ Start a fresh top-level session with the project `scientific-reviewer` agent or
 equivalent read-only permissions. Open `generated/REVIEW_PACKET.json` as an
 index, then inspect its referenced profile, actual Git state, CHANGESET,
 validation proof, Brief and approval, formal artifacts, source and tests, sealed
-Run records and logs, Evidence versions, Claims, Checkpoint, and diff. For an
-older Run, use its immutable governance and formal snapshots rather than later
-live files.
+ExperimentIntents, ControlGraphSpecs, active PLAN, Run records and Artifacts,
+Observations, Evidence versions, Claims, Checkpoint, graph-record sequence, and
+diff. Use each Run's immutable snapshots, not later live files.
 
 Read [the adversarial review rubric](references/adversarial-review-rubric.md)
-before assigning severity, judging Claim scope, selecting independent checks,
-or deciding which questions require human review.
+before assigning severity, Claim scope, checks, or human questions.
 
 ## Workflow
 
-1. Trace each material Brief requirement and Claim through method, source symbol,
-   validation, Run, Evidence, and scope. Try to falsify both implementation
-   fidelity and scientific interpretation.
+1. Trace the cognitive graph from EvidenceGap through exact ExperimentIntent,
+   Observation, Evidence, and scoped Claim. Separately trace the control graph
+   through exact Intent reference, finalized ControlGraphSpec, byte-identical
+   active PLAN, source, validation, Run, and Artifact. Verify the
+   Run/Artifact-to-Observation provenance bridge.
 2. Recompute change-scope and Run eligibility from authoritative state. Re-hash
-   inputs, outputs, logs, governance snapshots, and formal snapshots. Check the
-   base anchor, native validation, protected conditions, evaluator and split,
-   mathematical mapping, baselines, Cohorts, uncertainty, contradictions, and
-   formalization debt. For a promoted Observation, verify every source Run,
-   inclusion/exclusion disposition, exact promotion Registry binding and
-   trigger applicability, analysis fingerprint, Cohort boundary, distribution,
-   uncertainty, anomaly, and representative failure before
-   reviewing any Claim interpretation. For every current Evidence version, challenge its
-   observation-to-Claim bridge, auxiliary assumptions, competing explanations,
-   and stated falsification conditions against the actual Runs and addressed
-   Claim. For a high-strength Claim, inspect the frozen
-   Confirmation Record and the complete confirmation-attempt inventory: verify
-   temporal ordering, Claim/candidate/protocol/evaluator hashes, held-out
-   freshness, planned-slot coverage, failed attempts, and exclusions.
+   dependencies and snapshots. Check validation, protected conditions,
+   evaluator/split, mathematical mapping, baselines, Cohorts, uncertainty,
+   contradictions, and formalization. For promoted Observations, verify source
+   Runs, dispositions, Registry trigger, fingerprint, Cohorts, uncertainty,
+   anomalies, and failures. Challenge each Evidence inference, assumptions,
+   alternatives, and falsification conditions. For high-strength Claims, audit
+   the frozen Confirmation and every attempt, including ordering, hashes,
+   held-out freshness, slots, failures, and exclusions.
 3. Perform the smallest independent checks needed to test high-risk assertions;
    distinguish a verified defect from a risk or unanswered question.
 4. Produce structured JSON matching `review.schema.json`. Give every material
@@ -48,39 +43,33 @@ or deciding which questions require human review.
 
 - Never trust generated summaries or an implementer's explanation without
   checking their sources. Self-reported paths are context, not clean-scope proof.
+- Reject a `formal/PLAN.json` that is not the exact activated finalized
+  ControlGraphSpec, a Plan whose Intent reference is stale or inexact, or any
+  direct inference from Plan/Run completion to Claim support. The current
+  runtime lacks node-to-Run binding; do not invent node coverage.
 - Reject missing declared outputs, altered sealed records, undeclared mutable
   Study dependencies, incompatible unproved Cohorts, and legacy V1 Runs used as
   Evidence.
 - Do not edit scientific code, Study state, Evidence, Claims, Checkpoints,
   generated review files, or the human Verdict.
-- If the current top-level session participated in implementation, Run
-  interpretation, Evidence authoring, or Claim updates, do not perform the final
-  review in that session or disguise self-review as a child-agent review.
-  Return the prepared packet path and an explicit fresh-session handoff, then
-  stop.
+- If this top-level session participated in implementation or interpretation,
+  return a fresh-session handoff instead of reviewing its own work.
 - Do not equate implementation acceptance, numerical agreement, or absence of a
   discovered counterexample with scientific acceptance.
-- Treat legacy or unbound Runs as exploratory. Reject post-hoc relabeling,
-  cherry-picked confirmation slots, concealed attempts, or mixed Evidence that
-  does not distinguish its exploratory and confirmatory components.
+- Treat legacy/unbound Runs as exploratory. Reject relabeling, cherry-picked
+  slots, concealed attempts, or unlabeled mixed Evidence.
 - Reject a mutable/latest Observation reference, a stale Observation hash,
   omitted source Run, hidden exclusion or minority observation, duplicate
   analysis under a new ID, or any `supports`/`contradicts` semantics assigned
   directly to an Observation.
-- Reject an unregistered promotion reason, stale Registry binding, reinterpreted
-  trigger, semantic trigger presented as mechanically verified, or extension
-  lacking an endorsed independent review and explicit human adoption. A
-  Reviewer may recommend a new trigger but cannot make it effective.
+- Reject unregistered promotion, stale/reinterpreted Registry bindings, or an
+  extension without independent review and explicit human adoption.
 
 ## Output and handoff
 
 Return the structured review JSON outside the repository. Hand it to a separate
-trusted write-enabled caller, which may run `studyctl review-render`; the rendered
-Markdown remains non-authoritative. Surface critical human questions explicitly
-and leave the final implementation and scientific decisions to the human. The
-read-only reviewer must not record the Verdict. A separate write-enabled Agent
-may prepare and invoke the decision-only Agent path only after the human explicitly
-selects the decisions and scope or adopts an immediately preceding exact summary;
-`studyctl` derives mechanical scope and hashes. If
-material findings require correction, hand them back to `scientific-study`; the
-reviewer does not implement its own recommendations.
+trusted write-enabled caller, which may run
+`python -m tools.studyctl review-render <STUDY_ID> --file <PATH>`; the rendered Markdown remains
+non-authoritative. Surface human questions; never record the Verdict. Only
+after explicit human selection may a separate write-enabled Agent record the
+decision. Return corrections to `scientific-study`; do not implement them here.

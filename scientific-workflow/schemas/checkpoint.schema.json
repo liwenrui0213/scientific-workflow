@@ -8,13 +8,12 @@
     "active_formal_artifacts", "claims_file_sha256", "claims_snapshot",
     "inactive_claim_refs", "active_context_watermarks", "frontier",
     "decisive_evidence", "contradictory_evidence", "decisive_observations",
-    "open_questions", "next_actions",
     "budget_state", "formalization_debt", "representative_failures", "archived_work_files",
     "previous_checkpoint", "compaction_plan_sha256",
     "checkpoint_sha256"
   ],
   "properties": {
-    "schema_version": {"const": 3},
+    "schema_version": {"const": 4},
     "study_id": {"type": "string", "pattern": "^SC-[0-9]{4,}$", "maxLength": 64},
     "checkpoint_id": {"type": "string", "pattern": "^CHECKPOINT-[0-9]{6}$"},
     "created_at": {"type": "string", "minLength": 1, "maxLength": 64},
@@ -42,8 +41,6 @@
     "decisive_evidence": {"type": "array", "maxItems": 2048, "uniqueItems": true, "items": {"$ref": "#/$defs/evidence_ref"}},
     "contradictory_evidence": {"type": "array", "maxItems": 2048, "uniqueItems": true, "items": {"$ref": "#/$defs/evidence_ref"}},
     "decisive_observations": {"type": "array", "maxItems": 2048, "uniqueItems": true, "items": {"$ref": "#/$defs/observation_ref"}},
-    "open_questions": {"type": "array", "maxItems": 64, "items": {"type": "string", "maxLength": 1024}},
-    "next_actions": {"type": "array", "maxItems": 64, "items": {"type": "string", "maxLength": 1024}},
     "budget_state": {"type": "object"},
     "formalization_debt": {"type": "array", "maxItems": 64, "items": {"type": "object"}},
     "representative_failures": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/failure_ref"}},

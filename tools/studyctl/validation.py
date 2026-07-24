@@ -37,8 +37,10 @@ from .hashing import (
 from .models import (
     CHECKPOINT_SCHEMA_VERSION,
     CLAIMS_SCHEMA_VERSION,
+    CONTROL_GRAPH_SCHEMA_VERSION,
     CLAIM_STATES,
     EVIDENCE_SCHEMA_VERSION,
+    EXPERIMENT_INTENT_SCHEMA_VERSION,
     OBSERVATION_SCHEMA_VERSION,
     ID_PATTERNS,
     StudyPaths,
@@ -71,6 +73,8 @@ SCHEMA_FILES = {
     "confirmation": "confirmation.schema.json",
     "claims": "claims.schema.json",
     "checkpoint": "checkpoint.schema.json",
+    "experiment_intent": "experiment-intent.schema.json",
+    "control_graph": "control-graph.schema.json",
     "review": "review.schema.json",
     "verdict": "verdict.schema.json",
     "brief_approval": "brief-approval.schema.json",
@@ -85,6 +89,8 @@ CURRENT_ARTIFACT_SCHEMA_VERSIONS = {
     "evidence": EVIDENCE_SCHEMA_VERSION,
     "claims": CLAIMS_SCHEMA_VERSION,
     "checkpoint": CHECKPOINT_SCHEMA_VERSION,
+    "experiment_intent": EXPERIMENT_INTENT_SCHEMA_VERSION,
+    "control_graph": CONTROL_GRAPH_SCHEMA_VERSION,
 }
 
 _RUN_V2_TOP_LEVEL_KEYS = {
@@ -467,6 +473,8 @@ def object_schema_issues(
                 "observation": "Observation",
                 "evidence": "Evidence",
                 "checkpoint": "Checkpoint",
+                "experiment_intent": "Experiment Intent",
+                "control_graph": "Control Graph",
             }[name]
             return [
                 ValidationIssue(
@@ -3690,6 +3698,7 @@ def validate_study(paths: StudyPaths) -> list[ValidationIssue]:
     # The Confirmation workflow calls validation primitives, so use a local
     # import while still replaying its immutable semantic checks here.
     from .confirmation import confirmation_record_issues, confirmation_run_issues
+    from .graph_records import graph_record_issues, graph_record_sequence_issues
     from .observation_triggers import observation_trigger_registry_issues
     from .workspace import changeset_issues, repository_profile_issues
 
@@ -3703,6 +3712,8 @@ def validate_study(paths: StudyPaths) -> list[ValidationIssue]:
     issues.extend(changeset_issues(paths))
     issues.extend(brief_content_issues(paths))
     issues.extend(brief_approval_issues(paths))
+    issues.extend(graph_record_sequence_issues(paths))
+    issues.extend(graph_record_issues(paths))
     issues.extend(confirmation_record_issues(paths))
     run_issues, runs = _run_issues(paths)
     issues.extend(run_issues)
@@ -3730,9 +3741,13 @@ def assert_valid_study(paths: StudyPaths) -> None:
 
 
 def authoritative_string_references(paths: StudyPaths) -> set[str]:
+    from .graph_records import control_graph_paths, experiment_intent_paths
+
     references: set[str] = set()
     candidates = [
         paths.claims,
+        *experiment_intent_paths(paths),
+        *control_graph_paths(paths),
         *observation_paths(paths),
         *evidence_paths(paths),
         *checkpoint_paths(paths),

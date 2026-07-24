@@ -104,12 +104,18 @@ class HookPolicyTests(WorkflowTestCase):
     def test_checkpoint_and_sequence_authority_are_blocked_from_direct_edits(self) -> None:
         paths = self.initialize()
         expected = (
-            "Checkpoint, sequence, and archived Claim records are sealed "
-            "authority and must not be changed or removed directly."
+            "Checkpoint, sequence, finalized graph, active PLAN, and archived "
+            "Claim records are sealed authority and must not be changed or "
+            "removed directly."
         )
         for relative in (
+            f"studies/{paths.study_id}/OBSERVATIONS.sequence.json",
             f"studies/{paths.study_id}/CHECKPOINTS.sequence.json",
             f"studies/{paths.study_id}/EVIDENCE.sequence.json",
+            f"studies/{paths.study_id}/GRAPH_RECORDS.sequence.json",
+            f"studies/{paths.study_id}/intents/INTENT-0001.v0001.json",
+            f"studies/{paths.study_id}/control-plans/CG-0001.v0001.json",
+            f"studies/{paths.study_id}/formal/PLAN.json",
             f"studies/{paths.study_id}/checkpoints/CHECKPOINT-000001.json",
             f"studies/{paths.study_id}/checkpoints/claim-records/CLAIM-0001.{'0' * 64}.json",
         ):

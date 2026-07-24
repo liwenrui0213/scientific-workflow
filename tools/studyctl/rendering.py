@@ -120,19 +120,15 @@ def _load_claims(paths: StudyPaths) -> dict[str, Any]:
                 "summary": None,
                 "claim_ids": [],
                 "open_questions": [],
-                "next_actions": [],
                 "human_decisions_required": [],
             },
-            "formalization_debt": [],
         }
     if not isinstance(value, dict):
-        return {"claims": [], "frontier": {}, "formalization_debt": []}
+        return {"claims": [], "frontier": {}}
     if not isinstance(value.get("claims"), list):
         value["claims"] = []
     if not isinstance(value.get("frontier"), dict):
         value["frontier"] = {}
-    if not isinstance(value.get("formalization_debt"), list):
-        value["formalization_debt"] = []
     return value
 
 
@@ -371,6 +367,7 @@ def render_status(paths: StudyPaths) -> Path:
         pressure_error = str(exc)
     selector_error: str | None = None
     confirmation_projection: dict[str, Any] | None = None
+    graph_record_projection: dict[str, Any] | None = None
     try:
         if pressure_error is None:
             selector_path, compaction_due_path = refresh_active_projection(
@@ -392,6 +389,16 @@ def render_status(paths: StudyPaths) -> Path:
                 "ACTIVE_CONTEXT.json lacks the bounded Confirmation index"
             )
         confirmation_projection = raw_confirmations
+        raw_graph_records = (
+            selector_data.get("graph_records")
+            if isinstance(selector_data, dict)
+            else None
+        )
+        if not isinstance(raw_graph_records, dict):
+            raise ValidationError(
+                "ACTIVE_CONTEXT.json lacks the bounded graph-record index"
+            )
+        graph_record_projection = raw_graph_records
     except (ValidationError, WorkflowError, OSError, ValueError) as exc:
         selector_path = paths.generated / "ACTIVE_CONTEXT.json"
         compaction_due_path = paths.generated / "COMPACTION_DUE.json"
@@ -526,6 +533,52 @@ def render_status(paths: StudyPaths) -> Path:
     if frontier.get("claim_ids"):
         lines.append("")
         lines.append("Active Claim IDs: " + ", ".join(f"`{item}`" for item in frontier["claim_ids"]))
+
+    lines.extend(["", "## Cognitive and Control Contracts", ""])
+    if graph_record_projection is None:
+        lines.append(
+            "ExperimentIntent and ControlGraphSpec locators are unavailable "
+            "because active context is invalid."
+        )
+    else:
+        graph_sequence = graph_record_projection["sequence"]
+        intents = graph_record_projection["experiment_intents"]
+        plans = graph_record_projection["control_graphs"]
+        drafts = graph_record_projection["workspace_drafts"]
+        lines.extend(
+            [
+                "- Graph-record committed high-water mark: "
+                f"{graph_sequence['high_water_mark']}",
+                "- Graph-record full byte-inventory SHA-256: "
+                f"`{graph_sequence['inventory_sha256']}`",
+                f"- Current finalized ExperimentIntents: {intents['current_count']} "
+                f"({intents['total_count']} immutable version(s))",
+                f"- Current finalized ControlGraphSpecs: {plans['current_count']} "
+                f"({plans['total_count']} immutable version(s))",
+                f"- Mutable Intent/Plan Workspace drafts: {drafts['total_count']}",
+                f"- Intent inventory SHA-256: `{intents['inventory_sha256']}`",
+                f"- Control-graph inventory SHA-256: `{plans['inventory_sha256']}`",
+                "- Workspace drafts are mutable exploration and are not counted "
+                "as finalized cognitive or control authority.",
+            ]
+        )
+        for item in intents["items"]:
+            lines.append(
+                f"- Intent `{item['intent_id']}` v{item['version']}: "
+                f"`{item['path']}` (`{item['sha256']}`)"
+            )
+        for item in plans["items"]:
+            intent_ref = item["realizes_intent"]
+            lines.append(
+                f"- Plan `{item['control_graph_id']}` v{item['version']} realizes "
+                f"`{intent_ref['intent_id']}` v{intent_ref['version']}: "
+                f"`{item['path']}`"
+            )
+        if intents["truncated"] or plans["truncated"] or drafts["truncated"]:
+            lines.append(
+                "- Graph-record locator list is truncated; use the inventory "
+                "hashes and authoritative directories before inferring absence."
+            )
 
     epistemic_counts: dict[str, int] = {"exploratory": 0, "confirmatory": 0}
     for _, manifest in runs.values():
@@ -800,8 +853,6 @@ def render_status(paths: StudyPaths) -> Path:
         )
     _append_items(lines, attention)
 
-    lines.extend(["", "## Next Actions", ""])
-    _append_items(lines, frontier.get("next_actions", []))
     output = paths.generated / "STATUS.md"
     atomic_write_bytes(output, ("\n".join(lines) + "\n").encode("utf-8"))
     return output

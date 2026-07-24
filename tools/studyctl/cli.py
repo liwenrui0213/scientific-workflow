@@ -8,6 +8,10 @@ from typing import Any, Sequence
 
 from .checkpoint_sequence import empty_checkpoint_sequence, write_checkpoint_sequence
 from .evidence_sequence import empty_evidence_sequence, write_evidence_sequence
+from .graph_record_sequence import (
+    empty_graph_record_sequence,
+    write_graph_record_sequence,
+)
 from .execution_backends import SUPPORTED_EXECUTION_BACKENDS
 from .observation_sequence import (
     empty_observation_sequence,
@@ -43,6 +47,8 @@ def initialize_study(root: Path, study_id: str, title: str) -> Path:
     directories = (
         paths.formal,
         paths.confirmations,
+        paths.control_graphs,
+        paths.experiment_intents,
         paths.active_work,
         paths.archived_work,
         paths.runs,
@@ -62,6 +68,9 @@ def initialize_study(root: Path, study_id: str, title: str) -> Path:
     write_checkpoint_sequence(
         paths, empty_checkpoint_sequence(paths), overwrite=False
     )
+    write_graph_record_sequence(
+        paths, empty_graph_record_sequence(paths), overwrite=False
+    )
     template_root = root / "scientific-workflow" / "templates"
     brief_template = (template_root / "BRIEF.md").read_text(encoding="utf-8")
     brief_text = brief_template.replace("{{STUDY_ID}}", study_id).replace("{{TITLE}}", title.strip())
@@ -73,12 +82,9 @@ def initialize_study(root: Path, study_id: str, title: str) -> Path:
     except json.JSONDecodeError as exc:
         raise WorkflowError(f"invalid repository CLAIMS template: {exc}") from exc
     atomic_write_json(paths.claims, claims, overwrite=False)
-    try:
-        from .rendering import render_status
+    from .rendering import render_status
 
-        render_status(paths)
-    except ImportError:
-        pass
+    render_status(paths)
     paths.assert_safe_layout(must_exist=True)
     return paths.study
 
@@ -143,23 +149,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ledger_migrate.add_argument("study_id")
 
-    evidence_sequence_migrate = subparsers.add_parser(
-        "migrate-evidence-sequence",
+    graph_sequence_recover = subparsers.add_parser(
+        "recover-graph-record-sequence",
         help=(
-            "initialize the counter for intact legacy Evidence; records that "
-            "pre-migration deletion cannot be proven absent"
+            "advance across exactly one valid graph record left unindexed by "
+            "an interrupted finalization"
         ),
     )
-    evidence_sequence_migrate.add_argument("study_id")
-
-    checkpoint_sequence_migrate = subparsers.add_parser(
-        "migrate-checkpoint-sequence",
-        help=(
-            "bind an intact contiguous legacy Checkpoint chain; records that "
-            "pre-migration deletion cannot be proven absent"
-        ),
-    )
-    checkpoint_sequence_migrate.add_argument("study_id")
+    graph_sequence_recover.add_argument("study_id")
 
     validate = subparsers.add_parser("validate", help="validate authoritative records and references")
     validate.add_argument("study_id")
@@ -230,6 +227,57 @@ def build_parser() -> argparse.ArgumentParser:
     )
     confirmation_finalize.add_argument("study_id")
     confirmation_finalize.add_argument("--file", required=True)
+
+    intent_new = subparsers.add_parser(
+        "intent-new",
+        help="create a versioned ExperimentIntent draft (why evidence is needed)",
+    )
+    intent_new.add_argument("study_id")
+    intent_new.add_argument("--id", dest="intent_id", required=True)
+    intent_new.add_argument("--evidence-gap-id", required=True)
+    intent_new.add_argument("--evidence-gap", required=True)
+    intent_new.add_argument("--objective", required=True)
+    intent_new.add_argument(
+        "--requested-observation", action="append", required=True
+    )
+    intent_new.add_argument("--evidence-requirement", action="append", default=[])
+    intent_new.add_argument("--claim")
+
+    intent_finalize = subparsers.add_parser(
+        "intent-finalize",
+        help="freeze an ExperimentIntent after its evidence semantics are complete",
+    )
+    intent_finalize.add_argument("study_id")
+    intent_finalize.add_argument("--file", required=True)
+
+    plan_new = subparsers.add_parser(
+        "plan-new",
+        help="create a ControlGraphSpec draft (how an exact Intent will execute)",
+    )
+    plan_new.add_argument("study_id")
+    plan_new.add_argument("--id", dest="control_graph_id", required=True)
+    plan_new.add_argument("--intent", dest="intent_id", required=True)
+    plan_new.add_argument("--intent-version", type=int, required=True)
+    plan_new.add_argument("--executor", default="studyctl")
+    plan_new.add_argument("--cpu-hours", type=float, default=0.0)
+    plan_new.add_argument("--gpu-hours", type=float, default=0.0)
+    plan_new.add_argument("--storage-gb", type=float, default=0.0)
+    plan_new.add_argument("--parallel-workers", type=int, default=1)
+
+    plan_finalize = subparsers.add_parser(
+        "plan-finalize",
+        help="freeze a ControlGraphSpec bound to an exact ExperimentIntent",
+    )
+    plan_finalize.add_argument("study_id")
+    plan_finalize.add_argument("--file", required=True)
+
+    plan_activate = subparsers.add_parser(
+        "plan-activate",
+        help="materialize a current ControlGraphSpec as formal/PLAN.json",
+    )
+    plan_activate.add_argument("study_id")
+    plan_activate.add_argument("--id", dest="control_graph_id", required=True)
+    plan_activate.add_argument("--version", type=int, required=True)
 
     run = subparsers.add_parser("run", help="execute and seal a reproducible Run")
     run.add_argument("study_id")
@@ -402,15 +450,10 @@ def dispatch(args: argparse.Namespace) -> int:
 
         print(migrate_legacy_run_ledger(paths))
         return 0
-    if name == "migrate-evidence-sequence":
-        from .evidence import migrate_evidence_sequence
+    if name == "recover-graph-record-sequence":
+        from .graph_records import recover_graph_record_sequence
 
-        print(migrate_evidence_sequence(paths))
-        return 0
-    if name == "migrate-checkpoint-sequence":
-        from .compaction import migrate_checkpoint_sequence
-
-        print(migrate_checkpoint_sequence(paths))
+        print(recover_graph_record_sequence(paths))
         return 0
     if name == "status":
         from .rendering import render_status
@@ -549,6 +592,60 @@ def dispatch(args: argparse.Namespace) -> int:
         from .confirmation import finalize_confirmation
 
         print(finalize_confirmation(paths, Path(args.file)))
+        return 0
+    if name == "intent-new":
+        from .graph_records import create_experiment_intent_draft
+
+        print(
+            create_experiment_intent_draft(
+                paths,
+                args.intent_id,
+                evidence_gap_id=args.evidence_gap_id,
+                evidence_gap=args.evidence_gap,
+                objective=args.objective,
+                requested_observations=args.requested_observation,
+                evidence_requirements=args.evidence_requirement,
+                claim_id=args.claim,
+            )
+        )
+        return 0
+    if name == "intent-finalize":
+        from .graph_records import finalize_experiment_intent
+
+        print(finalize_experiment_intent(paths, Path(args.file)))
+        return 0
+    if name == "plan-new":
+        from .graph_records import create_control_graph_draft
+
+        print(
+            create_control_graph_draft(
+                paths,
+                args.control_graph_id,
+                intent_id=args.intent_id,
+                intent_version=args.intent_version,
+                executor=args.executor,
+                cpu_hours=args.cpu_hours,
+                gpu_hours=args.gpu_hours,
+                storage_gb=args.storage_gb,
+                parallel_workers=args.parallel_workers,
+            )
+        )
+        return 0
+    if name == "plan-finalize":
+        from .graph_records import finalize_control_graph
+
+        print(finalize_control_graph(paths, Path(args.file)))
+        return 0
+    if name == "plan-activate":
+        from .graph_records import activate_control_graph
+
+        print(
+            activate_control_graph(
+                paths,
+                args.control_graph_id,
+                args.version,
+            )
+        )
         return 0
     if name == "observation-new":
         from .observation import create_observation_draft

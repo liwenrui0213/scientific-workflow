@@ -6,11 +6,13 @@ from typing import Any
 
 from tests.helpers import WorkflowTestCase
 from tools.studyctl.active_context import build_active_selector
-from tools.studyctl.checkpoint_sequence import write_checkpoint_sequence
+from tools.studyctl.checkpoint_sequence import (
+    load_checkpoint_sequence,
+    write_checkpoint_sequence,
+)
 from tools.studyctl.compaction import (
     current_evidence_inventory_binding,
     finalize_compaction,
-    migrate_checkpoint_sequence,
     prepare_compaction,
 )
 from tools.studyctl.gc import garbage_collection_report
@@ -31,7 +33,7 @@ class CheckpointClaimIntegrityTests(WorkflowTestCase):
         state = load_json(compaction_input)
         claims = load_json(paths.claims)
         plan = {
-            "schema_version": 1,
+            "schema_version": 2,
             "study_id": paths.study_id,
             "compaction_input_sha256": sha256_file(compaction_input),
             "claims_sha256": sha256_file(paths.claims),
@@ -40,8 +42,6 @@ class CheckpointClaimIntegrityTests(WorkflowTestCase):
             "decisive_evidence": [],
             "contradictory_evidence": [],
             "frontier": claims["frontier"],
-            "open_questions": list(claims["frontier"]["open_questions"]),
-            "next_actions": list(claims["frontier"]["next_actions"]),
             "representative_failures": [],
             "budget_state": state["budget_totals"],
         }
@@ -108,6 +108,20 @@ class CheckpointClaimIntegrityTests(WorkflowTestCase):
         ]
         write_checkpoint_sequence(paths, sequence)
 
+    def test_checkpoint_sequence_uses_clean_break_schema_v2(self) -> None:
+        paths = self.initialize()
+        sequence = load_checkpoint_sequence(paths)
+        assert sequence is not None
+        self.assertEqual(sequence["schema_version"], 2)
+
+        sequence["schema_version"] = 1
+        sequence["sequence_sha256"] = record_digest(
+            sequence, "sequence_sha256"
+        )
+        atomic_write_json(paths.checkpoint_sequence, sequence, mode=0o444)
+        with self.assertRaisesRegex(ValidationError, "schema_version is unsupported"):
+            load_checkpoint_sequence(paths)
+
     def test_deleted_checkpoint_tail_is_detected_and_id_is_not_reused(self) -> None:
         paths = self.initialize_approved_with_claim()
         first_path = finalize_compaction(
@@ -146,27 +160,22 @@ class CheckpointClaimIntegrityTests(WorkflowTestCase):
         self.assertEqual(second_path.name, "CHECKPOINT-000002.json")
         self.assertTrue(first_path.is_file())
 
-    def test_explicit_legacy_checkpoint_sequence_migration_binds_visible_chain(self) -> None:
+    def test_missing_checkpoint_sequence_fails_closed_without_reconstruction(self) -> None:
         paths = self.initialize_approved_with_claim()
-        checkpoint_path = finalize_compaction(
+        finalize_compaction(
             paths,
-            self.write_compaction_plan(paths, name="legacy-checkpoint.json"),
+            self.write_compaction_plan(paths, name="checkpoint-before-loss.json"),
         )
         paths.checkpoint_sequence.unlink()
 
-        migrated_path = migrate_checkpoint_sequence(paths)
-        migrated = load_json(migrated_path)
-        checkpoint = load_json(checkpoint_path)
-        self.assertEqual(migrated["origin"]["kind"], "legacy_migration")
-        self.assertEqual(migrated["high_water_mark"], 1)
-        self.assertEqual(
-            migrated["latest_checkpoint"],
-            {
-                "checkpoint_id": "CHECKPOINT-000001",
-                "sha256": checkpoint["checkpoint_sha256"],
-            },
+        with self.assertRaisesRegex(ValidationError, "Checkpoint sequence is missing"):
+            prepare_compaction(paths)
+        self.assertTrue(
+            any(
+                "Checkpoint sequence is missing" in message
+                for message in self.error_messages(paths)
+            )
         )
-        self.assertEqual(self.error_messages(paths), [])
 
     def test_terminal_claim_full_content_rewrite_is_rejected_after_seal(self) -> None:
         paths = self.initialize_approved_with_claim()

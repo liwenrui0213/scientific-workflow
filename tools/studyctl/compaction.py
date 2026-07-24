@@ -20,8 +20,6 @@ from .budget import (
 )
 from .checkpoint_sequence import (
     advance_checkpoint_sequence,
-    load_checkpoint_sequence,
-    migrate_legacy_checkpoint_sequence,
     require_checkpoint_sequence,
 )
 from .evidence_sequence import require_evidence_sequence
@@ -285,10 +283,22 @@ def _validate_prepared_bindings(
     if source_hashes.get("claims") != sha256_file(paths.claims):
         raise ValidationError("CLAIMS.json changed after compact-prepare")
     prepared_confirmations = compaction_state.get("confirmations")
-    current_confirmations = build_active_selector(paths)["confirmations"]
+    current_selector = build_active_selector(paths)
+    current_confirmations = current_selector["confirmations"]
     if prepared_confirmations != current_confirmations:
         raise ValidationError(
             "Confirmation drafts, records, or consumed slots changed after "
+            "compact-prepare"
+        )
+    prepared_graph_records = compaction_state.get("graph_records")
+    current_graph_records = current_selector["graph_records"]
+    if not isinstance(prepared_graph_records, dict):
+        raise ValidationError(
+            "COMPACTION_INPUT.json lacks graph-record bindings"
+        )
+    if prepared_graph_records != current_graph_records:
+        raise ValidationError(
+            "ExperimentIntent or ControlGraphSpec records changed after "
             "compact-prepare"
         )
     if source_hashes.get("evidence") != current_evidence_inventory_binding(paths):
@@ -723,6 +733,7 @@ def prepare_compaction(paths: StudyPaths) -> Path:
         },
         "current_frontier": active_selector["frontier"],
         "confirmations": active_selector["confirmations"],
+        "graph_records": active_selector["graph_records"],
         "failed_direction_records": _bounded_index(failed_directions),
         "budget_totals": budget_state,
         "budget_authority": budget_authority,
@@ -744,35 +755,6 @@ def prepare_compaction(paths: StudyPaths) -> Path:
 def _next_checkpoint_id(paths: StudyPaths) -> str:
     sequence = require_checkpoint_sequence(paths)
     return f"CHECKPOINT-{int(sequence['high_water_mark']) + 1:06d}"
-
-
-def migrate_checkpoint_sequence(paths: StudyPaths) -> Path:
-    """Bind one intact pre-sequence Checkpoint chain explicitly."""
-
-    if load_checkpoint_sequence(paths) is not None:
-        raise ValidationError("Checkpoint sequence already exists")
-    from .models import errors_only
-    from .validation import validate_study
-
-    sequence_path = str(paths.checkpoint_sequence)
-    unrelated = [
-        issue
-        for issue in errors_only(validate_study(paths))
-        if issue.path != sequence_path
-    ]
-    if unrelated:
-        raise ValidationError(
-            "legacy Checkpoint history is not valid enough to migrate:\n"
-            + "\n".join(issue.render() for issue in unrelated)
-        )
-    checkpoints: list[dict[str, Any]] = []
-    for path in checkpoint_paths(paths):
-        value = load_json(path)
-        if not isinstance(value, dict):
-            raise ValidationError(f"Checkpoint must be an object: {path}")
-        checkpoints.append(value)
-    migrate_legacy_checkpoint_sequence(paths, checkpoints)
-    return paths.checkpoint_sequence
 
 
 def _evidence_ref_exists(
@@ -882,10 +864,6 @@ def _finalize_compaction_locked(paths: StudyPaths, plan_path: Path) -> Path:
     if plan.get("frontier") != claims.get("frontier"):
         raise ValidationError("compaction plan Frontier must equal the authoritative CLAIMS.json Frontier")
     frontier = claims.get("frontier", {})
-    if plan.get("open_questions") != frontier.get("open_questions", []):
-        raise ValidationError("compaction plan open_questions must equal the authoritative Frontier")
-    if plan.get("next_actions") != frontier.get("next_actions", []):
-        raise ValidationError("compaction plan next_actions must equal the authoritative Frontier")
     evidence = evidence_index(paths)
     runs = run_index(paths)
     expected_budget, expected_budget_authority = _compaction_budget_state(
@@ -1045,8 +1023,6 @@ def _finalize_compaction_locked(paths: StudyPaths, plan_path: Path) -> Path:
         "decisive_evidence": plan.get("decisive_evidence", []),
         "contradictory_evidence": plan.get("contradictory_evidence", []),
         "decisive_observations": decisive_observations,
-        "open_questions": frontier.get("open_questions", []),
-        "next_actions": frontier.get("next_actions", []),
         "budget_state": plan.get("budget_state", {}),
         "formalization_debt": collect_formalization_debt(paths),
         "representative_failures": representative_failure_records,

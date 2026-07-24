@@ -4,25 +4,42 @@ This repository uses Python 3.11 or newer and a local, deterministic workflow fo
 
 For a persistent investigation, the normal human interface is a scientific idea stated in ordinary language plus an explicit request to start or continue research. Codex turns that request into the internal Study structure; the scientist does not need to choose new IDs, edit templates, or manually route workflow stages. One-off scientific discussion remains ordinary conversation and creates no Study.
 
-## The two chains
+## Authoritative lanes and their bridge
 
-The authority chain is:
-
-```text
-Human Brief -> optional Formal Artifacts -> immutable Run
-```
-
-The scientific interpretation chain is:
+The Research Workspace is outside both authoritative graphs:
 
 ```text
-Work -> Run -> optional Observation Record -> Claim-specific Evidence
-     -> Claim synthesis -> human Verdict
+Research Workspace (mutable, non-authoritative)
+idea / conjecture / disposable code / failed exploration / provisional draft
 ```
 
-`work/active/` is a mutable scratch space. A Run records what actually executed
-under fixed code, inputs, configuration, environment and Cohort fields. Simple
-observations remain inline in Evidence. An optional Observation Record is
-created only when analysis needs reuse, aggregation, independent review, or
+The cognitive graph records why evidence is needed and what is learned:
+
+```text
+EvidenceGap -> ExperimentIntent -> Observation -> Evidence -> Claim
+```
+
+The control graph records how a finalized Intent is executed:
+
+```text
+exact ExperimentIntent reference
+-> ControlGraphSpec
+-> active formal/PLAN.json
+-> Run / Artifact
+```
+
+The cross-graph bridge is explicit:
+
+```text
+Run / Artifact -> provenance-bound interpretation -> Observation
+```
+
+The approved Human Brief governs both graphs, but neither Workspace material nor
+control completion is scientific support. `work/active/` is mutable scratch. A
+Run records what actually executed under fixed code, inputs, configuration,
+environment, and Cohort fields; it belongs to the execution/provenance layer.
+Simple observations remain inline in Evidence. An optional Observation Record
+is created only when analysis needs reuse, aggregation, independent review, or
 long-lived auditability. It records what was computed without assigning
 `supports` or `contradicts` semantics.
 
@@ -40,16 +57,87 @@ same exact Observation hash while reaching different assessments. A Claim may
 reference only finalized, hash-pinned Evidence. A Verdict separately judges
 implementation and scientific Claims.
 
-Runs also have an epistemic role. Every ordinary and legacy Run is
-`exploratory`: it may discover a hypothesis, narrow a candidate, or support an
-`under_test` or carefully scoped `partially_supported` Claim. Exploration does
-not require a Confirmation Record or other preregistration; important
-calculations still run through `studyctl run`. Only when a result is being promoted to the
-high-strength `numerically_supported` state does the workflow require a small
-pre-confirmatory-Run Confirmation Record followed by new `confirmatory` Runs. The record
-freezes the exact Claim statement and scope, selected candidate, protocol,
-evaluator, held-out conditions, analysis rule, and planned Run slots. This is a
-deterministic time-and-hash boundary, not a new human approval gate.
+### Cognitive graph, control graph, and Research Workspace
+
+The mutable Research Workspace is deliberately outside both authoritative
+graphs. Free-form hypotheses, abandoned explanations, logs, disposable code,
+and provisional plans may coexist or contradict one another under
+`work/active/`; their presence does not make them scientific knowledge.
+
+The cognitive graph contains auditable scientific objects and relations:
+EvidenceGaps, ExperimentIntents, Observations, Evidence, and Claims.
+An `ExperimentIntent` is the versioned boundary between an EvidenceGap and
+action. It states why a computation is requested, the exact approved Brief and
+optional Claim specification it addresses, the observations and evidence
+required, and typed assessment semantics. Rigorous here means explicit,
+versioned, scoped, and traceable; it does not mean the target Claim is already
+supported.
+
+ExperimentIntent schema v1 criteria use only equality/inequality or finite
+numeric ordering operators. They are frozen audit contracts that prevent silent threshold
+changes. The current Evidence schema does not yet carry a typed
+Intent-and-criterion result map or mechanically execute its aggregation rule.
+Consequently, these criteria do not by themselves authorize a Claim update:
+Claim-specific Evidence must still state the observation-to-Claim bridge,
+counterevidence, uncertainty, and scope. A future schema may make that
+application deterministic without changing the Intent/control separation.
+
+The control graph contains prospective actions and dependencies. A
+`ControlGraphSpec` states how one exact finalized Intent version could be
+realized: nodes, conditional edges, executor, resource estimates, and completion
+contract. Resource estimates are prospective metadata, not budget authority or
+a reservation; each actual Run independently passes the cumulative Brief
+budget gate. Its `realizes_intent` field is an exact
+`{intent_id, version, sha256}` reference. One Intent may have several
+alternative control graphs. A revised Intent or graph creates a new version
+with an exact `previous_ref`; finalized records are never edited in place.
+
+The permission model is asymmetric:
+
+- an Agent may explore freely in `work/active/`;
+- an Agent may propose and revise structured Intent and Plan drafts;
+- an Agent may choose a Plan topology freely within safety and data-access
+  boundaries; declared resources remain non-authorizing estimates;
+- finalization freezes exact semantics and topology, and activation is an
+  explicit operation;
+- an Agent cannot reinterpret execution success as Claim support, silently
+  change a frozen threshold, rewrite history, or bypass Evidence and the human
+  Verdict.
+
+The distinction between `assessment_semantics` and control completion is
+essential. If every solver and validator process exits successfully but an
+observed convergence order misses its threshold, the control graph completed;
+the resulting Evidence may contradict the target Claim or remain
+inconclusive. No ControlGraphSpec transition updates a Claim directly.
+
+ControlGraph schema v1 records are strictly validated prospective DAGs. Iteration is
+encapsulated in a bounded `loop` node with a maximum iteration count, progress
+metric, continue condition, and exhaustion action. `plan-activate` materializes
+the selected immutable graph byte-for-byte as `formal/PLAN.json`, which
+subsequent Runs snapshot. V1 does not yet claim that `studyctl` schedules the
+whole graph or deterministically binds each Run to a node; that requires a
+separate typed control runtime and node-level execution ledger.
+
+Finalized graph records are committed through
+`GRAPH_RECORDS.sequence.json`. Its monotone high-water mark equals the exact
+visible finalized-record count, and its inventory digest binds both each
+record's canonical content digest and exact file digest. This detects deletion
+of a latest or sole version, whole-ID rollback, byte replacement, and
+unindexed additions. The local sequence is a durable authority, not an
+authenticated external transparency log; coordinated rollback of the records
+and the sequence remains outside the local self-digest threat model.
+
+Runs remain execution and provenance records even when their manifest
+classifies them as `exploratory` or `confirmatory`. That classification
+controls how later Evidence may use a Run; it does not place the Run in the
+cognitive graph or make it support a Claim by itself. Exploratory Runs may
+discover hypotheses or narrow candidates without a Confirmation Record. Only
+when a result is being promoted to the high-strength
+`numerically_supported` state does the workflow require a small
+pre-confirmatory-Run Confirmation Record followed by new `confirmatory` Runs.
+The record freezes the exact Claim statement and scope, selected candidate,
+protocol, evaluator, held-out conditions, analysis rule, and planned Run slots.
+This is a deterministic time-and-hash boundary, not a new human approval gate.
 
 ## Thin Skills, thick protocol
 
@@ -191,6 +279,8 @@ Choose `study_root` and `object_root` during initial installation. Once Studies 
 | Product | Location | Lifecycle and authority |
 |---|---|---|
 | Notes, provisional derivations, disposable scripts, prototype code | `<study_root>/STUDY_ID/work/active/` | Mutable scratch space; may be archived by compaction; cannot directly support a Claim |
+| Finalized ExperimentIntent records | `<study_root>/STUDY_ID/intents/` | Immutable cognitive contracts: why evidence is requested and how observations will be assessed |
+| Finalized ControlGraphSpec records | `<study_root>/STUDY_ID/control-plans/` | Immutable prospective control topology bound to an exact Intent |
 | Brief, Claims, optional formal artifacts, Run manifests, Evidence, Checkpoints | The Study below `<study_root>` | Versioned or immutable authoritative research state according to object type |
 | Adopted production implementation | A configured `source_root` | Normal host code; reviewed, tested, and committed with the repository |
 | Adopted unit, integration, regression, convergence, or scientific validation tests | A configured `test_root` | Normal host tests; must use the host framework and validation commands |
@@ -241,7 +331,7 @@ python -m tools.studyctl changeset-renew SC-0001
 python -m tools.studyctl validate-changes SC-0001
 ```
 
-Exploratory Runs can still be recorded when Git is unavailable, but their host change scope cannot be verified and they are ineligible for Evidence. Likewise, allowlisted host code or tests must be committed before an Evidence-producing Run; staged, unstaged, or untracked host changes make the sealed Run Evidence-ineligible. Study-state edits remain possible because Brief, Claims, Evidence drafts, and Run records naturally evolve during research.
+Exploratory Runs can still be recorded when Git is unavailable, but their host change scope cannot be verified and they are ineligible for Evidence. Likewise, allowlisted host code or tests must be committed before an Evidence-producing Run; staged, unstaged, or untracked host changes make the sealed Run Evidence-ineligible. Study-state edits remain possible because Brief, Claims, ExperimentIntent and ControlGraphSpec drafts, Evidence drafts, and Run records naturally evolve during research.
 
 ## Route before intake
 
@@ -361,7 +451,12 @@ To change an approved Brief safely:
 python -m tools.studyctl brief-new-version SC-0001
 ```
 
-Edit the new draft and obtain a new approval. Evaluator, data-split or acceptance-criteria changes also reuse this Brief approval gate after the protected artifact is updated.
+Edit the new draft and obtain a new approval. Evaluator, data-split or
+acceptance-criteria changes also reuse this Brief approval gate after the
+protected artifact is updated. An Evaluator defines how an observed quantity
+is computed. The Brief or a finalized ExperimentIntent owns why that quantity
+matters and how it will be assessed; a control implementation cannot introduce
+or relax a scientific threshold.
 
 ## Progressive formalization
 
@@ -378,9 +473,65 @@ python -m tools.studyctl check-formalization SC-0001 \
   --scientific-critical
 ```
 
-The result is `PASS`, `ADVISORY`, or `BLOCKED`, with the smallest missing artifact. Policy defaults require an active `formal/PROTOCOL.json` at 10 GPU-hours, `METHOD.md` before scientific-critical shared code enters Evidence, `EVALUATOR.json` plus renewed Brief approval for protected evaluator changes, and `PLAN.json` only for genuine parallel dependencies or multi-worker orchestration.
+The result is `PASS`, `ADVISORY`, or `BLOCKED`, with the smallest missing
+artifact. Policy defaults require an active `formal/PROTOCOL.json` at 10
+GPU-hours, `METHOD.md` before scientific-critical shared code enters Evidence,
+`EVALUATOR.json` plus renewed Brief approval for protected evaluator changes,
+and `PLAN.json` only for genuine parallel dependencies or multi-worker
+orchestration. An active PLAN is ready only when it is the byte-identical
+materialization of a current finalized ControlGraphSpec whose exact
+ExperimentIntent is still current. Arbitrary or independently authored
+`formal/PLAN.json` files are invalid.
 
-The command uses flags and configured path patterns; it never guesses scientific meaning from arbitrary code.
+Formalization debt is derived governance status computed from the current
+policy, consequential scope, and active artifacts. It is not an author-owned
+field in `CLAIMS.json`, and editing a Claim cannot clear a missing
+formalization gate.
+
+For a nontrivial evidence-seeking computation, create the cognitive and control
+contracts separately:
+
+```bash
+python -m tools.studyctl intent-new SC-0001 \
+  --id INTENT-0001 \
+  --evidence-gap-id GAP-0001 \
+  --evidence-gap "Three mesh levels have not been compared." \
+  --objective "Estimate mesh discretization error." \
+  --requested-observation observed_convergence_order \
+  --requested-observation richardson_error_estimate \
+  --evidence-requirement "Three provenance-bound mesh solutions." \
+  --claim CLAIM-0001
+
+# Complete assessment_semantics.criteria in the returned draft.
+python -m tools.studyctl intent-finalize SC-0001 --file <intent-draft>
+
+python -m tools.studyctl plan-new SC-0001 \
+  --id CG-0001 --intent INTENT-0001 --intent-version 1 \
+  --executor slurm --cpu-hours 80 --parallel-workers 3
+
+# Complete nodes, edges, and terminal completion nodes in the returned draft.
+python -m tools.studyctl plan-finalize SC-0001 --file <plan-draft>
+python -m tools.studyctl plan-activate SC-0001 --id CG-0001 --version 1
+```
+
+Intent and Plan drafts remain mutable Workspace files. Finalization writes new
+read-only, versioned records under `intents/` and `control-plans/`; it never
+turns the draft itself into authority. `formal/PLAN.json` contains only the
+currently activated complete ControlGraphSpec. Historical Plan records stay
+outside `formal/` so every later Run does not recursively copy the entire Plan
+history.
+
+`GRAPH_RECORDS.sequence.json` binds every finalized Intent and Plan version by
+canonical-record and exact-file digest. Finalization publishes the sealed
+record, then advances this sequence while holding the Study authority lock. If
+the process stops between those commits, all ordinary graph operations fail
+closed. After verifying the one additional record, recover only forward:
+
+```bash
+python -m tools.studyctl recover-graph-record-sequence SC-0001
+```
+
+The command uses flags and configured path patterns; it never guesses scientific meaning from arbitrary code. In particular, the parallel-Plan gate is enforced only when the caller truthfully supplies `--parallel-workers` or `--has-parallel-dependencies`; the current runtime does not infer scheduler topology from arbitrary Run argv, and `studyctl run` is not yet a whole-graph executor.
 
 `check-formalization` and `run` also enforce the approved cumulative hard
 budget. Registration serializes budget checking and reservation, so concurrent
@@ -410,9 +561,8 @@ advances its digest-bound high-water mark before publishing the draft. A
 failed publication burns that count rather than rolling it back, and deleting
 an unreferenced draft therefore cannot make compaction pressure decrease. A
 missing, corrupt, or rolled-back sequence blocks Evidence growth and
-validation. A pre-sequence Study must use the explicit
-`migrate-evidence-sequence` command; the migration records that deletion before
-the sequence existed cannot be proven absent.
+validation. The current runtime does not reconstruct a missing sequence from
+visible Evidence files.
 
 `<study_root>/<STUDY_ID>/CHECKPOINTS.sequence.json` binds the monotone
 Checkpoint high-water mark and latest Checkpoint digest. Validation and active
@@ -595,9 +745,10 @@ Evidence discloses the now-complete campaign.
 
 ### Optional Observation Records
 
-The default path remains `Run -> Evidence`. Do not create one Observation per
-Run. Promote analysis into `observations/OBS-NNNN.vNNNN.json` only when at least
-one registered trigger applies. Inspect the active registry rather than assuming
+The default bridge is `Run / Artifact -> inline Observation -> Claim-specific
+Evidence`. Do not create one standalone Observation Record per Run. Promote
+analysis into `observations/OBS-NNNN.vNNNN.json` only when at least one
+registered trigger applies. Inspect the active registry rather than assuming
 that a hard-coded list is complete:
 
 ```bash
@@ -740,7 +891,7 @@ python -m tools.studyctl context SC-0001
 python -m tools.studyctl status SC-0001
 ```
 
-`profile-validate` checks repository adaptation. `validate-changes` executes and pins the host validation contract. `check-changes` regenerates `generated/CHANGES.json` from Git. `validate` checks schemas, IDs, immutable digests, approval freshness, references, profile/CHANGESET/validation state, actual change scope, Confirmation bindings and slot coverage, Run dependency integrity and eligibility, Observation source/fingerprint integrity, Evidence basis and Observation bindings, Claim evidence strength, Cohort compatibility, Checkpoint links, and Verdict structure. `context` regenerates the bounded `generated/ACTIVE_CONTEXT.json` selector; `status` regenerates `generated/STATUS.md`. Generated files are projections and are never authoritative.
+`profile-validate` checks repository adaptation. `validate-changes` executes and pins the host validation contract. `check-changes` regenerates `generated/CHANGES.json` from Git. `validate` checks schemas, IDs, immutable digests, approval freshness, ExperimentIntent and ControlGraphSpec lineage and exact bindings, active PLAN materialization, profile/CHANGESET/validation state, actual change scope, Confirmation bindings and slot coverage, Run dependency integrity and eligibility, Observation source/fingerprint integrity, Evidence basis and Observation bindings, Claim evidence strength, Cohort compatibility, Checkpoint links, and Verdict structure. `context` regenerates the bounded `generated/ACTIVE_CONTEXT.json` selector; `status` regenerates `generated/STATUS.md`. Generated files are projections and are never authoritative.
 
 ### Bounded active context and automatic compaction pressure
 
@@ -752,7 +903,11 @@ and content hashes rather than full semantic payloads. The approved Brief,
 active formal artifacts, and latest Checkpoint are represented by
 path/hash/size and compact count summaries. A separate bounded Confirmation
 index exposes editable drafts, pending/running slots, and records awaiting
-Evidence. `decisive_observations` contains only short result previews,
+Evidence. The `graph_records` index exposes its sequence high-water/inventory
+binding, bounded exact locators for the latest finalized ExperimentIntent and
+ControlGraphSpec per ID, plus a separate `workspace_drafts` index whose
+assurance is `mutable_non_authoritative`. It preserves full-history counts and
+inventory hashes but never embeds record bodies. `decisive_observations` contains only short result previews,
 Run/Cohort counts, exact hashes, paths, and the Evidence IDs that use each
 Observation; it never injects complete Observation contents by default. Resume
 these locators before creating a new Confirmation. Inspect only the authoritative
@@ -769,8 +924,8 @@ boundary they are terminal. A replacement receives a new Claim ID and the old
 Claim records `superseded_by`, and every supersession chain must end at an
 active Claim. The current Claims schema requires an explicit lifecycle.
 
-The current runtime accepts only the current Claims, Observation, Evidence, and
-Checkpoint schemas. Any unsupported schema version fails closed before normal Study
+The current runtime accepts only the current Claims, ExperimentIntent,
+ControlGraphSpec, Observation, Evidence, and Checkpoint schemas. Any unsupported schema version fails closed before normal Study
 operation: the current CLI does not validate it as a retained historical schema
 variant, infer missing Evidence semantics, or rewrite it in place. Keep an older
 installation on a Git-pinned compatible workflow, or perform an explicit,
@@ -779,9 +934,9 @@ record, reference, digest, and immutable-history binding before adopting the
 current runtime. Never allocate a replacement Study to bypass incompatibility.
 
 `policy.json` defines soft and hard thresholds for active, total-authoritative,
-and terminal Claims; `CLAIMS.json` bytes; Frontier questions/actions/decisions;
-serialized active-selector size; Runs and Evidence since the latest Checkpoint;
-and files/bytes under `work/active/`. `status`
+and terminal Claims; `CLAIMS.json` bytes; Frontier questions and human
+decisions; serialized active-selector size; Runs and Evidence since the latest
+Checkpoint; and files/bytes under `work/active/`. `status`
 reports every observed value and threshold. Soft pressure deterministically
 requests semantic compaction. Hard pressure prevents another Run, Evidence
 draft, or review packet, while validation, status, `compact-prepare`, and
@@ -825,11 +980,24 @@ python -m tools.studyctl compact-finalize SC-0001 \
   --plan studies/SC-0001/work/COMPACTION_PLAN.json
 ```
 
-The plan must match `scientific-workflow/schemas/compaction-plan.schema.json`, live outside `work/active/`, and pin the current compaction-input, Claims hash, and constant-size Evidence inventory binding (`total_count` plus the canonical full `inventory_sha256`). It never copies the complete Evidence path/hash map. `COMPACTION_INPUT.json` separately binds the complete Observation inventory and monotone Observation sequence, so creating, changing, or deleting an Observation after preparation makes the plan stale. Finalization recomputes these bindings and also rechecks the repository-profile hash, consequential host-scope fingerprint/count, and complete `work/active/` inventory; drift requires a new prepare step.
+The plan must match
+`scientific-workflow/schemas/compaction-plan.schema.json`, live outside
+`work/active/`, and pin the current compaction-input, Claims hash, and
+constant-size Evidence inventory binding (`total_count` plus the canonical full
+`inventory_sha256`). It carries the current `frontier` object exactly once and
+does not duplicate its open questions or maintain a separate action list. It
+never copies the complete Evidence path/hash map.
+`COMPACTION_INPUT.json` separately binds the complete Observation inventory and
+monotone Observation sequence, so creating, changing, or deleting an
+Observation after preparation makes the plan stale. Finalization recomputes
+these bindings and also rechecks the repository-profile hash, consequential
+host-scope fingerprint/count, and complete `work/active/` inventory; drift
+requires a new prepare step.
 
 `COMPACTION_INPUT.json` does not copy an unbounded history into the Agent
-context. Collections that can grow with Runs, Observations, Evidence, Cohorts, formal
-artifacts, failed directions, or `work/active/` are bounded indexes. Each index
+context. Collections that can grow with ExperimentIntent/ControlGraphSpec
+versions, Runs, Observations, Evidence, Cohorts, formal artifacts, failed
+directions, or `work/active/` are bounded indexes. Each index
 contains a deterministic `items` batch plus `total_count`, `selected_count`,
 `truncated`, and an `inventory_sha256` over the complete ordered inventory.
 The same locator rule applies to current Claims, the Frontier, consequential
@@ -863,6 +1031,14 @@ python -m tools.studyctl review-packet SC-0001
 ```
 
 The default review base comes from the repository profile; use `--base-ref` only for an explicit one-off override. The packet includes the repository profile and current Git change scope in addition to the scientific artifacts. It also includes bounded Confirmation Record and attempt locators plus full counts and inventory hashes. When `confirmation_records_truncated` or attempt `truncated` is true, the reviewer must inspect the referenced source inventory rather than treating unlisted records or attempts as absent. Start a fresh top-level Codex task for the review, set it to read-only, and invoke the repository `scientific-review` skill. The reviewer must check that the profile fits the host repository, compare the actual diff with `formal/CHANGESET.json`, verify the commit-bound `formal/VALIDATION.json`, confirm that production code/tests occupy their configured roots, audit every relevant confirmation attempt, and reject Evidence built from ineligible Runs. It must inspect source artifacts and return JSON matching `review.schema.json`; it must not edit code, Claims, Evidence or Verdicts. Save that JSON outside the reviewer session, then deterministically import and render it:
+
+The review separately traces the cognitive chain
+`EvidenceGap -> ExperimentIntent -> Observation -> Evidence -> Claim` and the
+control chain `ExperimentIntent reference -> ControlGraphSpec -> active PLAN ->
+Run / Artifact`, then checks the provenance bridge from execution outputs to
+the Observation. Because the current runtime does not bind each Run to a
+ControlGraph node, the reviewer must report node-level execution coverage as a
+known limitation rather than infer it from names or scheduling order.
 
 ```bash
 python -m tools.studyctl review-render SC-0001 --file /path/to/review.json
@@ -926,9 +1102,11 @@ the Agent only translates and records the authorized content.
 4. Recreate the recorded Python/runtime, hardware class and precision. Reconstruct the portable values in `execution_boundary.environment_variables`, replacing `${CAPSULE_HOME}` with a new private directory; verify `environment_sha256` and do not restore the caller's ambient environment. Historical manifests without those fields expose only their inherited-key allowlist and therefore need additional reconstruction evidence.
 5. Recreate the same named backend and an isolation policy equivalent to the recorded `execution_boundary`; verify the backend version compatibility, policy format, and policy digest. Execute the recorded `execution.argv` directly as an argument vector inside that boundary, not as a reconstructed shell string. For `private-copy-out`, retain only the declared regular output paths. Compare output hashes and inspect `stdout.log` and `stderr.log`.
 
-New Runs use manifest schema V4 and require an explicit epistemic role. V1,
-V2, and V3 predate that contract and are permanently interpreted as
-exploratory even if a later copy is decorated with confirmation-looking fields.
+New Runs use manifest schema V4 and require an explicit `epistemic_role`
+classification for later Evidence eligibility; despite the field name, the Run
+remains an execution/provenance record rather than a cognitive node. V1, V2,
+and V3 predate that contract and are permanently interpreted as exploratory
+even if a later copy is decorated with confirmation-looking fields.
 Immutable pre-budget V2 Runs keep their earlier Evidence semantics and are also
 conservatively charged for declared output bytes. V1 remains historical and
 Evidence-ineligible because it predates the repository-profile, change-scope,
@@ -949,26 +1127,4 @@ It cannot prove from local files alone that a continuous tail was never deleted
 before migration; use Git, backups, scheduler records, or another external
 append-only anchor to establish that historical premise.
 
-A schema-compatible pre-sequence Evidence history has the analogous explicit
-migration:
-
-```bash
-python -m tools.studyctl migrate-evidence-sequence SC-0001
-```
-
-It validates canonical continuous versions and Checkpoint watermarks before
-creating the monotone counter. Its origin record states the unavoidable lower
-assurance for deletions that may have happened before migration.
-
-A schema-compatible pre-sequence Checkpoint history uses the separate explicit
-migration:
-
-```bash
-python -m tools.studyctl migrate-checkpoint-sequence SC-0001
-```
-
-It accepts only the currently visible, schema-valid, digest-valid, contiguous
-chain from `CHECKPOINT-000001`. Its origin explicitly records that deletion
-before sequence initialization cannot be disproved from local files alone.
-
-The current implementation cannot automatically classify a process killed by `SIGKILL` or power loss. A crash before launch leaves a never-reused ledger reservation; a crash after launch authorization leaves the `running` Manifest and reservation. Both fail closed until explicit recovery. A terminal Manifest may be durable before its matching ledger update; the next locked registration can reconcile that one-way transition, while a missing Manifest always blocks rather than guessing. The workflow also cannot prove human identity cryptographically, and checks only that a Cohort compatibility justification exists—not whether its scientific argument is sound. Local SHA-256 digests detect inconsistent bytes but are not authenticated signatures or an external rollback anchor; an actor who can replace an entire Study and all of its history is outside this local protocol. Filesystem checks still have an unavoidable time-of-check/time-of-use race against a malicious concurrent local process. GPU-hour and CPU-hour values remain self-reported reservations: their cumulative limits are enforced, but arbitrary schedulers are not independently metered. Declared-output storage is measured after execution. Git detects committed, staged, unstaged, and untracked repository paths, while external and dynamically resolved inputs still must be declared with `--input`. Project hooks remain small guardrails, not a complete security boundary; repository-profile validation, actual-diff checks, immutable snapshots, tests, clean review context, and human review are the enforcement layers.
+The current implementation cannot automatically classify a process killed by `SIGKILL` or power loss. A crash before launch leaves a never-reused ledger reservation; a crash after launch authorization leaves the `running` Manifest and reservation. Both fail closed until explicit recovery. A terminal Manifest may be durable before its matching ledger update; the next locked registration can reconcile that one-way transition, while a missing Manifest always blocks rather than guessing. A graph record durable before its sequence update similarly requires the explicit one-record forward recovery above. The workflow also cannot prove human identity cryptographically, and checks only that a Cohort compatibility justification exists—not whether its scientific argument is sound. ExperimentIntent criteria are currently frozen and auditable but are not yet mechanically bound to typed Evidence criterion results. Local SHA-256 digests detect inconsistent bytes but are not authenticated signatures or an external rollback anchor; an actor who can replace an entire Study and all of its history is outside this local protocol. Filesystem checks still have an unavoidable time-of-check/time-of-use race against a malicious concurrent local process. GPU-hour and CPU-hour values remain self-reported reservations: their cumulative limits are enforced, but arbitrary schedulers are not independently metered. Declared-output storage is measured after execution. Git detects committed, staged, unstaged, and untracked repository paths, while external and dynamically resolved inputs still must be declared with `--input`. Project hooks remain small guardrails, not a complete security boundary; repository-profile validation, actual-diff checks, immutable snapshots, tests, clean review context, and human review are the enforcement layers.

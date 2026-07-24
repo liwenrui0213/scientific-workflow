@@ -22,7 +22,7 @@ from tools.studyctl.hashing import (
     record_digest,
     sha256_file,
 )
-from tools.studyctl.models import SCHEMA_VERSION, ValidationError
+from tools.studyctl.models import COMPACTION_PLAN_SCHEMA_VERSION, ValidationError
 from tools.studyctl.observation import (
     create_observation_draft,
     finalize_observation,
@@ -300,7 +300,7 @@ class ObservationRecordTests(WorkflowTestCase):
         claims = load_json(paths.claims)
         evidence_ref = claims["claims"][0]["supporting_evidence"][0]
         plan = {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": COMPACTION_PLAN_SCHEMA_VERSION,
             "study_id": paths.study_id,
             "compaction_input_sha256": sha256_file(compaction_input),
             "claims_sha256": sha256_file(paths.claims),
@@ -309,8 +309,6 @@ class ObservationRecordTests(WorkflowTestCase):
             "decisive_evidence": [evidence_ref],
             "contradictory_evidence": [],
             "frontier": claims["frontier"],
-            "open_questions": list(claims["frontier"]["open_questions"]),
-            "next_actions": list(claims["frontier"]["next_actions"]),
             "representative_failures": [],
             "budget_state": prepared["budget_totals"],
         }

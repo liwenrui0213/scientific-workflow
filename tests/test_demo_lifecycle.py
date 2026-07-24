@@ -45,7 +45,7 @@ class DemonstrationLifecycleTests(WorkflowTestCase):
         atomic_write_json(
             destination,
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "study_id": paths.study_id,
                 "compaction_input_sha256": sha256_file(compaction_input),
                 "claims_sha256": sha256_file(paths.claims),
@@ -58,8 +58,6 @@ class DemonstrationLifecycleTests(WorkflowTestCase):
                 "decisive_evidence": [] if evidence_ref is None else [evidence_ref],
                 "contradictory_evidence": [],
                 "frontier": claims["frontier"],
-                "open_questions": claims["frontier"]["open_questions"],
-                "next_actions": claims["frontier"]["next_actions"],
                 "representative_failures": [],
                 "budget_state": prepared["budget_totals"],
             },

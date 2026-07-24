@@ -229,7 +229,13 @@ def decide(event: dict[str, Any]) -> str | None:
     )
     sequence_pattern = _study_regex(
         study_root,
-        r"(?:EVIDENCE|CHECKPOINTS)\.sequence\.json(?:\b|$)",
+        r"(?:OBSERVATIONS|EVIDENCE|CHECKPOINTS|GRAPH_RECORDS)\.sequence\.json(?:\b|$)",
+    )
+    graph_record_pattern = _study_regex(
+        study_root,
+        r"(?:intents/INTENT-[0-9]{4,}\.v[0-9]{4,}\.json|"
+        r"control-plans/CG-[0-9]{4,}\.v[0-9]{4,}\.json|"
+        r"formal/PLAN\.json)(?:\b|$)",
     )
     checkpoint_pattern = _study_regex(
         study_root,
@@ -273,8 +279,12 @@ def decide(event: dict[str, Any]) -> str | None:
             return "Frozen Confirmation Records may be written only by studyctl confirmation-finalize."
         if run_pattern.search(lowered):
             return "Run manifests are sealed execution records and must not be changed or removed."
-        if sequence_pattern.search(lowered) or checkpoint_pattern.search(lowered):
-            return "Checkpoint, sequence, and archived Claim records are sealed authority and must not be changed or removed directly."
+        if (
+            sequence_pattern.search(lowered)
+            or checkpoint_pattern.search(lowered)
+            or graph_record_pattern.search(lowered)
+        ):
+            return "Checkpoint, sequence, finalized graph, active PLAN, and archived Claim records are sealed authority and must not be changed or removed directly."
         brief_match = brief_pattern.search(lowered)
         if brief_match and _approval_exists(
             repository_root, study_root, brief_match.group(1).upper()
@@ -321,9 +331,11 @@ def decide(event: dict[str, Any]) -> str | None:
         if run_pattern.search(lowered) and action in {"add", "update", "delete"}:
             return "Run manifests are sealed execution records and must not be changed or removed."
         if (
-            sequence_pattern.search(lowered) or checkpoint_pattern.search(lowered)
+            sequence_pattern.search(lowered)
+            or checkpoint_pattern.search(lowered)
+            or graph_record_pattern.search(lowered)
         ) and action in {"add", "update", "delete"}:
-            return "Checkpoint, sequence, and archived Claim records are sealed authority and must not be changed or removed directly."
+            return "Checkpoint, sequence, finalized graph, active PLAN, and archived Claim records are sealed authority and must not be changed or removed directly."
         brief_match = brief_pattern.search(normalized)
         if brief_match and _approval_exists(
             repository_root, study_root, brief_match.group(1).upper()

@@ -3,15 +3,14 @@
   "$id": "https://example.invalid/scientific-workflow/claims.schema.json",
   "title": "Current scientific Claims state",
   "type": "object",
-  "required": ["schema_version", "study_id", "revision", "updated_at", "claims", "frontier", "formalization_debt"],
+  "required": ["schema_version", "study_id", "revision", "updated_at", "claims", "frontier"],
   "properties": {
-    "schema_version": {"const": 2},
+    "schema_version": {"const": 3},
     "study_id": {"type": "string", "pattern": "^SC-[0-9]{4,}$", "maxLength": 64},
     "revision": {"type": "integer", "minimum": 1},
     "updated_at": {"type": "string", "minLength": 1, "maxLength": 64},
     "claims": {"type": "array", "maxItems": 256, "items": {"$ref": "#/$defs/claim"}},
-    "frontier": {"$ref": "#/$defs/frontier"},
-    "formalization_debt": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/debt"}}
+    "frontier": {"$ref": "#/$defs/frontier"}
   },
   "$defs": {
     "evidence_ref": {
@@ -49,25 +48,12 @@
     },
     "frontier": {
       "type": "object",
-      "required": ["summary", "claim_ids", "open_questions", "next_actions", "human_decisions_required"],
+      "required": ["summary", "claim_ids", "open_questions", "human_decisions_required"],
       "properties": {
         "summary": {"type": ["string", "null"], "maxLength": 4096},
         "claim_ids": {"type": "array", "maxItems": 64, "uniqueItems": true, "items": {"type": "string", "pattern": "^CLAIM-[0-9]{4,}$", "maxLength": 64}},
         "open_questions": {"type": "array", "maxItems": 64, "items": {"type": "string", "maxLength": 1024}},
-        "next_actions": {"type": "array", "maxItems": 64, "items": {"type": "string", "maxLength": 1024}},
         "human_decisions_required": {"type": "array", "maxItems": 32, "items": {"type": "string", "maxLength": 1024}}
-      },
-      "additionalProperties": false
-    },
-    "debt": {
-      "type": "object",
-      "required": ["debt_id", "level", "artifact", "reason", "source_refs"],
-      "properties": {
-        "debt_id": {"type": "string", "minLength": 1, "maxLength": 128},
-        "level": {"enum": ["advisory", "required_before_expensive_run", "required_before_evidence", "required_before_review", "blocking_now"]},
-        "artifact": {"enum": ["METHOD", "PROTOCOL", "EVALUATOR", "PLAN", "BRIEF"]},
-        "reason": {"type": "string", "minLength": 1, "maxLength": 2048},
-        "source_refs": {"type": "array", "maxItems": 32, "items": {"type": "string", "maxLength": 1024}}
       },
       "additionalProperties": false
     }

@@ -8,22 +8,14 @@ from .hashing import atomic_write_json, load_json, record_digest
 from .models import StudyPaths, ValidationError
 
 
-_SEQUENCE_SCHEMA_VERSION = 1
+_SEQUENCE_SCHEMA_VERSION = 2
 _SEQUENCE_KEYS = {
     "schema_version",
     "study_id",
     "high_water_mark",
     "latest_checkpoint",
-    "origin",
     "sequence_sha256",
 }
-_ORIGIN_KEYS = {
-    "kind",
-    "visible_checkpoint_count",
-    "pre_migration_deletion_assurance",
-}
-_NATIVE_ASSURANCE = "not_applicable"
-_LEGACY_ASSURANCE = "unverifiable_before_sequence_initialization"
 
 
 def empty_checkpoint_sequence(paths: StudyPaths) -> dict[str, Any]:
@@ -34,11 +26,6 @@ def empty_checkpoint_sequence(paths: StudyPaths) -> dict[str, Any]:
         "study_id": paths.study_id,
         "high_water_mark": 0,
         "latest_checkpoint": None,
-        "origin": {
-            "kind": "native",
-            "visible_checkpoint_count": 0,
-            "pre_migration_deletion_assurance": _NATIVE_ASSURANCE,
-        },
         "sequence_sha256": None,
     }
     value["sequence_sha256"] = record_digest(value, "sequence_sha256")
@@ -66,10 +53,10 @@ def validate_checkpoint_sequence_value(
 ) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValidationError("Checkpoint sequence must be a JSON object")
-    if set(value) != _SEQUENCE_KEYS:
-        raise ValidationError("Checkpoint sequence has missing or unsupported fields")
     if value.get("schema_version") != _SEQUENCE_SCHEMA_VERSION:
         raise ValidationError("Checkpoint sequence schema_version is unsupported")
+    if set(value) != _SEQUENCE_KEYS:
+        raise ValidationError("Checkpoint sequence has missing or unsupported fields")
     if value.get("study_id") != paths.study_id:
         raise ValidationError("Checkpoint sequence study_id does not match the Study")
 
@@ -103,30 +90,6 @@ def validate_checkpoint_sequence_value(
         ):
             raise ValidationError("Checkpoint sequence latest checkpoint hash is invalid")
 
-    origin = value.get("origin")
-    if not isinstance(origin, dict) or set(origin) != _ORIGIN_KEYS:
-        raise ValidationError("Checkpoint sequence origin has an invalid shape")
-    visible_at_origin = _nonnegative_integer(
-        origin.get("visible_checkpoint_count"),
-        label="Checkpoint sequence origin visible_checkpoint_count",
-    )
-    if visible_at_origin > high_water_mark:
-        raise ValidationError(
-            "Checkpoint sequence high_water_mark is below its origin checkpoint count"
-        )
-    kind = origin.get("kind")
-    assurance = origin.get("pre_migration_deletion_assurance")
-    if kind == "native":
-        if visible_at_origin != 0 or assurance != _NATIVE_ASSURANCE:
-            raise ValidationError("native Checkpoint sequence origin is invalid")
-    elif kind == "legacy_migration":
-        if assurance != _LEGACY_ASSURANCE:
-            raise ValidationError(
-                "legacy Checkpoint sequence must record the pre-migration deletion assurance gap"
-            )
-    else:
-        raise ValidationError("Checkpoint sequence origin kind is unsupported")
-
     if value.get("sequence_sha256") != record_digest(value, "sequence_sha256"):
         raise ValidationError("Checkpoint sequence digest is invalid")
     return deepcopy(value)
@@ -146,10 +109,7 @@ def load_checkpoint_sequence(paths: StudyPaths) -> dict[str, Any] | None:
 def require_checkpoint_sequence(paths: StudyPaths) -> dict[str, Any]:
     sequence = load_checkpoint_sequence(paths)
     if sequence is None:
-        raise ValidationError(
-            "Checkpoint sequence is missing; use migrate-checkpoint-sequence only "
-            "for an intact pre-sequence Checkpoint history"
-        )
+        raise ValidationError("Checkpoint sequence is missing")
     return sequence
 
 
@@ -191,44 +151,6 @@ def advance_checkpoint_sequence(
         "sha256": checkpoint_sha256,
     }
     return write_checkpoint_sequence(paths, sequence)
-
-
-def migrate_legacy_checkpoint_sequence(
-    paths: StudyPaths,
-    checkpoints: list[dict[str, Any]],
-) -> dict[str, Any]:
-    """Bind an explicitly validated, contiguous legacy Checkpoint chain."""
-
-    if load_checkpoint_sequence(paths) is not None:
-        raise ValidationError("Checkpoint sequence already exists")
-    for index, checkpoint in enumerate(checkpoints, start=1):
-        checkpoint_id = checkpoint.get("checkpoint_id")
-        if not isinstance(checkpoint_id, str) or _checkpoint_number(
-            checkpoint_id
-        ) != index:
-            raise ValidationError(
-                "legacy Checkpoint history must be contiguous from CHECKPOINT-000001"
-            )
-    latest = None
-    if checkpoints:
-        tail = checkpoints[-1]
-        latest = {
-            "checkpoint_id": tail["checkpoint_id"],
-            "sha256": tail["checkpoint_sha256"],
-        }
-    value: dict[str, Any] = {
-        "schema_version": _SEQUENCE_SCHEMA_VERSION,
-        "study_id": paths.study_id,
-        "high_water_mark": len(checkpoints),
-        "latest_checkpoint": latest,
-        "origin": {
-            "kind": "legacy_migration",
-            "visible_checkpoint_count": len(checkpoints),
-            "pre_migration_deletion_assurance": _LEGACY_ASSURANCE,
-        },
-        "sequence_sha256": None,
-    }
-    return write_checkpoint_sequence(paths, value, overwrite=False)
 
 
 def checkpoint_sequence_temporary_paths(paths: StudyPaths) -> list[Path]:

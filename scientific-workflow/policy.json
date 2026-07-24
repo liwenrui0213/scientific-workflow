@@ -9,13 +9,6 @@
     "EVALUATOR": "formal/EVALUATOR.json",
     "PLAN": "formal/PLAN.json"
   },
-  "formalization_debt_levels": [
-    "advisory",
-    "required_before_expensive_run",
-    "required_before_evidence",
-    "required_before_review",
-    "blocking_now"
-  ],
   "active_context": {
     "compaction_pressure": {
       "active_claims": {"soft": 24, "hard": 32},
@@ -23,7 +16,6 @@
       "terminal_claims": {"soft": 96, "hard": 160},
       "claims_source_bytes": {"soft": 1048576, "hard": 4194304},
       "frontier_open_questions": {"soft": 24, "hard": 32},
-      "frontier_next_actions": {"soft": 24, "hard": 32},
       "frontier_human_decisions": {"soft": 12, "hard": 16},
       "active_selector_bytes": {"soft": 65536, "hard": 98304},
       "runs_since_checkpoint": {"soft": 20, "hard": 40},

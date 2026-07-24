@@ -33,7 +33,8 @@ Record the question without blocking intake when it matters later.
 
 - GPU model matters for a performance Cohort but no performance Run is being
   authorized yet.
-- A solver tolerance matters before a production protocol or Evidence, while
+- A scientific acceptance threshold matters before the Brief or an
+  ExperimentIntent freezes how a future observation will be assessed, while
   low-cost exploratory derivations can proceed.
 - The exact ablation matrix matters after candidate mechanisms are known.
 
@@ -73,8 +74,10 @@ Avoid:
 > Method A is better.
 
 Do not fabricate numerical thresholds to make a Claim look precise. If the human
-did not authorize a threshold, record it as unresolved or defer it to evaluator
-formalization.
+did not authorize a scientific acceptance threshold, record it as unresolved
+or resolve it at the Brief or ExperimentIntent cognitive boundary before
+finalization. An Evaluator defines how to compute an observed quantity; it must
+not silently own why that quantity matters or what threshold supports a Claim.
 
 ## Anti-patterns
 

@@ -188,9 +188,7 @@ def _evidence_source_index(
                     "status": item.get("status"),
                     "assessment": item.get("assessment"),
                     "evidence_basis": _declared_evidence_mode(item),
-                    # Compatibility key: this is deliberately a bounded source
-                    # summary, never the authoritative Evidence object.
-                    "object": summary,
+                    "summary": summary,
                 }
             )
     return records
@@ -525,6 +523,7 @@ def create_review_packet(paths: StudyPaths, base_ref: str | None = None) -> Path
         "active_formal_artifacts": selector["active_formal_artifacts"][
             "sources"
         ],
+        "graph_records": selector["graph_records"],
         "claims": active_claims_data,
         "observations": selector["decisive_observations"],
         "observation_trigger_registry": {
@@ -566,10 +565,8 @@ def create_review_packet(paths: StudyPaths, base_ref: str | None = None) -> Path
         "decisive_evidence": decisive_refs,
         "contradictory_evidence": contradictory_refs,
         "other_evidence": other_refs,
-        # Compatibility names now contain bounded source indexes, not full
-        # authoritative Run manifests.
-        "decisive_run_manifests": decisive_run_sources,
-        "contradictory_run_manifests": contradictory_run_sources,
+        "decisive_run_sources": decisive_run_sources,
+        "contradictory_run_sources": contradictory_run_sources,
         "other_run_sources": [
             item for item in run_sources if "other" in item["roles"]
         ],

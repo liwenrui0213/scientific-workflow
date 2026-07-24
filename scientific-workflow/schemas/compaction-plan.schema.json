@@ -6,11 +6,11 @@
   "required": [
     "schema_version", "study_id", "compaction_input_sha256", "claims_sha256",
     "evidence_inventory", "archive_work_files", "decisive_evidence",
-    "contradictory_evidence", "frontier", "open_questions", "next_actions",
+    "contradictory_evidence", "frontier",
     "representative_failures", "budget_state"
   ],
   "properties": {
-    "schema_version": {"const": 1},
+    "schema_version": {"const": 2},
     "study_id": {"type": "string", "pattern": "^SC-[0-9]{4,}$", "maxLength": 64},
     "compaction_input_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "claims_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
@@ -19,8 +19,6 @@
     "decisive_evidence": {"type": "array", "maxItems": 2048, "items": {"$ref": "#/$defs/evidence_ref"}},
     "contradictory_evidence": {"type": "array", "maxItems": 2048, "items": {"$ref": "#/$defs/evidence_ref"}},
     "frontier": {"type": "object"},
-    "open_questions": {"type": "array", "maxItems": 64, "items": {"type": "string", "maxLength": 1024}},
-    "next_actions": {"type": "array", "maxItems": 64, "items": {"type": "string", "maxLength": 1024}},
     "representative_failures": {"type": "array", "maxItems": 64, "items": {"type": "string", "maxLength": 1024}},
     "budget_state": {"type": "object"}
   },
