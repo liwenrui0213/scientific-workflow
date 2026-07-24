@@ -1692,7 +1692,8 @@ def retained_run_output_budget_issues(
 
 
 def sealed_run_evidence_eligible(manifest: dict[str, Any]) -> bool:
-    if manifest.get("schema_version") not in {2, 3, 4}:
+    schema_version = manifest.get("schema_version")
+    if schema_version not in {2, 3, 4}:
         return False
     if manifest.get("status") not in {"succeeded", "failed", "interrupted"}:
         return False
@@ -1700,14 +1701,37 @@ def sealed_run_evidence_eligible(manifest: dict[str, Any]) -> bool:
 
     change_scope = manifest.get("change_scope", {})
     boundary = manifest.get("execution_boundary", {})
-    return (
+    supported_backends = {"linux-bubblewrap", "macos-seatbelt"}
+    backend = boundary.get("backend") if isinstance(boundary, dict) else None
+    boundary_environment = (
+        boundary.get("environment_variables") if isinstance(boundary, dict) else None
+    )
+    environment_binding_valid = (
+        backend == "macos-seatbelt"
+        and (
+            boundary_environment is None
+            or (
+                isinstance(boundary_environment, dict)
+                and boundary.get("environment_sha256")
+                == sha256_json(boundary_environment)
+            )
+        )
+    ) or (
+        backend == "linux-bubblewrap"
+        and isinstance(boundary_environment, dict)
+        and boundary.get("environment_sha256") == sha256_json(boundary_environment)
+    )
+    backend_policy_valid = (
+        backend == "macos-seatbelt"
+        and boundary.get("policy_format") in {None, "seatbelt-profile-v1"}
+        and boundary.get("output_staging") in {None, "direct"}
+    ) or (
+        backend == "linux-bubblewrap"
+        and boundary.get("policy_format") == "bubblewrap-mount-policy-v1"
+        and boundary.get("output_staging") == "private-copy-out"
+    )
+    dependency_state_valid = (
         isinstance(change_scope, dict)
-        and isinstance(boundary, dict)
-        and boundary.get("mode") == "sealed"
-        and boundary.get("declared_inputs_only") is True
-        and boundary.get("repository_write_access") is False
-        and boundary.get("declared_outputs_only") is True
-        and boundary.get("network_access") is False
         and change_state_evidence_eligible(change_scope.get("before", {}))
         and change_state_evidence_eligible(change_scope.get("after", {}))
         and all(
@@ -1724,6 +1748,43 @@ def sealed_run_evidence_eligible(manifest: dict[str, Any]) -> bool:
             "artifacts_unchanged_during_run"
         )
         is True
+    )
+    if schema_version == 2:
+        # Frozen V2 predates the sealed execution-boundary field. Preserve its
+        # original endpoint-integrity semantics without pretending that it had
+        # a runtime sandbox. It remains permanently exploratory elsewhere.
+        return (
+            isinstance(change_scope, dict)
+            and change_state_evidence_eligible(change_scope.get("before", {}))
+            and change_state_evidence_eligible(change_scope.get("after", {}))
+            and all(
+                record.get("changed_during_run") is False
+                for record in manifest.get("inputs", [])
+                if isinstance(record, dict)
+            )
+            and all(
+                record.get("present") is True
+                for record in manifest.get("outputs", [])
+                if isinstance(record, dict)
+            )
+            and manifest.get("formalization", {}).get(
+                "artifacts_unchanged_during_run"
+            )
+            is True
+        )
+    return (
+        dependency_state_valid
+        and isinstance(boundary, dict)
+        and boundary.get("mode") == "sealed"
+        and boundary.get("declared_inputs_only") is True
+        and boundary.get("backend") in supported_backends
+        and backend_policy_valid
+        and environment_binding_valid
+        and isinstance(boundary.get("policy_sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", boundary["policy_sha256"]) is not None
+        and boundary.get("repository_write_access") is False
+        and boundary.get("declared_outputs_only") is True
+        and boundary.get("network_access") is False
     )
 
 

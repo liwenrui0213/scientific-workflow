@@ -33,6 +33,24 @@
     "protected_patterns": {"type": "array", "items": {"type": "string", "minLength": 1}},
     "generated_patterns": {"type": "array", "items": {"type": "string", "minLength": 1}},
     "vendor_patterns": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "execution": {
+      "type": "object",
+      "required": ["backend_preference", "trusted_read_only_paths"],
+      "properties": {
+        "backend_preference": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"enum": ["linux-bubblewrap", "macos-seatbelt"]}
+        },
+        "trusted_read_only_paths": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        }
+      },
+      "additionalProperties": false
+    },
     "commands": {"type": "object"},
     "git": {
       "type": "object",

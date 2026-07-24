@@ -1029,7 +1029,9 @@ class GarbageCollectionTests(WorkflowTestCase):
             ".objects/pinned.txt": "output is pinned",
             ".objects/baseline.txt": "output is a baseline",
             ".objects/anomaly.txt": "output is a unique anomaly",
-            ".objects/referenced.txt": "Run is referenced by Evidence, Claim, or Verdict",
+            ".objects/referenced.txt": (
+                "Run is referenced by Observation, Evidence, Claim, or Verdict"
+            ),
             ".objects/orphan.txt": "object has no reproducible Run manifest",
         }
         self.assertEqual(set(retained), set(expected_reasons))

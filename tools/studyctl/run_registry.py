@@ -25,6 +25,12 @@ from .budget import (
     requested_budget,
 )
 from .formalization import check_formalization, load_policy
+from .execution_backends import (
+    DEFAULT_BACKEND_PREFERENCE,
+    ExecutionPlan,
+    ExecutionRequest,
+    build_execution_plan,
+)
 from .git_state import git_state, git_tracked_state
 from .hashing import (
     atomic_write_bytes,
@@ -83,26 +89,34 @@ _REPRODUCIBILITY_ENVIRONMENT_KEYS = (
     "CONDA_DEFAULT_ENV",
     "CONDA_PREFIX",
     "CUDA_VISIBLE_DEVICES",
+    "HIP_VISIBLE_DEVICES",
     "JAX_PLATFORM_NAME",
     "JAX_PLATFORMS",
     "NVIDIA_VISIBLE_DEVICES",
+    "ONEAPI_DEVICE_SELECTOR",
     "OMP_NUM_THREADS",
     "PYTHONHASHSEED",
+    "ROCR_VISIBLE_DEVICES",
     "VIRTUAL_ENV",
     "XLA_FLAGS",
+    "ZE_AFFINITY_MASK",
 )
 _CAPSULE_ENVIRONMENT_KEYS = frozenset(
     {
         "CUDA_VISIBLE_DEVICES",
+        "HIP_VISIBLE_DEVICES",
         "JAX_PLATFORM_NAME",
         "JAX_PLATFORMS",
         "LANG",
         "LC_ALL",
         "NVIDIA_VISIBLE_DEVICES",
+        "ONEAPI_DEVICE_SELECTOR",
         "OMP_NUM_THREADS",
         "PATH",
         "PYTHONHASHSEED",
+        "ROCR_VISIBLE_DEVICES",
         "XLA_FLAGS",
+        "ZE_AFFINITY_MASK",
     }
 )
 
@@ -1048,12 +1062,6 @@ def _environment_record(
     }
 
 
-def _sandbox_literal(path: Path) -> str:
-    """Quote one canonical path for a macOS sandbox profile."""
-
-    return json.dumps(str(path.resolve(strict=False)))
-
-
 def _capsule_environment(capsule_home: Path) -> dict[str, str]:
     """Build the complete child environment; do not inherit hidden channels."""
 
@@ -1069,6 +1077,88 @@ def _capsule_environment(capsule_home: Path) -> dict[str, str]:
     return environment
 
 
+def _command_executable(configured_cwd: Path, command: Sequence[str]) -> Path:
+    raw = Path(command[0])
+    if raw.is_absolute():
+        executable = raw
+    elif len(raw.parts) > 1:
+        executable = configured_cwd / raw
+    else:
+        resolved = shutil.which(command[0])
+        if resolved is None:
+            raise ValidationError(f"Run executable is not available: {command[0]!r}")
+        executable = Path(resolved)
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        raise ValidationError(f"Run executable is not available: {command[0]!r}")
+    return executable.resolve(strict=True)
+
+
+def _capsule_plan(
+    *,
+    root: Path,
+    configured_cwd: Path,
+    profile: dict[str, Any],
+    command: list[str],
+    inputs: Sequence[tuple[Path, dict[str, Any]]],
+    output_paths: Sequence[str | os.PathLike[str]] | None,
+    capsule_home: Path,
+    execution_backend: str = "auto",
+) -> ExecutionPlan:
+    """Build a probed, OS-enforced execution plan without allocating a Run."""
+
+    executable_path = _command_executable(configured_cwd, command)
+    runtime_prefix = Path(sys.prefix).resolve(strict=False)
+    read_subpaths = [runtime_prefix]
+    for raw in profile.get("source_roots", []):
+        read_subpaths.append(_user_path(root, str(raw)))
+    execution_profile = profile.get("execution", {})
+    if not isinstance(execution_profile, dict):
+        raise ValidationError("repository profile execution must be an object")
+    for raw in execution_profile.get("trusted_read_only_paths", []):
+        path = _user_path(root, str(raw))
+        if not path.exists():
+            raise ValidationError(
+                f"configured trusted runtime path does not exist on this host: {raw!r}"
+            )
+        read_subpaths.append(path)
+    read_literals = [path for path, _ in inputs]
+    for argument in command[1:]:
+        read_literals.extend(_argument_file_candidates(configured_cwd, argument))
+    read_literals.append(executable_path)
+
+    writes = [_user_path(root, raw) for raw in output_paths or ()]
+    preference = execution_profile.get(
+        "backend_preference", list(DEFAULT_BACKEND_PREFERENCE)
+    )
+    if not isinstance(preference, list) or any(
+        not isinstance(item, str) for item in preference
+    ):
+        raise ValidationError(
+            "repository profile execution.backend_preference must be an array of strings"
+        )
+    environment = _capsule_environment(capsule_home)
+    inner_command = [str(executable_path), *command[1:]]
+    return build_execution_plan(
+        ExecutionRequest(
+            root=root.resolve(),
+            configured_cwd=configured_cwd.resolve(),
+            command=tuple(inner_command),
+            executable=executable_path,
+            environment=environment,
+            environment_allowlist=tuple(sorted(_CAPSULE_ENVIRONMENT_KEYS)),
+            capsule_home=capsule_home.resolve(),
+            object_root=_user_path(root, str(profile["object_root"])).resolve(
+                strict=False
+            ),
+            read_subpaths=tuple(read_subpaths),
+            read_literals=tuple(read_literals),
+            outputs=tuple(writes),
+        ),
+        backend=execution_backend,
+        preference=preference,
+    )
+
+
 def _capsule_command(
     *,
     root: Path,
@@ -1078,76 +1168,21 @@ def _capsule_command(
     inputs: Sequence[tuple[Path, dict[str, Any]]],
     output_paths: Sequence[str | os.PathLike[str]] | None,
     capsule_home: Path,
+    execution_backend: str = "auto",
 ) -> tuple[list[str], dict[str, str], dict[str, Any]]:
-    """Return an OS-enforced, fail-closed execution boundary.
+    """Compatibility wrapper returning the command-facing parts of a plan."""
 
-    macOS Seatbelt is currently the supported backend.  Unsupported hosts fail
-    before starting the scientific command instead of silently degrading to
-    endpoint observation.
-    """
-
-    sandbox = shutil.which("sandbox-exec")
-    if platform.system() != "Darwin" or sandbox is None:
-        raise ValidationError(
-            "sealed Run execution requires a supported isolation backend; "
-            "this host has no macOS sandbox-exec backend"
-        )
-    executable = shutil.which(command[0]) if not Path(command[0]).is_absolute() else command[0]
-    if executable is None:
-        raise ValidationError(f"Run executable is not available: {command[0]!r}")
-
-    read_subpaths = [Path("/System"), Path("/usr/lib"), Path("/dev")]
-    executable_path = Path(executable).resolve(strict=False)
-    runtime_prefix = Path(sys.prefix).resolve(strict=False)
-    read_subpaths.append(runtime_prefix)
-    for raw in profile.get("source_roots", []):
-        read_subpaths.append(_user_path(root, str(raw)))
-    read_literals = [path for path, _ in inputs]
-    for argument in command[1:]:
-        read_literals.extend(_argument_file_candidates(configured_cwd, argument))
-    read_literals.append(executable_path)
-
-    writes = [_user_path(root, raw) for raw in output_paths or ()]
-    profile_lines = [
-        "(version 1)",
-        "(deny default)",
-        "(allow process*)",
-        "(allow signal (target self))",
-        "(allow sysctl-read)",
-        "(allow mach-lookup)",
-        "(allow file-read-metadata)",
-    ]
-    for path in sorted({item.resolve(strict=False) for item in read_subpaths}):
-        profile_lines.append(f"(allow file-read* (subpath {_sandbox_literal(path)}))")
-    for path in sorted({item.resolve(strict=False) for item in read_literals}):
-        profile_lines.append(f"(allow file-read* (literal {_sandbox_literal(path)}))")
-    profile_lines.append(
-        f"(allow file-read* file-write* (subpath {_sandbox_literal(capsule_home)}))"
+    plan = _capsule_plan(
+        root=root,
+        configured_cwd=configured_cwd,
+        profile=profile,
+        command=command,
+        inputs=inputs,
+        output_paths=output_paths,
+        capsule_home=capsule_home,
+        execution_backend=execution_backend,
     )
-    for path in sorted({item.resolve(strict=False) for item in writes}):
-        profile_lines.append(f"(allow file-read* file-write* (literal {_sandbox_literal(path)}))")
-    sandbox_profile = "\n".join(profile_lines) + "\n"
-    profile_path = capsule_home / "sandbox.sb"
-    atomic_write_bytes(profile_path, sandbox_profile.encode("utf-8"), mode=0o400)
-    environment = _capsule_environment(capsule_home)
-    boundary = {
-        "mode": "sealed",
-        "backend": "macos-seatbelt",
-        "policy_sha256": sha256_bytes(sandbox_profile.encode("utf-8")),
-        "environment_allowlist": sorted(_CAPSULE_ENVIRONMENT_KEYS),
-        "network_access": False,
-        "repository_write_access": False,
-        "declared_inputs_only": True,
-        "declared_outputs_only": True,
-        "read_only_paths": sorted(
-            str(path.resolve(strict=False))
-            for path in {*read_subpaths, *read_literals}
-        ),
-        "writable_paths": sorted(
-            str(path.resolve(strict=False)) for path in writes
-        ),
-    }
-    return [sandbox, "-f", str(profile_path), "--", *command], environment, boundary
+    return plan.argv, plan.environment, plan.boundary
 
 
 def _input_records(
@@ -1594,6 +1629,7 @@ def execute_run(
     confirmation_id: str | None = None,
     confirmation_slot: str | None = None,
     sealed: bool = True,
+    execution_backend: str = "auto",
 ) -> dict[str, Any]:
     """Execute ``argv`` and atomically seal its immutable Run manifest."""
     if not isinstance(argv, list) or not argv:
@@ -1604,6 +1640,8 @@ def execute_run(
         raise ValidationError("purpose must be a non-empty string")
     if isinstance(seed, bool) or not isinstance(seed, (int, str, type(None))):
         raise ValidationError("seed must be an integer, string, or null")
+    if not isinstance(execution_backend, str) or not execution_backend:
+        raise ValidationError("execution_backend must be a non-empty string")
     if epistemic_mode not in ("exploratory", "confirmatory"):
         raise ValidationError(
             "epistemic_mode must be 'exploratory' or 'confirmatory'"
@@ -1706,11 +1744,10 @@ def execute_run(
             "unsealed Run execution is not accepted: endpoint hashes do not "
             "establish a complete computation boundary"
         )
-    capsule_home = Path(tempfile.mkdtemp(prefix="studyctl-capsule-"))
-    (capsule_home / "tmp").mkdir(mode=0o700)
     sealed_command: list[str] | None = None
     child_environment: dict[str, str] | None = None
     execution_boundary: dict[str, Any] | None = None
+    execution_plan: ExecutionPlan | None = None
 
     # Budget check, reservation, Run-ID allocation, and the initial Manifest
     # are one serialized registration transaction.  No child process can
@@ -1840,15 +1877,25 @@ def execute_run(
             runtime_environment,
         )
         inputs = _input_records(root, input_paths)
-        sealed_command, child_environment, execution_boundary = _capsule_command(
-            root=root,
-            configured_cwd=configured_cwd,
-            profile=profile,
-            command=command,
-            inputs=inputs,
-            output_paths=output_paths,
-            capsule_home=capsule_home,
-        )
+        capsule_home = Path(tempfile.mkdtemp(prefix="studyctl-capsule-"))
+        (capsule_home / "tmp").mkdir(mode=0o700)
+        try:
+            execution_plan = _capsule_plan(
+                root=root,
+                configured_cwd=configured_cwd,
+                profile=profile,
+                command=command,
+                inputs=inputs,
+                output_paths=output_paths,
+                capsule_home=capsule_home,
+                execution_backend=execution_backend,
+            )
+        except BaseException:
+            shutil.rmtree(capsule_home, ignore_errors=True)
+            raise
+        sealed_command = execution_plan.argv
+        child_environment = execution_plan.environment
+        execution_boundary = execution_plan.boundary
         git = git_state(root)
         code_state_before = _tracked_state(paths, root)
         environment = _environment_record(
@@ -2155,9 +2202,10 @@ def execute_run(
             try:
                 assert sealed_command is not None
                 assert child_environment is not None
+                assert execution_plan is not None
                 process = subprocess.Popen(
                     sealed_command,
-                    cwd=configured_cwd,
+                    cwd=execution_plan.host_cwd,
                     env=child_environment,
                     stdout=stdout_log,
                     stderr=stderr_log,
@@ -2217,6 +2265,8 @@ def execute_run(
                 _flush_log(stdout_log)
                 _flush_log(stderr_log)
 
+        if execution_plan is not None:
+            execution_plan.materialize_outputs()
         if unexpected_error is not None:
             raise unexpected_error
 

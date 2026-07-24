@@ -8,6 +8,7 @@ from typing import Any, Sequence
 
 from .checkpoint_sequence import empty_checkpoint_sequence, write_checkpoint_sequence
 from .evidence_sequence import empty_evidence_sequence, write_evidence_sequence
+from .execution_backends import SUPPORTED_EXECUTION_BACKENDS
 from .observation_sequence import (
     empty_observation_sequence,
     write_observation_sequence,
@@ -257,6 +258,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--hardware-class")
     run.add_argument("--precision")
     run.add_argument("--cohort-field", action="append", default=[])
+    run.add_argument(
+        "--execution-backend",
+        choices=("auto", *SUPPORTED_EXECUTION_BACKENDS),
+        default="auto",
+        help="sealed execution backend; auto follows repository-profile preference",
+    )
     # ``+`` lets argparse continue recognizing Run options after STUDY_ID;
     # the explicit ``--`` then terminates studyctl parsing and preserves every
     # remaining command argument literally.
@@ -509,6 +516,7 @@ def dispatch(args: argparse.Namespace) -> int:
             hardware_class=args.hardware_class,
             precision=args.precision,
             cohort_fields=args.cohort_field,
+            execution_backend=args.execution_backend,
         )
         _print_json({"run_id": manifest["run_id"], "status": manifest["status"], "exit_code": manifest["execution"]["exit_code"]})
         status = manifest["status"]

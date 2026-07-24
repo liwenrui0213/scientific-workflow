@@ -232,14 +232,29 @@ Claim 版本的后续 Confirmation 会自动串入同一 campaign；前序 slot 
 其无效原因。Evidence 自动重建整个 campaign，遗漏旧失败或中断尝试会失败关闭。
 旧 Evidence 保持不可变，但 campaign 扩展后不能单独维持
 `numerically_supported`，直到新 Evidence 覆盖当前完整历史。旧 Run 或 exploratory
-Run 永远不能通过改标签升级为 confirmatory。Run 子进程在 macOS Seatbelt
-边界中运行：环境变量使用白名单重新构造，仓库写入被拒绝，只能写入声明的输出与
-私有临时目录，并禁止网络访问；读白名单之外的隐藏路径不可见。Manifest 的
-`execution_boundary` 记录隔离后端与策略哈希；缺少这一强制边界的 Run 不能进入
-Evidence。当前实现要求 macOS Seatbelt (`sandbox-exec`)；不支持的主机会在启动
-科学命令前失败关闭，不会退化为仅比较运行前后哈希。它还不是完整的内容寻址
-capsule：profile `source_roots`、Python/runtime 与部分系统服务仍是受信任的可读
-环境，完整策略也没有随 Run 保存，依赖和外部程序尚未逐项内容固定。
+Run 永远不能通过改标签升级为 confirmatory。Run 子进程通过可插拔的密封执行
+后端运行：macOS 使用 Seatbelt (`sandbox-exec`)，Linux/集群节点使用
+Bubblewrap (`bwrap`)。环境变量使用白名单重新构造，仓库写入被拒绝，只允许保留
+声明的输出，并禁止网络访问；读白名单之外的隐藏路径不可见。Linux 后端把
+`object_root` 映射到私有 staging，命令结束后只复制声明的常规文件，因此程序即使
+创建未声明的临时结果也不能把它们写入宿主仓库。Manifest 的
+`execution_boundary` 记录后端、版本、策略格式与哈希、环境哈希及访问声明；缺少
+这一强制边界的 Run 不能进入 Evidence。后端会在 Run ID 与预算分配前进行能力
+探测；工具缺失、Linux 所需 namespace 能力不可用（非 setuid 安装通常需要
+unprivileged user namespace）或 macOS 嵌套 Seatbelt 不可用时均失败关闭，不会
+退化为仅比较运行前后哈希。
+
+仓库 profile 的 `execution.backend_preference` 决定自动探测顺序；也可在单次运行
+中传入 `--execution-backend linux-bubblewrap` 或
+`--execution-backend macos-seatbelt`。Linux GPU 节点只在标准的
+CUDA/NVIDIA、HIP/ROCm 或 oneAPI 可见性变量声明设备选择时，才把相应
+NVIDIA、DRI 或 KFD 设备加入边界；宿主调度器的 device cgroup/权限仍是分配
+边界。额外的编译器、MPI、CUDA 或 module
+运行时目录必须由受保护 profile 的 `execution.trusted_read_only_paths` 明确
+列出。它仍不是完整的内容寻址 capsule：profile `source_roots`、Python/runtime、
+受信任系统路径和显式 runtime 路径仍是可读环境，依赖与外部程序尚未逐项内容
+固定。Slurm/PBS 用户应在已分配的计算节点内运行 `studyctl run`；V1 后端不负责
+提交异步调度任务。
 
 Brief 中可见的 `STUDYCTL-HARD-BUDGET` JSON 块是唯一的数值预算权威。
 `null` 与数值 `0` 都不授权任何正用量；GPU-hour、CPU-hour 和存储预算

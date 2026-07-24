@@ -371,7 +371,7 @@ class CheckpointClaimIntegrityTests(WorkflowTestCase):
         retained = {item["path"]: item for item in after["retained"]}
         self.assertEqual(
             retained[output]["reason"],
-            "Run is referenced by Evidence, Claim, or Verdict",
+            "Run is referenced by Observation, Evidence, Claim, or Verdict",
         )
 
 

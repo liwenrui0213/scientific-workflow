@@ -145,6 +145,25 @@ class RepositoryAdaptationTests(WorkflowTestCase):
             ("missing cwd", lambda item: item.__setitem__("run_cwd", "missing-project"), "must exist"),
             ("unignored object root", lambda item: item.__setitem__("object_root", "visible-objects"), "must be ignored"),
             (
+                "source exposes object store",
+                lambda item: item.__setitem__("source_roots", [".objects"]),
+                "source_roots and object_root must not overlap",
+            ),
+            (
+                "trusted host root",
+                lambda item: item["execution"].__setitem__(
+                    "trusted_read_only_paths", ["/"]
+                ),
+                "entire host filesystem",
+            ),
+            (
+                "unsupported backend",
+                lambda item: item["execution"].__setitem__(
+                    "backend_preference", ["endpoint-only"]
+                ),
+                "is not in",
+            ),
+            (
                 "shell command string",
                 lambda item: item.__setitem__("commands", {"test": "python -m unittest"}),
                 "argv array",

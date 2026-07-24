@@ -85,12 +85,24 @@
       ],
       "properties": {
         "mode": {"const": "sealed"},
-        "backend": {"enum": ["macos-seatbelt"]},
+        "backend": {"enum": ["linux-bubblewrap", "macos-seatbelt"]},
+        "backend_version": {"type": "string", "minLength": 1, "maxLength": 256},
+        "policy_format": {
+          "enum": ["bubblewrap-mount-policy-v1", "seatbelt-profile-v1"]
+        },
         "policy_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
         "environment_allowlist": {
           "type": "array",
           "uniqueItems": true,
           "items": {"type": "string", "minLength": 1}
+        },
+        "environment_variables": {
+          "type": "object",
+          "propertyNames": {"type": "string", "minLength": 1},
+          "additionalProperties": {"type": "string"}
+        },
+        "environment_sha256": {
+          "type": "string", "pattern": "^[0-9a-f]{64}$"
         },
         "network_access": {"const": false},
         "repository_write_access": {"const": false},
@@ -103,8 +115,45 @@
         "writable_paths": {
           "type": "array", "uniqueItems": true,
           "items": {"type": "string", "minLength": 1}
+        },
+        "output_staging": {"enum": ["direct", "private-copy-out"]},
+        "device_paths": {
+          "type": "array", "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
         }
       },
+      "allOf": [
+        {
+          "if": {
+            "properties": {"backend": {"const": "linux-bubblewrap"}},
+            "required": ["backend"]
+          },
+          "then": {
+            "required": [
+              "backend_version", "policy_format", "output_staging", "device_paths",
+              "environment_variables", "environment_sha256"
+            ],
+            "properties": {
+              "policy_format": {"const": "bubblewrap-mount-policy-v1"},
+              "output_staging": {"const": "private-copy-out"}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "backend": {"const": "macos-seatbelt"},
+              "policy_format": {"type": "string"}
+            },
+            "required": ["backend", "policy_format"]
+          },
+          "then": {
+            "properties": {
+              "policy_format": {"const": "seatbelt-profile-v1"}
+            }
+          }
+        }
+      ],
       "additionalProperties": false
     },
     "git": {

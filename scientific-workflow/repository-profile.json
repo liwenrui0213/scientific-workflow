@@ -34,6 +34,13 @@
     "**/__pycache__/**"
   ],
   "vendor_patterns": [],
+  "execution": {
+    "backend_preference": [
+      "linux-bubblewrap",
+      "macos-seatbelt"
+    ],
+    "trusted_read_only_paths": []
+  },
   "commands": {
     "full_validation": [
       "python",

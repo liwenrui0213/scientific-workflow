@@ -7,15 +7,22 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from typing import Any
 
 from tools.studyctl.approval import approve_brief
 from tools.studyctl.budget import replace_brief_hard_budget
 from tools.studyctl.cli import initialize_study
 from tools.studyctl.evidence import create_evidence_draft, finalize_evidence
-from tools.studyctl.hashing import atomic_write_json, load_json, sha256_file
+from tools.studyctl.execution_backends import ExecutionPlan
+from tools.studyctl.hashing import (
+    atomic_write_json,
+    load_json,
+    sha256_file,
+    sha256_json,
+)
 from tools.studyctl.models import StudyPaths, study_paths, utc_now
-from tools.studyctl.run_registry import execute_run
+from tools.studyctl.run_registry import _capsule_environment, execute_run
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -53,9 +60,63 @@ class WorkflowTestCase(unittest.TestCase):
         (self.root / ".gitignore").write_text("__pycache__/\n*.py[cod]\n", encoding="utf-8")
         self.initialize_git()
         self.commit_all("initialize workflow fixture")
+        # Integration tests exercise Run lifecycle and provenance independent
+        # of host sandbox availability. Backend enforcement itself is covered
+        # by test_sealed_execution_boundary with real policy assertions.
+        self._backend_patcher = patch(
+            "tools.studyctl.run_registry._capsule_plan",
+            side_effect=self._test_execution_plan,
+        )
+        self._backend_patcher.start()
 
     def tearDown(self) -> None:
+        self._backend_patcher.stop()
         self._temporary.cleanup()
+
+    @staticmethod
+    def _test_execution_plan(**kwargs: Any) -> ExecutionPlan:
+        root = Path(kwargs["root"]).resolve()
+        configured_cwd = Path(kwargs["configured_cwd"]).resolve()
+        capsule_home = Path(kwargs["capsule_home"]).resolve()
+        command = list(kwargs["command"])
+        outputs = [
+            (Path(raw) if Path(raw).is_absolute() else root / Path(raw)).resolve(
+                strict=False
+            )
+            for raw in kwargs.get("output_paths") or ()
+        ]
+        environment = _capsule_environment(capsule_home)
+        portable_environment = dict(environment)
+        portable_environment["HOME"] = "${CAPSULE_HOME}"
+        portable_environment["TMPDIR"] = "${CAPSULE_HOME}/tmp"
+        policy = {
+            "kind": "integration-test-double",
+            "outputs": [str(path) for path in outputs],
+        }
+        boundary = {
+            "mode": "sealed",
+            "backend": "macos-seatbelt",
+            "backend_version": "integration-test-double",
+            "policy_format": "seatbelt-profile-v1",
+            "policy_sha256": sha256_json(policy),
+            "environment_allowlist": [],
+            "environment_variables": portable_environment,
+            "environment_sha256": sha256_json(portable_environment),
+            "network_access": False,
+            "repository_write_access": False,
+            "declared_inputs_only": True,
+            "declared_outputs_only": True,
+            "read_only_paths": [],
+            "writable_paths": [str(path) for path in outputs],
+            "output_staging": "direct",
+            "device_paths": [],
+        }
+        return ExecutionPlan(
+            argv=command,
+            environment=environment,
+            boundary=boundary,
+            host_cwd=configured_cwd,
+        )
 
     def initialize(self, study_id: str | None = None) -> StudyPaths:
         selected = study_id or self.study_id

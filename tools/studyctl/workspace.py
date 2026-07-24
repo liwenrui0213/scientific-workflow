@@ -65,6 +65,26 @@ def _validate_pattern(value: str, *, label: str) -> str:
     return _normalize_relative(value, label=label, allow_glob=True)
 
 
+def _normalize_trusted_runtime_path(value: str, *, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError(f"{label} must be a non-empty path")
+    if "\x00" in value:
+        raise ValidationError(f"{label} must not contain a NUL byte")
+    if "\\" in value:
+        raise ValidationError(f"{label} must use POSIX '/' separators")
+    normalized = value.strip()
+    path = PurePosixPath(normalized)
+    if any(part == ".." for part in path.parts):
+        raise ValidationError(f"{label} must not contain '..': {value!r}")
+    if path.is_absolute():
+        if path == PurePosixPath("/"):
+            raise ValidationError(
+                f"{label} must not expose the entire host filesystem"
+            )
+        return str(path)
+    return _normalize_relative(normalized, label=label)
+
+
 def _normalize_git_path(value: str) -> str:
     """Validate a Git-reported POSIX path without changing legal filename bytes."""
     if not isinstance(value, str) or value == "":
@@ -165,6 +185,15 @@ def _normalized_profile(value: dict[str, Any]) -> dict[str, Any]:
             _validate_pattern(item, label=f"repository profile {key} item")
             for item in profile[key]
         ]
+    execution = profile.get("execution")
+    if isinstance(execution, dict):
+        execution["trusted_read_only_paths"] = [
+            _normalize_trusted_runtime_path(
+                item,
+                label="repository profile execution trusted_read_only_paths item",
+            )
+            for item in execution.get("trusted_read_only_paths", [])
+        ]
     return profile
 
 
@@ -248,6 +277,48 @@ def repository_profile_issues(root: Path) -> list[ValidationIssue]:
             if len(normalized_values) != len(set(normalized_values)):
                 raise ValidationError(f"repository profile {key} must not contain duplicates")
             normalized_lists[key] = normalized_values
+        for source_root in normalized_lists["source_roots"]:
+            if _under_root(source_root, object_root) or _under_root(
+                object_root, source_root
+            ):
+                raise ValidationError(
+                    "repository profile source_roots and object_root must not overlap"
+                )
+        execution = value.get("execution")
+        if isinstance(execution, dict):
+            trusted_paths = [
+                _normalize_trusted_runtime_path(
+                    item,
+                    label=(
+                        "repository profile execution "
+                        "trusted_read_only_paths item"
+                    ),
+                )
+                for item in execution.get("trusted_read_only_paths", [])
+            ]
+            if len(trusted_paths) != len(set(trusted_paths)):
+                raise ValidationError(
+                    "repository profile execution trusted_read_only_paths "
+                    "must not contain duplicates"
+                )
+            for trusted in trusted_paths:
+                trusted_path = Path(trusted)
+                if trusted_path.is_absolute():
+                    resolved_trusted = trusted_path.resolve(strict=False)
+                    resolved_object = (root / object_root).resolve(strict=False)
+                    if resolved_object == resolved_trusted or resolved_object.is_relative_to(
+                        resolved_trusted
+                    ):
+                        raise ValidationError(
+                            "trusted runtime paths must not expose object_root"
+                        )
+                elif (
+                    _under_root(trusted, object_root)
+                    or _under_root(object_root, trusted)
+                ):
+                    raise ValidationError(
+                        "trusted runtime paths must not overlap object_root"
+                    )
         for key in (
             "scientific_critical_patterns",
             "protected_patterns",
