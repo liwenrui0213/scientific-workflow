@@ -17,6 +17,14 @@ from tools.studyctl.compaction import (
 )
 from tools.studyctl.evidence import create_evidence_draft
 from tools.studyctl.gc import garbage_collection_report
+from tools.studyctl.graph_record_sequence import (
+    empty_graph_record_sequence,
+    write_graph_record_sequence,
+)
+from tools.studyctl.graph_records import (
+    create_experiment_intent_draft,
+    finalize_experiment_intent,
+)
 from tools.studyctl.hashing import (
     atomic_write_json,
     load_json,
@@ -95,17 +103,33 @@ class CompactionTests(_CompactionPlanMixin, WorkflowTestCase):
         ):
             finalize_compaction(paths, plan)
 
-    def test_prepare_rejects_blocked_host_change_scope(self) -> None:
+    def test_blocked_host_change_scope_is_snapshotted_without_authorizing_it(
+        self,
+    ) -> None:
         paths = self.initialize_approved_with_claim()
         rogue = self.root / "unclassified-host-change.txt"
         rogue.write_text("not authorized by a CHANGESET\n", encoding="utf-8")
 
-        with self.assertRaisesRegex(
-            ValidationError,
-            "host repository change scope is BLOCKED",
-        ):
-            prepare_compaction(paths)
-        self.assertFalse((paths.generated / "COMPACTION_INPUT.json").exists())
+        prepared = load_json(prepare_compaction(paths))
+        self.assertEqual(prepared["host_change_scope"]["outcome"], "BLOCKED")
+        self.assertEqual(
+            [
+                item["path"]
+                for item in prepared["host_change_scope"]["consequential_paths"][
+                    "items"
+                ]
+            ],
+            [rogue.name],
+        )
+        plan = self.write_compaction_plan(
+            paths,
+            [],
+            name="blocked-host-scope-plan.json",
+        )
+        checkpoint = load_json(finalize_compaction(paths, plan))
+
+        self.assertEqual(checkpoint["host_change_scope"]["outcome"], "BLOCKED")
+        self.assertTrue(rogue.is_file())
 
     def test_prepare_records_profile_host_scope_and_active_work_bindings(self) -> None:
         paths = self.initialize_approved_with_claim()
@@ -404,7 +428,10 @@ class CompactionTests(_CompactionPlanMixin, WorkflowTestCase):
             encoding="utf-8",
         )
 
-        with self.assertRaisesRegex(ValidationError, "change scope is BLOCKED"):
+        with self.assertRaisesRegex(
+            ValidationError,
+            "host consequential change scope changed after compact-prepare",
+        ):
             finalize_compaction(paths, plan)
         self.assertEqual(list(paths.checkpoints.glob("CHECKPOINT-*.json")), [])
 
@@ -465,16 +492,21 @@ class CompactionTests(_CompactionPlanMixin, WorkflowTestCase):
             state["active_work_inventory_sha256"],
         )
 
-    def test_checkpoint_hash_pins_representative_failed_direction(self) -> None:
+    def test_checkpoint_hash_pins_representative_failed_run(self) -> None:
         paths = self.initialize_approved_with_claim()
-        failure = paths.study / "failed-directions" / "unstable-method.md"
-        failure.write_text("Representative failed direction.\n", encoding="utf-8")
-        failure_ref = failure.relative_to(paths.root).as_posix()
+        failure = execute_run(
+            paths,
+            argv=[sys.executable, "-c", "raise SystemExit(7)"],
+            purpose="preserve one failed attempt",
+            hardware_class="test-cpu",
+            precision="exact-integer",
+        )
+        self.assertEqual(failure["status"], "failed")
         plan = self.write_compaction_plan(
             paths,
             [],
-            name="failed-direction-plan.json",
-            representative_failures=[failure_ref],
+            name="failed-run-plan.json",
+            representative_failures=[failure["run_id"]],
         )
         checkpoint_path = finalize_compaction(paths, plan)
         checkpoint = load_json(checkpoint_path)
@@ -482,17 +514,63 @@ class CompactionTests(_CompactionPlanMixin, WorkflowTestCase):
             checkpoint["representative_failures"],
             [
                 {
-                    "kind": "failed_direction",
-                    "path": failure_ref,
-                    "size": failure.stat().st_size,
-                    "sha256": sha256_file(failure),
+                    "kind": "run",
+                    "run_id": failure["run_id"],
+                    "manifest_sha256": failure["integrity"]["manifest_sha256"],
                 }
             ],
         )
+        self.assertEqual(
+            [issue for issue in validate_study(paths) if issue.level == "ERROR"],
+            [],
+        )
+        self.assertEqual(
+            checkpoint["graph_record_sequence"],
+            load_json(paths.generated / "COMPACTION_INPUT.json")["graph_records"][
+                "sequence"
+            ],
+        )
 
-        failure.write_text("Mutated failed direction.\n", encoding="utf-8")
-        errors = [issue.message for issue in validate_study(paths) if issue.level == "ERROR"]
-        self.assertIn("representative failed-direction hash/size is stale", errors)
+    def test_checkpoint_prevents_graph_record_history_rollback(self) -> None:
+        paths = self.initialize_approved_with_claim()
+        draft_path = create_experiment_intent_draft(
+            paths,
+            "INTENT-0001",
+            evidence_gap_id="GAP-0001",
+            evidence_gap="The Claim lacks a recorded observation.",
+            objective="Produce one exact observation.",
+            requested_observations=["fixture_value"],
+            evidence_requirements=[],
+            claim_id="CLAIM-0001",
+        )
+        intent_path = finalize_experiment_intent(paths, draft_path)
+        plan = self.write_compaction_plan(
+            paths,
+            [],
+            name="graph-history-plan.json",
+        )
+        checkpoint = load_json(finalize_compaction(paths, plan))
+        self.assertEqual(
+            checkpoint["graph_record_sequence"]["high_water_mark"],
+            1,
+        )
+
+        intent_path.unlink()
+        write_graph_record_sequence(
+            paths,
+            empty_graph_record_sequence(paths),
+        )
+
+        messages = [
+            issue.message
+            for issue in validate_study(paths)
+            if issue.level == "ERROR"
+        ]
+        self.assertIn(
+            "Graph-record sequence high_water_mark is below Checkpoint "
+            f"{checkpoint['checkpoint_id']} watermark 1",
+            messages,
+        )
 
     def test_unassigned_cohorts_are_grouped_by_fingerprint(self) -> None:
         paths = self.initialize_approved_with_claim()
@@ -803,6 +881,29 @@ class ReviewTests(_CompactionPlanMixin, WorkflowTestCase):
                 },
                 {"kind": "claim", "claim_id": "CLAIM-0001"},
                 {"kind": "run", "run_id": "RUN-000001"},
+                {
+                    "kind": "experiment_intent",
+                    "intent_id": "INTENT-0001",
+                    "version": 1,
+                    "sha256": "1" * 64,
+                },
+                {
+                    "kind": "control_graph",
+                    "control_graph_id": "CG-0001",
+                    "version": 1,
+                    "sha256": "2" * 64,
+                },
+                {
+                    "kind": "observation",
+                    "observation_id": "OBS-0001",
+                    "version": 1,
+                    "sha256": "3" * 64,
+                },
+                {
+                    "kind": "artifact",
+                    "path": ".objects/result.bin",
+                    "sha256": "4" * 64,
+                },
                 {"kind": "evidence", "evidence_id": "EVID-0001"},
                 {"kind": "checkpoint", "checkpoint_id": "CHECKPOINT-000001"},
                 {"kind": "commit", "commit": "0123456789abcdef"},
@@ -938,6 +1039,28 @@ class ReviewTests(_CompactionPlanMixin, WorkflowTestCase):
         self.assertIn("file: path=tools/example.py, symbol=compute_result, line=12", rendered)
         self.assertIn("claim: claim_id=CLAIM-0001", rendered)
         self.assertIn("run: run_id=RUN-000001", rendered)
+        self.assertIn(
+            "experiment_intent: sha256="
+            + "1" * 64
+            + ", intent_id=INTENT-0001, version=1",
+            rendered,
+        )
+        self.assertIn(
+            "control_graph: sha256="
+            + "2" * 64
+            + ", control_graph_id=CG-0001, version=1",
+            rendered,
+        )
+        self.assertIn(
+            "observation: sha256="
+            + "3" * 64
+            + ", observation_id=OBS-0001, version=1",
+            rendered,
+        )
+        self.assertIn(
+            "artifact: path=.objects/result.bin, sha256=" + "4" * 64,
+            rendered,
+        )
         self.assertIn("evidence: evidence_id=EVID-0001", rendered)
         self.assertIn("checkpoint: checkpoint_id=CHECKPOINT-000001", rendered)
         self.assertIn("commit: commit=0123456789abcdef", rendered)

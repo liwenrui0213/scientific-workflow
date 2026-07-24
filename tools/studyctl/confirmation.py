@@ -39,6 +39,7 @@ _CAMPAIGN_TERMINAL_RUN_STATUSES = {
 }
 _MAX_CAMPAIGN_CONFIRMATIONS = 256
 _MAX_CAMPAIGN_SLOTS = 256
+_CONFIRMATORY_RUN_SCHEMA_VERSIONS = frozenset({4, 5})
 
 
 def claim_spec_sha256(claim: dict[str, Any]) -> str:
@@ -740,6 +741,68 @@ def _finalize_analysis_plan(raw: Any) -> dict[str, Any]:
     }
 
 
+def _finalize_outcome_contract(raw: Any, slot_id: str) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ValidationError(
+            f"Confirmation slot {slot_id} requires an outcome_contract"
+        )
+    statuses = raw.get("acceptable_terminal_statuses")
+    allowed_statuses = {"succeeded", "failed", "interrupted"}
+    if (
+        not isinstance(statuses, list)
+        or not statuses
+        or any(status not in allowed_statuses for status in statuses)
+        or len(statuses) != len(set(statuses))
+    ):
+        raise ValidationError(
+            f"Confirmation slot {slot_id} requires unique acceptable terminal statuses"
+        )
+    observation_required = raw.get("observation_required")
+    if not isinstance(observation_required, bool):
+        raise ValidationError(
+            f"Confirmation slot {slot_id} outcome_contract.observation_required "
+            "must be boolean"
+        )
+    output_paths = raw.get("required_output_paths")
+    if (
+        not isinstance(output_paths, list)
+        or any(not isinstance(path, str) or not path.strip() for path in output_paths)
+        or len(output_paths) != len(set(output_paths))
+    ):
+        raise ValidationError(
+            f"Confirmation slot {slot_id} required_output_paths must be unique "
+            "non-empty strings"
+        )
+    normalized_outputs: list[str] = []
+    for raw_path in output_paths:
+        if "\x00" in raw_path:
+            raise ValidationError(
+                f"Confirmation slot {slot_id} required output contains NUL"
+            )
+        candidate = Path(raw_path)
+        if candidate.is_absolute() or ".." in candidate.parts or not candidate.parts:
+            raise ValidationError(
+                f"Confirmation slot {slot_id} required outputs must be safe "
+                "repository-relative paths"
+            )
+        normalized = candidate.as_posix()
+        if normalized in {"", "."}:
+            raise ValidationError(
+                f"Confirmation slot {slot_id} required output path is invalid"
+            )
+        normalized_outputs.append(normalized)
+    if not observation_required and not normalized_outputs:
+        raise ValidationError(
+            f"Confirmation slot {slot_id} must require an Observation or at least "
+            "one declared output Artifact"
+        )
+    return {
+        "acceptable_terminal_statuses": list(statuses),
+        "observation_required": observation_required,
+        "required_output_paths": normalized_outputs,
+    }
+
+
 def _finalize_slots(
     paths: StudyPaths,
     raw_slots: Any,
@@ -796,6 +859,9 @@ def _finalize_slots(
                 ),
                 "input_paths": input_paths,
                 "input_bindings": input_bindings,
+                "outcome_contract": _finalize_outcome_contract(
+                    raw.get("outcome_contract"), slot_id
+                ),
             }
         )
     return result
@@ -863,7 +929,7 @@ def finalize_confirmation(paths: StudyPaths, source: Path) -> Path:
         )
     campaign = _finalize_campaign_metadata(paths, claims, draft.get("campaign"))
     finalized: dict[str, Any] = {
-        "schema_version": 2,
+        "schema_version": 3,
         "study_id": paths.study_id,
         "confirmation_id": confirmation_id,
         "status": "finalized",
@@ -1131,7 +1197,8 @@ def validate_confirmation_current(
                 continue
             role = manifest.get("epistemic_role")
             if not (
-                manifest.get("schema_version") == 4
+                manifest.get("schema_version")
+                in _CONFIRMATORY_RUN_SCHEMA_VERSIONS
                 and isinstance(role, dict)
                 and role.get("mode") == "confirmatory"
                 and role.get("confirmation_id") == confirmation_id
@@ -1165,8 +1232,13 @@ def validate_confirmation_run(
     loaded = load_final_confirmation(paths, str(confirmation.get("confirmation_id", "")))
     if loaded != confirmation:
         raise ValidationError("Confirmation object does not match its immutable record")
-    if manifest.get("schema_version") != 4:
-        raise ValidationError("only Run schema V4 can represent confirmatory execution")
+    if (
+        manifest.get("schema_version")
+        not in _CONFIRMATORY_RUN_SCHEMA_VERSIONS
+    ):
+        raise ValidationError(
+            "only Run schema V4/V5 can represent confirmatory execution"
+        )
     role = manifest.get("epistemic_role")
     if not isinstance(role, dict) or role.get("mode") != "confirmatory":
         raise ValidationError("Run is not immutably marked confirmatory")
@@ -1227,6 +1299,22 @@ def validate_confirmation_run(
     )
     if normalized_run_inputs != planned_inputs:
         differing.append("input_bindings")
+    outcome_contract = slot.get("outcome_contract")
+    if confirmation.get("schema_version") == 3:
+        if not isinstance(outcome_contract, dict):
+            differing.append("outcome_contract")
+        else:
+            run_output_paths = {
+                str(item.get("path"))
+                for item in manifest.get("outputs", [])
+                if isinstance(item, dict) and isinstance(item.get("path"), str)
+            }
+            required_output_paths = outcome_contract.get("required_output_paths")
+            if (
+                not isinstance(required_output_paths, list)
+                or not set(required_output_paths).issubset(run_output_paths)
+            ):
+                differing.append("required_output_paths")
     formal_by_kind = {
         item.get("kind"): item
         for item in manifest.get("formal_artifacts", [])
@@ -1261,7 +1349,11 @@ def _slot_consumed(paths: StudyPaths, confirmation_id: str, slot_id: str) -> str
             manifest = load_json(manifest_path)
         except ValidationError:
             continue
-        if not isinstance(manifest, dict) or manifest.get("schema_version") != 4:
+        if (
+            not isinstance(manifest, dict)
+            or manifest.get("schema_version")
+            not in _CONFIRMATORY_RUN_SCHEMA_VERSIONS
+        ):
             continue
         role = manifest.get("epistemic_role")
         if (
@@ -1285,6 +1377,7 @@ def validate_confirmation_slot(
     precision: str,
     cohort_fields: dict[str, Any],
     input_paths: Sequence[str | os.PathLike[str]] | None,
+    output_paths: Sequence[str | os.PathLike[str]] | None = None,
 ) -> dict[str, str]:
     """Validate exact current execution conditions for one unused frozen slot."""
 
@@ -1309,6 +1402,25 @@ def validate_confirmation_slot(
         "input_bindings": actual_bindings,
     }
     differing = [key for key, value in comparisons.items() if slot.get(key) != value]
+    outcome_contract = slot.get("outcome_contract")
+    if confirmation.get("schema_version") == 3 and isinstance(
+        outcome_contract, dict
+    ):
+        supplied_outputs: set[str] = set()
+        repository_root = paths.root.absolute()
+        for value in output_paths or []:
+            candidate = Path(str(value))
+            absolute = candidate if candidate.is_absolute() else paths.root / candidate
+            try:
+                normalized = absolute.absolute().relative_to(
+                    repository_root
+                ).as_posix()
+            except ValueError:
+                normalized = candidate.as_posix()
+            supplied_outputs.add(normalized)
+        required_outputs = set(outcome_contract.get("required_output_paths", []))
+        if not required_outputs.issubset(supplied_outputs):
+            differing.append("required_output_paths")
     if differing:
         raise ValidationError(
             f"confirmatory Run does not match frozen slot {slot_id}: "
@@ -1394,13 +1506,16 @@ def confirmation_run_issues(
     paths: StudyPaths,
     runs: Mapping[str, tuple[Path, dict[str, Any]]],
 ) -> list[ValidationIssue]:
-    """Replay every V4 confirmatory binding, including unreferenced attempts."""
+    """Replay every V4/V5 confirmatory binding, including unreferenced attempts."""
 
     issues: list[ValidationIssue] = []
     consumed: dict[tuple[str, str], str] = {}
     loaded: dict[str, dict[str, Any]] = {}
     for run_id, (manifest_path, manifest) in sorted(runs.items()):
-        if manifest.get("schema_version") != 4:
+        if (
+            manifest.get("schema_version")
+            not in _CONFIRMATORY_RUN_SCHEMA_VERSIONS
+        ):
             continue
         role = manifest.get("epistemic_role")
         if not isinstance(role, dict) or role.get("mode") != "confirmatory":

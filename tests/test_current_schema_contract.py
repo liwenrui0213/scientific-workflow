@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 import sys
 import unittest
@@ -17,7 +18,12 @@ from tools.studyctl.graph_records import (
     finalize_control_graph,
     finalize_experiment_intent,
 )
-from tools.studyctl.hashing import atomic_write_json, load_json, sha256_file
+from tools.studyctl.hashing import (
+    atomic_write_json,
+    load_json,
+    record_digest,
+    sha256_file,
+)
 from tools.studyctl.models import (
     CHECKPOINT_SCHEMA_VERSION,
     CLAIMS_SCHEMA_VERSION,
@@ -92,17 +98,21 @@ class CurrentSchemaContractTests(WorkflowTestCase):
             claim_id="CLAIM-0001",
         )
         intent_draft = load_json(intent_draft_path)
-        intent_draft["assessment_semantics"]["criteria"] = [
-            {
-                "criterion_id": "CRIT-001",
-                "observation": "fixture_value",
-                "operator": "eq",
-                "target": 4,
-                "unit": None,
-                "on_pass": "supports",
-                "on_fail": "contradicts",
-            }
-        ]
+        intent_draft["assessment_semantics"] = {
+            "aggregation": "all_required",
+            "criteria": [
+                {
+                    "criterion_id": "CRIT-001",
+                    "observation": "fixture_value",
+                    "operator": "eq",
+                    "target": 4,
+                    "unit": None,
+                    "on_pass": "supports",
+                    "on_fail": "contradicts",
+                }
+            ],
+            "default_outcome": "inconclusive",
+        }
         intent_draft["scope"] = "The deterministic current-schema fixture."
         atomic_write_json(intent_draft_path, intent_draft)
         intent_path = finalize_experiment_intent(paths, intent_draft_path)
@@ -182,6 +192,72 @@ class CurrentSchemaContractTests(WorkflowTestCase):
                         ),
                         [issue.render() for issue in issues],
                     )
+
+    def test_checkpoint_requires_execution_context_bindings(self) -> None:
+        paths = self.initialize_approved_with_claim()
+        checkpoint_path = finalize_compaction(
+            paths,
+            self._write_compaction_plan(paths),
+        )
+        checkpoint = load_json(checkpoint_path)
+
+        for field in (
+            "repository_profile",
+            "host_change_scope",
+            "prepared_active_work_inventory_sha256",
+        ):
+            with self.subTest(field=field):
+                malformed = copy.deepcopy(checkpoint)
+                malformed.pop(field)
+                messages = [
+                    issue.message
+                    for issue in object_schema_issues(
+                        self.root,
+                        "checkpoint",
+                        checkpoint_path,
+                        malformed,
+                    )
+                ]
+                self.assertTrue(
+                    any(
+                        f"missing required property '{field}'" in message
+                        for message in messages
+                    ),
+                    messages,
+                )
+
+    def test_checkpoint_replays_current_graph_sequence_file_binding(
+        self,
+    ) -> None:
+        paths = self.initialize_approved_with_claim()
+        checkpoint_path = finalize_compaction(
+            paths,
+            self._write_compaction_plan(paths),
+        )
+        original = load_json(checkpoint_path)
+        mutations = (
+            ("path", "studies/SC-0001/forged-sequence.json",
+             "canonical Study authority"),
+            ("size", original["graph_record_sequence"]["size"] + 1,
+             "file binding differs"),
+            ("file_sha256", "0" * 64, "file binding differs"),
+        )
+
+        for field, value, expected_message in mutations:
+            with self.subTest(field=field):
+                malformed = copy.deepcopy(original)
+                malformed["graph_record_sequence"][field] = value
+                malformed["checkpoint_sha256"] = record_digest(
+                    malformed,
+                    "checkpoint_sha256",
+                )
+                atomic_write_json(checkpoint_path, malformed, mode=0o444)
+                messages = self._error_messages(paths)
+                atomic_write_json(checkpoint_path, original, mode=0o444)
+                self.assertTrue(
+                    any(expected_message in message for message in messages),
+                    messages,
+                )
 
     def test_supersession_chain_must_end_at_active_claim(self) -> None:
         paths = self.initialize_approved_with_claim()

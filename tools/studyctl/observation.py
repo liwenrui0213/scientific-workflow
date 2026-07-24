@@ -7,6 +7,10 @@ from pathlib import Path
 import re
 from typing import Any, Iterator, Sequence
 
+from .cognitive_refs import (
+    intent_refs_from_manifests,
+    validate_exact_intent_refs,
+)
 from .hashing import (
     atomic_write_json,
     load_json,
@@ -24,7 +28,13 @@ from .models import (
     require_id,
     utc_now,
 )
-from .observation_sequence import reserve_observation_creation
+from .observation_sequence import (
+    advance_finalized_observation_sequence,
+    finalized_observation_inventory,
+    recover_unindexed_observation_finalization,
+    require_consistent_observation_finalizations,
+    reserve_observation_creation,
+)
 from .observation_triggers import (
     load_bound_registry,
     load_current_registry,
@@ -266,6 +276,7 @@ def create_observation_draft(
                 "triggers": normalized_triggers,
                 "rationale": None,
             },
+            "intent_refs": intent_refs_from_manifests(paths, manifests),
             "runs": [
                 {
                     "run_id": run_id,
@@ -355,6 +366,12 @@ def validate_observation_content(
         dispositions[run_id] = str(run_ref.get("disposition"))
         manifests.append(manifest)
 
+    validate_exact_intent_refs(
+        paths,
+        item.get("intent_refs"),
+        manifests,
+        record_label="Observation",
+    )
     expected_cohorts = _cohort_refs(manifests)
     if item.get("cohorts") != expected_cohorts:
         raise ValidationError(
@@ -574,6 +591,10 @@ def finalize_observation(paths: StudyPaths, source_path: Path) -> Path:
         paths.observations / f"{observation_id}.v{version:04d}.json"
     )
     with _observation_lock(paths, observation_id):
+        previous_finalized_inventory = finalized_observation_inventory(paths)
+        require_consistent_observation_finalizations(
+            paths, previous_finalized_inventory
+        )
         current = next(
             (
                 value
@@ -638,4 +659,17 @@ def finalize_observation(paths: StudyPaths, source_path: Path) -> Path:
             mode=0o444,
             before_replace=_ensure_draft_unchanged,
         )
+        advance_finalized_observation_sequence(
+            paths,
+            previous_inventory=previous_finalized_inventory,
+        )
         return destination
+
+
+@serialized_study_authority
+def recover_observation_sequence(paths: StudyPaths) -> Path:
+    """Index one finalized Observation left by an interrupted publish."""
+
+    recover_unindexed_observation_finalization(paths)
+    require_consistent_observation_finalizations(paths)
+    return paths.observation_sequence

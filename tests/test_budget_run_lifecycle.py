@@ -287,8 +287,8 @@ class HardBudgetAndRunLifecycleTests(WorkflowTestCase):
 
         first = self._run(paths, gpu_hours=0.4)
         second = self._run(paths, gpu_hours=0.6)
-        self.assertEqual(first["schema_version"], 4)
-        self.assertEqual(second["schema_version"], 4)
+        self.assertEqual(first["schema_version"], 5)
+        self.assertEqual(second["schema_version"], 5)
         self.assertEqual(first["status"], "succeeded")
         self.assertEqual(second["status"], "succeeded")
         self.assertEqual(second["budget"]["committed_after"]["gpu_hours"], 1.0)

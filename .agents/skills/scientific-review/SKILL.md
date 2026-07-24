@@ -7,69 +7,73 @@ description: Independently review and try to falsify a Claim-to-Evidence scienti
 
 ## Authoritative inputs
 
-Start a fresh top-level session with the project `scientific-reviewer` agent or
-equivalent read-only permissions. Open `generated/REVIEW_PACKET.json` as an
-index, then inspect its referenced profile, actual Git state, CHANGESET,
-validation proof, Brief and approval, formal artifacts, source and tests, sealed
-ExperimentIntents, ControlGraphSpecs, active PLAN, Run records and Artifacts,
-Observations, Evidence versions, Claims, Checkpoint, graph-record sequence, and
-diff. Use each Run's immutable snapshots, not later live files.
+Use a fresh top-level `scientific-reviewer` session or equivalent read-only
+permissions. Treat `generated/REVIEW_PACKET.json` as an index. Inspect its
+profile, Git state and diff, CHANGESET, validation, Brief, source/tests, Runs and
+Artifacts, Observations, Evidence, Claims, logical-ledger files, and referenced
+formal records. Inspect Intent, ControlGraphSpec, and PLAN only when present or
+required by the applicable gate. Use immutable Run snapshots, not later live
+files. Checkpoints and sequences authenticate continuity but do not supply
+scientific support. In `ACTIVE_CONTEXT.json`, mutable drafts belong only under
+`workspace.graph_record_drafts`; finalized locators belong under
+`graph_records`.
 
 Read [the adversarial review rubric](references/adversarial-review-rubric.md)
 before assigning severity, Claim scope, checks, or human questions.
 
 ## Workflow
 
-1. Trace the cognitive graph from EvidenceGap through exact ExperimentIntent,
-   Observation, Evidence, and scoped Claim. Separately trace the control graph
-   through exact Intent reference, finalized ControlGraphSpec, byte-identical
-   active PLAN, source, validation, Run, and Artifact. Verify the
-   Run/Artifact-to-Observation provenance bridge.
-2. Recompute change-scope and Run eligibility from authoritative state. Re-hash
-   dependencies and snapshots. Check validation, protected conditions,
-   evaluator/split, mathematical mapping, baselines, Cohorts, uncertainty,
-   contradictions, and formalization. For promoted Observations, verify source
-   Runs, dispositions, Registry trigger, fingerprint, Cohorts, uncertainty,
-   anomalies, and failures. Challenge each Evidence inference, assumptions,
-   alternatives, and falsification conditions. For high-strength Claims, audit
-   the frozen Confirmation and every attempt, including ordering, hashes,
-   held-out freshness, slots, failures, and exclusions.
-3. Perform the smallest independent checks needed to test high-risk assertions;
-   distinguish a verified defect from a risk or unanswered question.
-4. Produce structured JSON matching `review.schema.json`. Give every material
-   finding exact source references and a proportionate recommendation.
+1. Trace each Claim backward through Claim-specific Evidence, exact Observation
+   when used, and eligible Runs/Artifacts. If Intent or PLAN exists or was
+   required, separately trace the EvidenceGap, exact Intent reference,
+   finalized graph, byte-identical PLAN, source, validation, and Run.
+2. For Run v5, inspect the independent `intent_binding` first, then distinguish
+   exact `control_binding` from `null`; active PLAN does not bind ordinary Runs.
+   Verify graph, Intent consistency, node ID, and node-spec hash.
+   Observation v3 and Evidence v5 must reproduce Intent refs derived from their
+   source Runs; Evidence must also bind the addressed Claim
+   statement/scope digest.
+3. Recompute scope and eligibility; re-hash inputs, outputs, logs, governance,
+   and formal snapshots. Check protected conditions, evaluator/split,
+   mathematical mapping, baselines, Cohorts, uncertainty, contradictions,
+   exclusions, Registry promotion, frozen outcome contracts, and complete
+   confirmation campaigns. A high-strength Claim must have bounded scope and
+   an explicit resolved/scope-limited synthesis for contradictory Evidence.
+   Challenge every inference, assumption, alternative, and falsifier. Keep
+   immutable failure facts, candidate causes, and Evidence-backed lessons
+   separate.
+4. Perform the smallest independent checks needed for high-risk assertions.
+   Report verified defects separately from risks and open questions. Produce
+   `review.schema.json`-valid JSON with exact references and proportionate
+   recommendations.
 
 ## Hard gates
 
-- Never trust generated summaries or an implementer's explanation without
-  checking their sources. Self-reported paths are context, not clean-scope proof.
-- Reject a `formal/PLAN.json` that is not the exact activated finalized
-  ControlGraphSpec, a Plan whose Intent reference is stale or inexact, or any
-  direct inference from Plan/Run completion to Claim support. The current
-  runtime lacks node-to-Run binding; do not invent node coverage.
-- Reject missing declared outputs, altered sealed records, undeclared mutable
-  Study dependencies, incompatible unproved Cohorts, and legacy V1 Runs used as
-  Evidence.
-- Do not edit scientific code, Study state, Evidence, Claims, Checkpoints,
-  generated review files, or the human Verdict.
-- If this top-level session participated in implementation or interpretation,
-  return a fresh-session handoff instead of reviewing its own work.
-- Do not equate implementation acceptance, numerical agreement, or absence of a
-  discovered counterexample with scientific acceptance.
-- Treat legacy/unbound Runs as exploratory. Reject relabeling, cherry-picked
-  slots, concealed attempts, or unlabeled mixed Evidence.
-- Reject a mutable/latest Observation reference, a stale Observation hash,
-  omitted source Run, hidden exclusion or minority observation, duplicate
-  analysis under a new ID, or any `supports`/`contradicts` semantics assigned
-  directly to an Observation.
-- Reject unregistered promotion, stale/reinterpreted Registry bindings, or an
-  extension without independent review and explicit human adoption.
+- Never trust a projection, implementation explanation, or self-reported scope
+  without its authority. Do not review your own implementation.
+- Report a gate-required missing PLAN. Reject stale/inexact PLAN bindings, but
+  do not require PLAN for ordinary work. ControlGraph v2 has open topology and
+  opaque control policies; `studyctl` does not execute the whole graph. Never
+  infer `control_binding`, graph completion, or Claim support.
+- Reject Evidence use of missing outputs, altered seals, undeclared mutable
+  dependencies, unproved Cohorts, ineligible/legacy Runs, concealed attempts,
+  or mislabeled exploratory/mixed work. Preserve failed attempts as facts.
+- Observation has no Claim assessment. Reject mutable/stale references, hidden
+  exclusions, duplicate analysis, unregistered promotion, or Registry drift.
+- Observation/Evidence sequences must match the complete finalized inventory.
+  Explicit recovery moves forward by exactly one uniquely reconstructable
+  interrupted finalization; it never deletes or rolls back history.
+- Do not edit code or Study state, and never equate implementation or numerical
+  success with scientific acceptance.
+- Verify that any Verdict binds immutable archived Review and Review Packet
+  digests, or carries an explicit no-Review waiver.
 
 ## Output and handoff
 
 Return the structured review JSON outside the repository. Hand it to a separate
 trusted write-enabled caller, which may run
-`python -m tools.studyctl review-render <STUDY_ID> --file <PATH>`; the rendered Markdown remains
-non-authoritative. Surface human questions; never record the Verdict. Only
-after explicit human selection may a separate write-enabled Agent record the
-decision. Return corrections to `scientific-study`; do not implement them here.
+`python -m tools.studyctl review-render <STUDY_ID> --file <PATH>`. Surface human
+questions but never record the Verdict. Import must archive the exact Review
+and packet that a later Verdict binds. Only explicit human selection permits a
+separate write-enabled Agent to record it. Return corrections to
+`scientific-study`; do not implement them here.

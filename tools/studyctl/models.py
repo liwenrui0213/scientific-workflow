@@ -11,13 +11,14 @@ from typing import Iterable
 
 
 SCHEMA_VERSION = 1
-OBSERVATION_SCHEMA_VERSION = 2
-EVIDENCE_SCHEMA_VERSION = 4
+OBSERVATION_SCHEMA_VERSION = 3
+EVIDENCE_SCHEMA_VERSION = 5
 CLAIMS_SCHEMA_VERSION = 3
-CHECKPOINT_SCHEMA_VERSION = 4
+CHECKPOINT_SCHEMA_VERSION = 5
 COMPACTION_PLAN_SCHEMA_VERSION = 2
-EXPERIMENT_INTENT_SCHEMA_VERSION = 1
-CONTROL_GRAPH_SCHEMA_VERSION = 1
+EXPERIMENT_INTENT_SCHEMA_VERSION = 2
+CONTROL_GRAPH_SCHEMA_VERSION = 2
+VERDICT_SCHEMA_VERSION = 2
 
 ID_PATTERNS = {
     "study": re.compile(r"^SC-[0-9]{4,}$"),
@@ -213,12 +214,6 @@ class StudyPaths:
         )
 
     @property
-    def failed_directions(self) -> Path:
-        return self._safe_study_path(
-            Path("failed-directions"), label="failed-directions directory"
-        )
-
-    @property
     def checkpoints(self) -> Path:
         return self._safe_study_path(Path("checkpoints"), label="checkpoints directory")
 
@@ -270,7 +265,6 @@ class StudyPaths:
             self.runs,
             self.observations,
             self.evidence,
-            self.failed_directions,
             self.checkpoints,
             self.generated,
             self.brief_history,

@@ -74,14 +74,14 @@ class RunEvidenceIntegrityTests(WorkflowTestCase):
         script.write_text("print(2 + 2)\n", encoding="utf-8")
         return script
 
-    def test_v4_exploratory_run_with_intact_dependencies_finalizes_evidence(self) -> None:
+    def test_v5_exploratory_run_with_intact_dependencies_finalizes_evidence(self) -> None:
         paths = self.initialize_approved_with_claim()
         manifest = self.successful_run(paths, output=".objects/result.txt")
 
         finalized_path = finalize_evidence(paths, self.populated_draft(paths, manifest))
         finalized = load_json(finalized_path)
 
-        self.assertEqual(manifest["schema_version"], 4)
+        self.assertEqual(manifest["schema_version"], 5)
         self.assertEqual(
             manifest["epistemic_role"],
             {
@@ -102,6 +102,8 @@ class RunEvidenceIntegrityTests(WorkflowTestCase):
         legacy = copy.deepcopy(manifest)
         legacy["schema_version"] = 3
         legacy.pop("epistemic_role")
+        legacy.pop("control_binding")
+        legacy.pop("intent_binding")
         legacy["integrity"]["manifest_sha256"] = nested_record_digest(
             legacy,
             "integrity",
@@ -117,7 +119,7 @@ class RunEvidenceIntegrityTests(WorkflowTestCase):
         self.assertEqual(effective_run_epistemic_mode(legacy), "exploratory")
 
         # Model an intact pre-upgrade repository: the durable ledger binds the
-        # exact historical V3 bytes, so every full-Study V4 integration branch
+        # exact historical V3 bytes, so every full-Study V5 integration branch
         # must accept the Run without manufacturing confirmatory provenance.
         atomic_write_json(manifest_path, legacy, overwrite=True, mode=0o444)
         ledger_path = paths.study / "RUNS.ledger.json"
@@ -375,6 +377,8 @@ class RunEvidenceIntegrityTests(WorkflowTestCase):
         malformed = copy.deepcopy(current)
         malformed["schema_version"] = 2
         malformed.pop("epistemic_role")
+        malformed.pop("control_binding")
+        malformed.pop("intent_binding")
         malformed["brief"].pop("snapshot")
         malformed["brief"].pop("approval_snapshot")
         malformed["budget"] = {"estimated_cpu_hours": 0.0}
@@ -635,6 +639,8 @@ class RunEvidenceIntegrityTests(WorkflowTestCase):
         legacy = copy.deepcopy(manifest)
         legacy["schema_version"] = 1
         legacy.pop("epistemic_role")
+        legacy.pop("control_binding")
+        legacy.pop("intent_binding")
         legacy.pop("execution_boundary")
         legacy.pop("change_scope")
         legacy.pop("failure")

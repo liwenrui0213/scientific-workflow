@@ -204,6 +204,50 @@ class CheckpointClaimIntegrityTests(WorkflowTestCase):
             errors,
         )
 
+    def test_archived_claim_keeps_finalized_evidence_binding_valid_after_prune(
+        self,
+    ) -> None:
+        paths = self.initialize_approved_with_claim()
+        self.add_proposed_claim(paths, "CLAIM-0002", lifecycle="active")
+        manifest = self.successful_run(paths)
+        self.finalized_supporting_evidence(
+            paths,
+            [manifest],
+            claim_id="CLAIM-0002",
+        )
+
+        claims = load_json(paths.claims)
+        retired = next(
+            claim
+            for claim in claims["claims"]
+            if claim["claim_id"] == "CLAIM-0002"
+        )
+        retired["lifecycle"] = "retired"
+        retired["updated_at"] = utc_now()
+        claims["frontier"]["claim_ids"] = ["CLAIM-0001"]
+        claims["revision"] += 1
+        claims["updated_at"] = utc_now()
+        atomic_write_json(paths.claims, claims)
+        finalize_compaction(
+            paths,
+            self.write_compaction_plan(
+                paths,
+                name="archive-evidence-claim.json",
+            ),
+        )
+
+        claims = load_json(paths.claims)
+        claims["claims"] = [
+            claim
+            for claim in claims["claims"]
+            if claim["claim_id"] != "CLAIM-0002"
+        ]
+        claims["revision"] += 1
+        claims["updated_at"] = utc_now()
+        atomic_write_json(paths.claims, claims)
+
+        self.assertEqual(self.error_messages(paths), [])
+
     def test_historical_supersession_chain_rejects_retired_successor(self) -> None:
         paths = self.initialize_approved_with_claim()
         self.add_proposed_claim(paths, "CLAIM-0002", lifecycle="active")

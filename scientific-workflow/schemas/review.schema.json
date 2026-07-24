@@ -41,12 +41,30 @@
       "type": "object",
       "required": ["kind"],
       "properties": {
-        "kind": {"enum": ["file", "commit", "run", "evidence", "claim", "brief", "checkpoint"]},
+        "kind": {
+          "enum": [
+            "file",
+            "commit",
+            "run",
+            "artifact",
+            "experiment_intent",
+            "control_graph",
+            "observation",
+            "evidence",
+            "claim",
+            "brief",
+            "checkpoint"
+          ]
+        },
         "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
         "symbol": {"type": "string", "minLength": 1},
         "line": {"type": "integer", "minimum": 1},
         "commit": {"type": "string", "minLength": 1},
         "run_id": {"type": "string", "pattern": "^RUN-[0-9]{6}$"},
+        "intent_id": {"type": "string", "pattern": "^INTENT-[0-9]{4,}$"},
+        "control_graph_id": {"type": "string", "pattern": "^CG-[0-9]{4,}$"},
+        "observation_id": {"type": "string", "pattern": "^OBS-[0-9]{4,}$"},
         "evidence_id": {"type": "string", "pattern": "^EVID-[0-9]{4,}$"},
         "version": {"type": "integer", "minimum": 1},
         "claim_id": {"type": "string", "pattern": "^CLAIM-[0-9]{4,}$"},
@@ -58,6 +76,22 @@
         {"required": ["path"], "properties": {"kind": {"const": "brief"}}},
         {"required": ["commit"], "properties": {"kind": {"const": "commit"}}},
         {"required": ["run_id"], "properties": {"kind": {"const": "run"}}},
+        {
+          "required": ["path", "sha256"],
+          "properties": {"kind": {"const": "artifact"}}
+        },
+        {
+          "required": ["intent_id", "version", "sha256"],
+          "properties": {"kind": {"const": "experiment_intent"}}
+        },
+        {
+          "required": ["control_graph_id", "version", "sha256"],
+          "properties": {"kind": {"const": "control_graph"}}
+        },
+        {
+          "required": ["observation_id", "version", "sha256"],
+          "properties": {"kind": {"const": "observation"}}
+        },
         {"required": ["evidence_id"], "properties": {"kind": {"const": "evidence"}}},
         {"required": ["claim_id"], "properties": {"kind": {"const": "claim"}}},
         {"required": ["checkpoint_id"], "properties": {"kind": {"const": "checkpoint"}}}

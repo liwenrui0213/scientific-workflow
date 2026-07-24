@@ -5,6 +5,7 @@ from contextlib import redirect_stdout
 import io
 import json
 import unittest
+from unittest.mock import patch
 from typing import Any
 
 from tests.helpers import WorkflowTestCase
@@ -26,9 +27,11 @@ from tools.studyctl.models import COMPACTION_PLAN_SCHEMA_VERSION, ValidationErro
 from tools.studyctl.observation import (
     create_observation_draft,
     finalize_observation,
+    recover_observation_sequence,
 )
+from tools.studyctl.observation_sequence import load_observation_sequence
 from tools.studyctl.observation_triggers import load_current_registry
-from tools.studyctl.validation import validate_study
+from tools.studyctl.validation import observation_sequence_issues, validate_study
 
 
 class ObservationRecordTests(WorkflowTestCase):
@@ -163,6 +166,21 @@ class ObservationRecordTests(WorkflowTestCase):
         ]
         self.fill_evidence_inference(draft)
         draft["assessment"] = "supports"
+
+    def test_open_draft_is_writable_without_breaking_finalization_sequence(
+        self,
+    ) -> None:
+        paths = self.initialize_approved_with_claim()
+        manifest = self.successful_run(paths)
+        draft_path = create_observation_draft(
+            paths,
+            "OBS-0001",
+            [manifest["run_id"]],
+            ["independent_review"],
+        )
+
+        self.assertNotEqual(draft_path.stat().st_mode & 0o222, 0)
+        self.assertEqual(observation_sequence_issues(paths), [])
 
     def test_inline_observation_remains_the_default_boundary(self) -> None:
         paths = self.initialize_approved_with_claim()
@@ -532,6 +550,106 @@ class ObservationRecordTests(WorkflowTestCase):
             "requires a supported deterministic validator",
         ):
             load_current_registry(self.root)
+
+    def test_finalized_observation_inventory_detects_deletion(self) -> None:
+        paths = self.initialize_approved_with_claim()
+        manifest = self.successful_run(paths)
+        observation_path = create_observation_draft(
+            paths,
+            "OBS-0001",
+            [manifest["run_id"]],
+            ["independent_review"],
+        )
+        observation = load_json(observation_path)
+        self.fill_observation(observation)
+        atomic_write_json(observation_path, observation)
+        finalize_observation(paths, observation_path)
+
+        sequence = load_observation_sequence(paths)
+        assert sequence is not None
+        self.assertEqual(sequence["schema_version"], 2)
+        self.assertEqual(sequence["finalized_count"], 1)
+
+        observation_path.unlink()
+
+        messages = [
+            issue.message for issue in observation_sequence_issues(paths)
+        ]
+        self.assertTrue(
+            any("finalized Observations" in message for message in messages),
+            messages,
+        )
+
+    def test_interrupted_observation_finalization_has_forward_recovery(
+        self,
+    ) -> None:
+        paths = self.initialize_approved_with_claim()
+        manifest = self.successful_run(paths)
+        observation_path = create_observation_draft(
+            paths,
+            "OBS-0001",
+            [manifest["run_id"]],
+            ["independent_review"],
+        )
+        observation = load_json(observation_path)
+        self.fill_observation(observation)
+        atomic_write_json(observation_path, observation)
+
+        with patch(
+            "tools.studyctl.observation.advance_finalized_observation_sequence",
+            side_effect=OSError("simulated sequence update interruption"),
+        ):
+            with self.assertRaisesRegex(
+                OSError, "sequence update interruption"
+            ):
+                finalize_observation(paths, observation_path)
+
+        self.assertEqual(load_json(observation_path)["status"], "finalized")
+        self.assertTrue(observation_sequence_issues(paths))
+        recover_observation_sequence(paths)
+        self.assertEqual(observation_sequence_issues(paths), [])
+        sequence = load_observation_sequence(paths)
+        assert sequence is not None
+        self.assertEqual(sequence["finalized_count"], 1)
+
+    def test_sequence_and_finalized_record_must_remain_sealed(self) -> None:
+        paths = self.initialize_approved_with_claim()
+        manifest = self.successful_run(paths)
+        observation_path = create_observation_draft(
+            paths,
+            "OBS-0001",
+            [manifest["run_id"]],
+            ["independent_review"],
+        )
+        observation = load_json(observation_path)
+        self.fill_observation(observation)
+        atomic_write_json(observation_path, observation)
+        finalize_observation(paths, observation_path)
+
+        paths.observation_sequence.chmod(0o644)
+        sequence_messages = [
+            issue.message for issue in observation_sequence_issues(paths)
+        ]
+        self.assertTrue(
+            any(
+                "Observation sequence must be sealed read-only" in message
+                for message in sequence_messages
+            ),
+            sequence_messages,
+        )
+        paths.observation_sequence.chmod(0o444)
+
+        observation_path.chmod(0o644)
+        record_messages = [
+            issue.message for issue in observation_sequence_issues(paths)
+        ]
+        self.assertTrue(
+            any(
+                "finalized Observation must be sealed read-only" in message
+                for message in record_messages
+            ),
+            record_messages,
+        )
 
 
 if __name__ == "__main__":

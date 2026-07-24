@@ -48,17 +48,21 @@ class GraphRecordTests(WorkflowTestCase):
             claim_id="CLAIM-0001",
         )
         draft = load_json(draft_path)
-        draft["assessment_semantics"]["criteria"] = [
-            {
-                "criterion_id": "CRIT-001",
-                "observation": "fixture_value",
-                "operator": "eq",
-                "target": 4,
-                "unit": None,
-                "on_pass": "supports",
-                "on_fail": "contradicts",
-            }
-        ]
+        draft["assessment_semantics"] = {
+            "aggregation": "all_required",
+            "criteria": [
+                {
+                    "criterion_id": "CRIT-001",
+                    "observation": "fixture_value",
+                    "operator": "eq",
+                    "target": 4,
+                    "unit": None,
+                    "on_pass": "supports",
+                    "on_fail": "contradicts",
+                }
+            ],
+            "default_outcome": "inconclusive",
+        }
         draft["scope"] = "The exact deterministic fixture and approved Brief."
         atomic_write_json(draft_path, draft)
         return finalize_experiment_intent(paths, draft_path)
@@ -258,17 +262,21 @@ class GraphRecordTests(WorkflowTestCase):
             claim_id="CLAIM-0001",
         )
         draft = load_json(draft_path)
-        draft["assessment_semantics"]["criteria"] = [
-            {
-                "criterion_id": "CRIT-001",
-                "observation": "fixture_value",
-                "operator": "eq",
-                "target": 4,
-                "unit": None,
-                "on_pass": "supports",
-                "on_fail": "contradicts",
-            }
-        ]
+        draft["assessment_semantics"] = {
+            "aggregation": "all_required",
+            "criteria": [
+                {
+                    "criterion_id": "CRIT-001",
+                    "observation": "fixture_value",
+                    "operator": "eq",
+                    "target": 4,
+                    "unit": None,
+                    "on_pass": "supports",
+                    "on_fail": "contradicts",
+                }
+            ],
+            "default_outcome": "inconclusive",
+        }
         draft["scope"] = "The exact deterministic fixture and approved Brief."
         atomic_write_json(draft_path, draft)
 
@@ -396,6 +404,27 @@ class GraphRecordTests(WorkflowTestCase):
                 claim_id="CLAIM-0001",
             )
 
+    def test_minimal_intent_can_finalize_without_premature_claim_semantics(
+        self,
+    ) -> None:
+        paths = self.initialize_approved_with_claim()
+        draft_path = create_experiment_intent_draft(
+            paths,
+            "INTENT-0001",
+            evidence_gap_id="GAP-0001",
+            evidence_gap="The exploratory behavior has not been observed.",
+            objective="Observe the behavior without pre-committing a Claim assessment.",
+            requested_observations=["exploratory_behavior"],
+        )
+
+        finalized = load_json(finalize_experiment_intent(paths, draft_path))
+
+        self.assertEqual(finalized["evidence_requirements"], [])
+        self.assertIsNone(finalized["assessment_semantics"])
+        self.assertIsNone(finalized["scope"])
+        self.assertIsNone(finalized["addresses"]["target_claim"])
+        self.assertEqual(finalized["status"], "finalized")
+
     def test_intent_rejects_criterion_for_unrequested_observation(self) -> None:
         paths = self.initialize_approved_with_claim()
         draft_path = create_experiment_intent_draft(
@@ -409,17 +438,21 @@ class GraphRecordTests(WorkflowTestCase):
             claim_id="CLAIM-0001",
         )
         draft = load_json(draft_path)
-        draft["assessment_semantics"]["criteria"] = [
-            {
-                "criterion_id": "CRIT-001",
-                "observation": "unrequested_metric",
-                "operator": "eq",
-                "target": 4,
-                "unit": None,
-                "on_pass": "supports",
-                "on_fail": "contradicts",
-            }
-        ]
+        draft["assessment_semantics"] = {
+            "aggregation": "all_required",
+            "criteria": [
+                {
+                    "criterion_id": "CRIT-001",
+                    "observation": "unrequested_metric",
+                    "operator": "eq",
+                    "target": 4,
+                    "unit": None,
+                    "on_pass": "supports",
+                    "on_fail": "contradicts",
+                }
+            ],
+            "default_outcome": "inconclusive",
+        }
         atomic_write_json(draft_path, draft)
 
         with self.assertRaisesRegex(
@@ -467,17 +500,21 @@ class GraphRecordTests(WorkflowTestCase):
             claim_id="CLAIM-0001",
         )
         draft = load_json(draft_path)
-        draft["assessment_semantics"]["criteria"] = [
-            {
-                "criterion_id": "CRIT-001",
-                "observation": "fixture_value",
-                "operator": "gte",
-                "target": "four",
-                "unit": None,
-                "on_pass": "supports",
-                "on_fail": "contradicts",
-            }
-        ]
+        draft["assessment_semantics"] = {
+            "aggregation": "all_required",
+            "criteria": [
+                {
+                    "criterion_id": "CRIT-001",
+                    "observation": "fixture_value",
+                    "operator": "gte",
+                    "target": "four",
+                    "unit": None,
+                    "on_pass": "supports",
+                    "on_fail": "contradicts",
+                }
+            ],
+            "default_outcome": "inconclusive",
+        }
         draft["scope"] = "The exact deterministic fixture and approved Brief."
         atomic_write_json(draft_path, draft)
 
@@ -489,7 +526,9 @@ class GraphRecordTests(WorkflowTestCase):
             (paths.experiment_intents / "INTENT-0001.v0001.json").exists()
         )
 
-    def test_control_graph_rejects_cycle_and_nonfinite_budget(self) -> None:
+    def test_control_graph_accepts_agent_defined_cycle_but_rejects_nonfinite_budget(
+        self,
+    ) -> None:
         paths = self.initialize_approved_with_claim()
         self._final_intent(paths)
         with self.assertRaisesRegex(ValidationError, "finite non-negative"):
@@ -511,29 +550,44 @@ class GraphRecordTests(WorkflowTestCase):
         draft["nodes"] = [
             {
                 "node_id": "first",
-                "kind": "task",
-                "purpose": "First task.",
-                "command": [sys.executable, "-c", "print(1)"],
-                "loop_contract": None,
+                "kind": "agent.research_step",
+                "purpose": "Generate one implementation or diagnosis candidate.",
+                "specification": {"strategy": "agent_defined"},
             },
             {
                 "node_id": "second",
-                "kind": "validator",
-                "purpose": "Second task.",
-                "command": [sys.executable, "-c", "print(2)"],
-                "loop_contract": None,
+                "kind": "diagnostic_probe",
+                "purpose": "Evaluate whether the candidate reduces uncertainty.",
+                "specification": {"measure": "information_gain"},
             },
         ]
         draft["edges"] = [
-            {"from": "first", "to": "second", "condition": "on_success"},
-            {"from": "second", "to": "first", "condition": "on_failure"},
+            {
+                "from": "first",
+                "to": "second",
+                "condition": "candidate_available",
+            },
+            {
+                "from": "second",
+                "to": "first",
+                "relation": "revisits",
+                "condition": {
+                    "when": "important uncertainty remains",
+                    "policy": "agent_defined",
+                },
+            },
         ]
         draft["completion"]["required_node_ids"] = ["second"]
         atomic_write_json(draft_path, draft)
 
-        with self.assertRaisesRegex(ValidationError, "contain a cycle"):
-            finalize_control_graph(paths, draft_path)
-        self.assertFalse((paths.control_graphs / "CG-0001.v0001.json").exists())
+        final_path = finalize_control_graph(paths, draft_path)
+
+        self.assertTrue(final_path.is_file())
+        self.assertEqual(load_json(final_path)["nodes"][0]["kind"], "agent.research_step")
+        self.assertEqual(
+            [issue for issue in validate_study(paths) if issue.level == "ERROR"],
+            [],
+        )
 
     def test_control_graph_rejects_whitespace_command_item(self) -> None:
         paths = self.initialize_approved_with_claim()

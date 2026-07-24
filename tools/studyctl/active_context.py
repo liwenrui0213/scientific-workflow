@@ -47,6 +47,7 @@ CONFIRMATION_SLOT_LOCATOR_LIMIT = 16
 CONFIRMATION_CLAIM_LOCATOR_LIMIT = 8
 ACTIVE_CONTEXT_TEXT_PREVIEW_BYTES = 256
 ACTIVE_CONTEXT_FRONTIER_ITEM_LIMIT = 8
+ACTIVE_CONTEXT_OCCURRENCE_ITEM_LIMIT = 8
 ACTIVE_CONTEXT_FILENAME = "ACTIVE_CONTEXT.json"
 COMPACTION_DUE_FILENAME = "COMPACTION_DUE.json"
 
@@ -638,6 +639,179 @@ def _decisive_observation_locators(
     )
 
 
+def _source_locator(paths: StudyPaths, path: Path) -> dict[str, Any]:
+    """Locate one authority file without treating the projection as authority."""
+
+    return {
+        "path": path.relative_to(paths.root).as_posix(),
+        "size": path.stat().st_size,
+        "sha256": sha256_file(path),
+    }
+
+
+def _claim_evidence_keys(claims_data: Mapping[str, Any]) -> set[tuple[str, int]]:
+    keys: set[tuple[str, int]] = set()
+    claims = claims_data.get("claims", [])
+    if not isinstance(claims, list):
+        return keys
+    for claim in claims:
+        if not isinstance(claim, dict):
+            continue
+        for field in (
+            "supporting_evidence",
+            "contradictory_evidence",
+            "other_evidence",
+        ):
+            references = claim.get(field, [])
+            if not isinstance(references, list):
+                continue
+            for reference in references:
+                if not isinstance(reference, dict):
+                    continue
+                evidence_id = reference.get("evidence_id")
+                version = reference.get("version")
+                if (
+                    isinstance(evidence_id, str)
+                    and isinstance(version, int)
+                    and not isinstance(version, bool)
+                    and version > 0
+                ):
+                    keys.add((evidence_id, version))
+    return keys
+
+
+def build_occurrence_locator(
+    paths: StudyPaths,
+    *,
+    claims_data: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return bounded attention locators for occurrence facts.
+
+    The projection records only facts already present in immutable Run or
+    Evidence records.  It does not diagnose a failure, infer a cause, or turn
+    an occurrence into scientific Evidence.  Selected items are navigation
+    aids; the two inventory hashes commit to every matching source record.
+    """
+
+    if claims_data is None:
+        loaded_claims = load_json(paths.claims)
+        if not isinstance(loaded_claims, dict):
+            raise ValidationError("CLAIMS.json must be an object")
+        claims_data = loaded_claims
+
+    # Local imports avoid the validation -> active_context import cycle.
+    from .validation import (
+        evidence_index,
+        run_index,
+        sealed_run_evidence_eligible,
+    )
+
+    run_occurrences: list[dict[str, Any]] = []
+    for run_id, (manifest_path, manifest) in sorted(
+        run_index(paths).items(),
+        reverse=True,
+    ):
+        status = str(manifest.get("status", ""))
+        facts: list[str] = []
+        if status in {"failed", "interrupted", "incomplete"}:
+            facts.append(f"run_status_{status}")
+        missing_output_count = sum(
+            1
+            for output in manifest.get("outputs", [])
+            if isinstance(output, dict) and output.get("present") is False
+        )
+        if missing_output_count:
+            facts.append("missing_declared_output")
+        if not sealed_run_evidence_eligible(manifest):
+            facts.append("evidence_ineligible_attempt")
+        if not facts:
+            continue
+        run_occurrences.append(
+            {
+                "kind": "run",
+                "run_id": run_id,
+                "status": status,
+                "facts": facts,
+                "missing_declared_output_count": missing_output_count,
+                "source": {
+                    **_source_locator(paths, manifest_path),
+                    "manifest_sha256": manifest.get("integrity", {}).get(
+                        "manifest_sha256"
+                    ),
+                },
+            }
+        )
+
+    dispositioned = _claim_evidence_keys(claims_data)
+    undispositioned_evidence: list[dict[str, Any]] = []
+    for key, (evidence_path, evidence) in sorted(
+        evidence_index(paths).items(),
+        reverse=True,
+    ):
+        if evidence.get("status") != "finalized" or key in dispositioned:
+            continue
+        undispositioned_evidence.append(
+            {
+                "kind": "evidence",
+                "evidence_id": key[0],
+                "version": key[1],
+                "status": "finalized",
+                "fact": "finalized_undispositioned_evidence",
+                "assessment": evidence.get("assessment"),
+                "claim_ids": list(
+                    evidence.get("addresses", {}).get("claim_ids", [])
+                ),
+                "source": {
+                    **_source_locator(paths, evidence_path),
+                    "record_sha256": evidence.get("record_sha256"),
+                },
+            }
+        )
+
+    ledger = load_ledger(paths)
+    run_authority = (
+        {
+            **_source_locator(paths, paths.study / "RUNS.ledger.json"),
+            "high_water_mark": ledger["high_water_mark"],
+            "ledger_sha256": ledger["ledger_sha256"],
+        }
+        if ledger is not None
+        else None
+    )
+    evidence_sequence = require_evidence_sequence(paths)
+    evidence_authority = {
+        **_source_locator(paths, paths.evidence_sequence),
+        "high_water_mark": evidence_sequence["high_water_mark"],
+        "finalized_count": evidence_sequence["finalized_count"],
+        "finalized_inventory_sha256": evidence_sequence[
+            "finalized_inventory_sha256"
+        ],
+        "sequence_sha256": evidence_sequence["sequence_sha256"],
+    }
+    complete_inventory = {
+        "run_occurrences": run_occurrences,
+        "finalized_undispositioned_evidence": undispositioned_evidence,
+    }
+    return {
+        "run_occurrences": _bounded_locator_index(
+            run_occurrences,
+            limit=ACTIVE_CONTEXT_OCCURRENCE_ITEM_LIMIT,
+        ),
+        "finalized_undispositioned_evidence": _bounded_locator_index(
+            undispositioned_evidence,
+            limit=ACTIVE_CONTEXT_OCCURRENCE_ITEM_LIMIT,
+        ),
+        "total_count": len(run_occurrences) + len(undispositioned_evidence),
+        "inventory_sha256": sha256_json(complete_inventory),
+        "authority": {
+            "run_ledger": run_authority,
+            "evidence_sequence": evidence_authority,
+            "claims": _source_locator(paths, paths.claims),
+        },
+        "assurance": "derived_occurrence_facts_only",
+    }
+
+
 def build_active_selector(
     paths: StudyPaths,
     *,
@@ -688,8 +862,16 @@ def build_active_selector(
 
     from .graph_records import current_graph_record_locators
 
+    combined_projection = current_graph_record_locators(paths)
+    workspace_drafts = combined_projection["workspace_drafts"]
+    graph_projection = {
+        key: value
+        for key, value in combined_projection.items()
+        if key != "workspace_drafts"
+    }
+
     selector = {
-        "schema_version": 1,
+        "schema_version": 2,
         "study_id": paths.study_id,
         "brief": {
             "path": paths.brief.relative_to(paths.root).as_posix(),
@@ -709,9 +891,17 @@ def build_active_selector(
         "decisive_observations": _decisive_observation_locators(
             paths, selected_claims
         ),
+        "occurrences": build_occurrence_locator(
+            paths,
+            claims_data=claims_data,
+        ),
         "active_formal_artifacts": formal,
         "confirmations": _confirmation_source_index(paths),
-        "graph_records": current_graph_record_locators(paths),
+        "workspace": {
+            "graph_record_drafts": workspace_drafts,
+            "assurance": "mutable_non_authoritative",
+        },
+        "graph_records": graph_projection,
         "latest_checkpoint": checkpoint_summary,
         "selector_sha256": "",
     }

@@ -7,13 +7,13 @@
   "x-maxCanonicalBytesStatuses": ["draft"],
   "required": [
     "schema_version", "study_id", "observation_id", "version", "status",
-    "created_at", "updated_at", "promotion", "runs", "cohorts", "analysis",
+    "created_at", "updated_at", "promotion", "intent_refs", "runs", "cohorts", "analysis",
     "results", "uncertainty", "scope", "anomalies",
     "representative_failures", "analysis_assumptions", "limitations",
     "analysis_fingerprint_sha256", "record_sha256"
   ],
   "properties": {
-    "schema_version": {"const": 2},
+    "schema_version": {"const": 3},
     "study_id": {
       "type": "string",
       "pattern": "^SC-[0-9]{4,}$",
@@ -57,6 +57,12 @@
         "rationale": {"type": ["string", "null"], "maxLength": 4096}
       },
       "additionalProperties": false
+    },
+    "intent_refs": {
+      "type": "array",
+      "maxItems": 256,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/intent_ref"}
     },
     "runs": {
       "type": "array",
@@ -177,6 +183,20 @@
     }
   },
   "$defs": {
+    "intent_ref": {
+      "type": "object",
+      "required": ["intent_id", "version", "sha256"],
+      "properties": {
+        "intent_id": {
+          "type": "string",
+          "pattern": "^INTENT-[0-9]{4,}$",
+          "maxLength": 64
+        },
+        "version": {"type": "integer", "minimum": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
     "nullable_result": {
       "type": ["object", "string", "number", "array", "boolean", "null"]
     },

@@ -210,7 +210,7 @@ class ConfirmatoryRunTests(WorkflowTestCase):
 
         manifest = self.successful_run(paths)
 
-        self.assertEqual(manifest["schema_version"], 4)
+        self.assertEqual(manifest["schema_version"], 5)
         self.assertEqual(
             manifest["epistemic_role"],
             {

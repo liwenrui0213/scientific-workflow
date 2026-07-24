@@ -70,16 +70,23 @@ class CoreWorkflowTests(WorkflowTestCase):
         atomic_write_json(paths.claims, claims)
 
     def valid_verdict_source(self, paths: object, verdict_id: str) -> dict[str, object]:
-        """Return a legacy full-source Verdict for compatibility-boundary tests."""
+        """Return a current full-source Verdict for manual boundary tests."""
 
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "study_id": paths.study_id,
             "verdict_id": verdict_id,
             "created_at": utc_now(),
             "reviewer": {
                 "identity": "Independent Test Reviewer",
                 "source": "human_authored_test_fixture",
+            },
+            "review_basis": {
+                "mode": "waived",
+                "reason": (
+                    "No imported independent Review was available for this "
+                    "manual boundary fixture."
+                ),
             },
             "judged_scope": {
                 "commit": git_state(paths.root)["commit"],
@@ -433,7 +440,7 @@ class CoreWorkflowTests(WorkflowTestCase):
 
         self.assertEqual(list(paths.study.glob("VERDICT*.json")), [])
 
-    def test_manual_legacy_verdict_rejects_agent_authorization_branch(self) -> None:
+    def test_manual_full_verdict_rejects_agent_authorization_branch(self) -> None:
         paths = self.initialize()
         self.fill_brief(paths)
         self.approve(paths)
@@ -584,7 +591,7 @@ class CoreWorkflowTests(WorkflowTestCase):
         self.assertEqual(calls, 3)
         self.assertFalse(paths.verdict.exists())
 
-    def test_legacy_full_verdict_cannot_bypass_clean_worktree_binding(self) -> None:
+    def test_full_verdict_cannot_bypass_clean_worktree_binding(self) -> None:
         paths = self.initialize()
         self.fill_brief(paths)
         self.approve(paths)

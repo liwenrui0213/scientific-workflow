@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "record_type": "control_graph_spec",
   "study_id": "SC-0000",
   "control_graph_id": "CG-0000",
@@ -14,7 +14,7 @@
     "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
   },
   "executor": {
-    "kind": "studyctl",
+    "kind": "external",
     "parameters": {}
   },
   "resources": {
@@ -27,7 +27,7 @@
   "edges": [],
   "completion": {
     "required_node_ids": [],
-    "on_incomplete": "fail"
+    "on_incomplete": "record_incomplete"
   },
   "record_sha256": null
 }

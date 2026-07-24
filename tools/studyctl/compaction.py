@@ -216,19 +216,15 @@ def _repository_path_identity(root: Path, relative: str) -> dict[str, Any]:
 
 
 def _host_change_scope(paths: StudyPaths) -> dict[str, Any]:
-    """Seal only host-repository changes, excluding every Study-state path."""
+    """Snapshot host changes without turning compaction into an authorization gate.
+
+    A blocked host scope still prevents Evidence-producing execution through the
+    normal change-governance gates.  Compaction must remain available so the
+    Study can record and bound that blocked state instead of becoming
+    unrecoverable under context pressure.
+    """
 
     state = evaluate_changes(paths, require_validation=True)
-    if state.get("outcome") == "BLOCKED":
-        details = "; ".join(
-            f"{item.get('rule')}: {item.get('reason')}"
-            for item in state.get("violations", [])
-        )
-        suffix = f": {details}" if details else ""
-        raise ValidationError(
-            "cannot compact while the current host repository change scope is BLOCKED"
-            + suffix
-        )
     records: list[dict[str, Any]] = []
     for item in state.get("changed_paths", []):
         if item.get("classification") in _STUDY_CHANGE_CLASSIFICATIONS:
@@ -363,11 +359,6 @@ def _validate_prepared_bindings(
     formal_inventory = active_formal_artifacts(paths)
     if source_hashes.get("formal_artifacts") != _inventory_binding(formal_inventory):
         raise ValidationError("formal-artifact inventory changed after compact-prepare")
-    failed_inventory = _file_inventory(paths.study / "failed-directions", paths.root)
-    if source_hashes.get("failed_directions") != _inventory_binding(failed_inventory):
-        raise ValidationError("failed-direction inventory changed after compact-prepare")
-
-
 def budget_totals(runs: dict[str, tuple[Path, dict[str, Any]]]) -> dict[str, Any]:
     committed = budget_totals_from_manifests(
         manifest for _, manifest in runs.values()
@@ -643,10 +634,6 @@ def prepare_compaction(paths: StudyPaths) -> Path:
     active_selector = build_active_selector(paths, claims_data=claims)
     active_formal = [item for item in formal if item["active"]]
     stale_formal = [item for item in formal if not item["active"]]
-    failed_directions = _file_inventory(
-        paths.study / "failed-directions",
-        paths.root,
-    )
     unreferenced_runs = sorted(set(runs) - evidence_run_ids)
     unreferenced_evidence = [
         {"evidence_id": key[0], "version": key[1], "status": item.get("status")}
@@ -695,7 +682,6 @@ def prepare_compaction(paths: StudyPaths) -> Path:
             "evidence_sequence": sha256_file(paths.evidence_sequence),
             "checkpoint_sequence": sha256_file(paths.checkpoint_sequence),
             "formal_artifacts": _inventory_binding(formal),
-            "failed_directions": _inventory_binding(failed_directions),
         },
         "repository_profile": {
             "path": repository_profile_path(paths.root)
@@ -732,9 +718,9 @@ def prepare_compaction(paths: StudyPaths) -> Path:
             "claims_file_sha256": sha256_file(paths.claims),
         },
         "current_frontier": active_selector["frontier"],
+        "occurrences": active_selector["occurrences"],
         "confirmations": active_selector["confirmations"],
         "graph_records": active_selector["graph_records"],
-        "failed_direction_records": _bounded_index(failed_directions),
         "budget_totals": budget_state,
         "budget_authority": budget_authority,
         "candidate_archive_items": _bounded_index(candidates),
@@ -861,6 +847,24 @@ def _finalize_compaction_locked(paths: StudyPaths, plan_path: Path) -> Path:
         raise ValidationError("Evidence set changed after the compaction plan was written")
     assert_valid_study(paths)
     claims = load_json(paths.claims)
+    occurrence_inventory = plan.get("occurrence_inventory")
+    if occurrence_inventory is not None:
+        prepared_occurrences = compaction_state.get("occurrences")
+        expected_occurrence_inventory = (
+            {
+                "total_count": prepared_occurrences.get("total_count"),
+                "inventory_sha256": prepared_occurrences.get(
+                    "inventory_sha256"
+                ),
+            }
+            if isinstance(prepared_occurrences, dict)
+            else None
+        )
+        if occurrence_inventory != expected_occurrence_inventory:
+            raise ValidationError(
+                "compaction plan occurrence_inventory does not match the "
+                "prepared occurrence locator"
+            )
     if plan.get("frontier") != claims.get("frontier"):
         raise ValidationError("compaction plan Frontier must equal the authoritative CLAIMS.json Frontier")
     frontier = claims.get("frontier", {})
@@ -909,10 +913,6 @@ def _finalize_compaction_locked(paths: StudyPaths, plan_path: Path) -> Path:
         raise ValidationError(
             "compaction plan budget_state must equal authoritative Run budget totals"
         )
-    failed_direction_records = {
-        item["path"]: item
-        for item in _file_inventory(paths.study / "failed-directions", paths.root)
-    }
     representative_failure_records: list[dict[str, Any]] = []
     for failure in plan.get("representative_failures", []):
         if failure in runs:
@@ -931,18 +931,11 @@ def _finalize_compaction_locked(paths: StudyPaths, plan_path: Path) -> Path:
                     ),
                 }
             )
-        elif failure in failed_direction_records:
-            record = failed_direction_records[failure]
-            representative_failure_records.append(
-                {
-                    "kind": "failed_direction",
-                    "path": record["path"],
-                    "size": record["size"],
-                    "sha256": record["sha256"],
-                }
-            )
         else:
-            raise ValidationError(f"representative failure reference does not exist: {failure}")
+            raise ValidationError(
+                "representative failure must identify an immutable failed, "
+                f"interrupted, or incomplete Run: {failure}"
+            )
 
     references = authoritative_string_references(paths) | run_file_references(paths)
     checkpoint_id = _next_checkpoint_id(paths)
@@ -1012,6 +1005,7 @@ def _finalize_compaction_locked(paths: StudyPaths, plan_path: Path) -> Path:
         "claims_file_sha256": sha256_file(paths.claims),
         "claims_snapshot": selected_claims,
         "inactive_claim_refs": checkpoint_inactive_refs,
+        "graph_record_sequence": compaction_state["graph_records"]["sequence"],
         "active_context_watermarks": pressure_watermarks(
             run_count=run_high_water_mark,
             observation_high_water_mark=observation_sequence[

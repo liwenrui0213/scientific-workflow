@@ -368,6 +368,7 @@ def render_status(paths: StudyPaths) -> Path:
     selector_error: str | None = None
     confirmation_projection: dict[str, Any] | None = None
     graph_record_projection: dict[str, Any] | None = None
+    workspace_projection: dict[str, Any] | None = None
     try:
         if pressure_error is None:
             selector_path, compaction_due_path = refresh_active_projection(
@@ -399,6 +400,16 @@ def render_status(paths: StudyPaths) -> Path:
                 "ACTIVE_CONTEXT.json lacks the bounded graph-record index"
             )
         graph_record_projection = raw_graph_records
+        raw_workspace = (
+            selector_data.get("workspace")
+            if isinstance(selector_data, dict)
+            else None
+        )
+        if not isinstance(raw_workspace, dict):
+            raise ValidationError(
+                "ACTIVE_CONTEXT.json lacks the bounded Workspace index"
+            )
+        workspace_projection = raw_workspace
     except (ValidationError, WorkflowError, OSError, ValueError) as exc:
         selector_path = paths.generated / "ACTIVE_CONTEXT.json"
         compaction_due_path = paths.generated / "COMPACTION_DUE.json"
@@ -535,7 +546,7 @@ def render_status(paths: StudyPaths) -> Path:
         lines.append("Active Claim IDs: " + ", ".join(f"`{item}`" for item in frontier["claim_ids"]))
 
     lines.extend(["", "## Cognitive and Control Contracts", ""])
-    if graph_record_projection is None:
+    if graph_record_projection is None or workspace_projection is None:
         lines.append(
             "ExperimentIntent and ControlGraphSpec locators are unavailable "
             "because active context is invalid."
@@ -544,7 +555,7 @@ def render_status(paths: StudyPaths) -> Path:
         graph_sequence = graph_record_projection["sequence"]
         intents = graph_record_projection["experiment_intents"]
         plans = graph_record_projection["control_graphs"]
-        drafts = graph_record_projection["workspace_drafts"]
+        drafts = workspace_projection["graph_record_drafts"]
         lines.extend(
             [
                 "- Graph-record committed high-water mark: "
@@ -872,7 +883,22 @@ REVIEW_SECTIONS = (
 
 def _render_source(source: dict[str, Any]) -> str:
     fields = []
-    for key in ("path", "symbol", "line", "commit", "run_id", "evidence_id", "claim_id", "checkpoint_id", "note"):
+    for key in (
+        "path",
+        "sha256",
+        "symbol",
+        "line",
+        "commit",
+        "run_id",
+        "intent_id",
+        "control_graph_id",
+        "observation_id",
+        "evidence_id",
+        "version",
+        "claim_id",
+        "checkpoint_id",
+        "note",
+    ):
         if key in source:
             fields.append(f"{key}={source[key]}")
     return f"{source.get('kind')}: " + ", ".join(fields)

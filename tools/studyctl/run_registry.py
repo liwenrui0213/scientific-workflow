@@ -83,8 +83,8 @@ from .workspace import (
 )
 
 
-_RUN_SCHEMA_VERSION = 4
-_EPISTEMIC_ROLE_SCHEMA_VERSIONS = frozenset({4})
+_RUN_SCHEMA_VERSION = 5
+_EPISTEMIC_ROLE_SCHEMA_VERSIONS = frozenset({4, 5})
 _REPRODUCIBILITY_ENVIRONMENT_KEYS = (
     "CONDA_DEFAULT_ENV",
     "CONDA_PREFIX",
@@ -105,6 +105,7 @@ _CAPSULE_ENVIRONMENT_KEYS = frozenset(
     {
         "CUDA_VISIBLE_DEVICES",
         "HIP_VISIBLE_DEVICES",
+        "HOME",
         "JAX_PLATFORM_NAME",
         "JAX_PLATFORMS",
         "LANG",
@@ -114,7 +115,9 @@ _CAPSULE_ENVIRONMENT_KEYS = frozenset(
         "OMP_NUM_THREADS",
         "PATH",
         "PYTHONHASHSEED",
+        "PYTHONDONTWRITEBYTECODE",
         "ROCR_VISIBLE_DEVICES",
+        "TMPDIR",
         "XLA_FLAGS",
         "ZE_AFFINITY_MASK",
     }
@@ -183,6 +186,118 @@ def _exploratory_epistemic_role() -> dict[str, Any]:
         "confirmation_sha256": None,
         "slot_id": None,
     }
+
+
+def _run_control_binding(
+    paths: StudyPaths,
+    control_node_id: str | None,
+    *,
+    argv: Sequence[str],
+) -> dict[str, Any] | None:
+    """Bind an explicitly selected active Control Graph node to a new Run."""
+
+    if control_node_id is None:
+        return None
+    from .graph_records import active_control_graph
+
+    control_graph = active_control_graph(paths)
+    if control_graph is None:
+        raise ValidationError(
+            "a plan node binding requires an active formal/PLAN.json"
+        )
+    nodes = control_graph.get("nodes")
+    node = next(
+        (
+            item
+            for item in nodes
+            if isinstance(item, dict)
+            and item.get("node_id") == control_node_id
+        ),
+        None,
+    ) if isinstance(nodes, list) else None
+    if node is None:
+        raise ValidationError(
+            f"active Control Graph node does not exist: {control_node_id}"
+        )
+    node_command = node.get("command")
+    if node_command is not None and node_command != list(argv):
+        raise ValidationError(
+            f"Run argv does not exactly match active Control Graph node "
+            f"{control_node_id} command"
+        )
+    graph_digest = control_graph.get("record_sha256")
+    intent_ref = control_graph.get("realizes_intent")
+    if not isinstance(graph_digest, str) or not isinstance(intent_ref, dict):
+        raise ValidationError(
+            "active Control Graph lacks an exact graph or Intent reference"
+        )
+    return {
+        "control_graph_id": control_graph["control_graph_id"],
+        "version": control_graph["version"],
+        "sha256": graph_digest,
+        "intent_ref": copy.deepcopy(intent_ref),
+        "node_id": control_node_id,
+        "node_spec_sha256": sha256_json(node),
+    }
+
+
+def _run_intent_binding(
+    paths: StudyPaths,
+    intent_id: str | None,
+    intent_version: int | None,
+    *,
+    control_binding: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Bind a finalized Intent independently of an optional Control Graph."""
+
+    if (intent_id is None) != (intent_version is None):
+        raise ValidationError(
+            "intent_id and intent_version must be provided together"
+        )
+    if intent_id is None:
+        if control_binding is None:
+            return None
+        control_intent = control_binding.get("intent_ref")
+        if not isinstance(control_intent, dict):
+            raise ValidationError(
+                "control binding lacks an exact Experiment Intent reference"
+            )
+        return copy.deepcopy(control_intent)
+
+    from .graph_records import load_final_experiment_intent
+
+    normalized = require_id("experiment_intent", intent_id)
+    assert intent_version is not None
+    if (
+        isinstance(intent_version, bool)
+        or not isinstance(intent_version, int)
+        or intent_version < 1
+    ):
+        raise ValidationError(
+            "intent_version must be a positive integer"
+        )
+    intent = load_final_experiment_intent(
+        paths, normalized, intent_version
+    )
+    digest = intent.get("record_sha256")
+    if not isinstance(digest, str):
+        raise ValidationError(
+            "finalized Experiment Intent lacks an exact record digest"
+        )
+    binding = {
+        "intent_id": normalized,
+        "version": intent_version,
+        "sha256": digest,
+    }
+    if (
+        control_binding is not None
+        and control_binding.get("intent_ref") != binding
+    ):
+        raise ValidationError(
+            "explicit Experiment Intent does not match the selected "
+            "Control Graph"
+        )
+    return binding
 
 
 def _require_unconsumed_confirmation_slot(
@@ -1610,6 +1725,9 @@ def execute_run(
     epistemic_mode: str = "exploratory",
     confirmation_id: str | None = None,
     confirmation_slot: str | None = None,
+    intent_id: str | None = None,
+    intent_version: int | None = None,
+    control_node_id: str | None = None,
     sealed: bool = True,
     execution_backend: str = "auto",
 ) -> dict[str, Any]:
@@ -1624,6 +1742,26 @@ def execute_run(
         raise ValidationError("seed must be an integer, string, or null")
     if not isinstance(execution_backend, str) or not execution_backend:
         raise ValidationError("execution_backend must be a non-empty string")
+    if control_node_id is not None and (
+        not isinstance(control_node_id, str) or not control_node_id.strip()
+    ):
+        raise ValidationError("control_node_id must be a non-empty string or null")
+    if intent_id is not None and (
+        not isinstance(intent_id, str) or not intent_id.strip()
+    ):
+        raise ValidationError("intent_id must be a non-empty string or null")
+    if intent_version is not None and (
+        isinstance(intent_version, bool)
+        or not isinstance(intent_version, int)
+        or intent_version < 1
+    ):
+        raise ValidationError(
+            "intent_version must be a positive integer or null"
+        )
+    if (intent_id is None) != (intent_version is None):
+        raise ValidationError(
+            "intent_id and intent_version must be provided together"
+        )
     if epistemic_mode not in ("exploratory", "confirmatory"):
         raise ValidationError(
             "epistemic_mode must be 'exploratory' or 'confirmatory'"
@@ -1836,6 +1974,17 @@ def execute_run(
         policy = load_policy(paths)
         protocol_path, protocol = _load_protocol(paths)
         captured_formal_artifacts = _capture_formal_artifacts(paths, policy)
+        control_binding = _run_control_binding(
+            paths,
+            control_node_id,
+            argv=command,
+        )
+        intent_binding = _run_intent_binding(
+            paths,
+            intent_id,
+            intent_version,
+            control_binding=control_binding,
+        )
         if _captured_protected_artifacts(
             paths, captured_formal_artifacts
         ) != approval.get("protected_artifacts"):
@@ -1905,6 +2054,7 @@ def execute_run(
                 precision=effective_precision,
                 cohort_fields=cohort["fields"],
                 input_paths=input_paths,
+                output_paths=output_paths,
             )
             if not isinstance(validated_binding, dict):
                 raise WorkflowError(
@@ -1992,6 +2142,8 @@ def execute_run(
             "purpose": purpose,
             "status": "running",
             "epistemic_role": epistemic_role,
+            "intent_binding": intent_binding,
+            "control_binding": control_binding,
             "execution": {
                 "argv": command,
                 "cwd": str(configured_cwd),

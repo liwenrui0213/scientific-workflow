@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "study_id": null,
   "confirmation_id": null,
   "status": "draft",
@@ -42,7 +42,12 @@
       "hardware_class": "",
       "precision": "",
       "cohort_fields": {},
-      "input_paths": []
+      "input_paths": [],
+      "outcome_contract": {
+        "acceptable_terminal_statuses": ["succeeded"],
+        "observation_required": true,
+        "required_output_paths": []
+      }
     }
   ],
   "created_at": null

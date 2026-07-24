@@ -23,7 +23,7 @@
     "record_sha256"
   ],
   "properties": {
-    "schema_version": {"const": 1},
+    "schema_version": {"const": 2},
     "record_type": {"const": "control_graph_spec"},
     "study_id": {"type": "string", "pattern": "^SC-[0-9]{4,}$"},
     "control_graph_id": {"type": "string", "pattern": "^CG-[0-9]{4,}$"},
@@ -74,7 +74,7 @@
         "storage_gb": {"type": "number", "minimum": 0},
         "parallel_workers": {"type": "integer", "minimum": 1}
       },
-      "additionalProperties": false
+      "additionalProperties": true
     },
     "nodes": {
       "type": "array",
@@ -82,22 +82,15 @@
       "uniqueItems": true,
       "items": {
         "type": "object",
-        "required": ["node_id", "kind", "purpose", "command", "loop_contract"],
+        "required": ["node_id", "kind", "purpose"],
         "properties": {
           "node_id": {
             "type": "string",
             "pattern": "^[a-z][a-z0-9_-]{0,127}$"
           },
           "kind": {
-            "enum": [
-              "task",
-              "validator",
-              "router",
-              "loop",
-              "checkpoint",
-              "human_approval",
-              "publish"
-            ]
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9_.:-]{0,127}$"
           },
           "purpose": {"type": "string", "minLength": 1, "maxLength": 4096},
           "command": {
@@ -114,24 +107,11 @@
           "loop_contract": {
             "oneOf": [
               {"type": "null"},
-              {
-                "type": "object",
-                "required": [
-                  "max_iterations",
-                  "progress_metric",
-                  "continue_condition",
-                  "on_exhausted"
-                ],
-                "properties": {
-                  "max_iterations": {"type": "integer", "minimum": 1},
-                  "progress_metric": {"type": "string", "minLength": 1, "maxLength": 256},
-                  "continue_condition": {"type": "string", "minLength": 1, "maxLength": 4096},
-                  "on_exhausted": {"enum": ["fail", "human_review"]}
-                },
-                "additionalProperties": false
-              }
+              {"type": "object"}
             ]
-          }
+          },
+          "specification": {"type": "object"},
+          "metadata": {"type": "object"}
         },
         "additionalProperties": false
       }
@@ -147,14 +127,14 @@
           "from": {"type": "string", "minLength": 1},
           "to": {"type": "string", "minLength": 1},
           "condition": {
-            "enum": [
-              "always",
-              "on_success",
-              "on_failure",
-              "when_true",
-              "when_false"
+            "oneOf": [
+              {"type": "null"},
+              {"type": "string", "minLength": 1, "maxLength": 4096},
+              {"type": "object"}
             ]
-          }
+          },
+          "relation": {"type": "string", "minLength": 1, "maxLength": 128},
+          "metadata": {"type": "object"}
         },
         "additionalProperties": false
       }
@@ -169,7 +149,13 @@
           "uniqueItems": true,
           "items": {"type": "string", "minLength": 1}
         },
-        "on_incomplete": {"enum": ["fail", "human_review"]}
+        "on_incomplete": {"type": "string", "minLength": 1, "maxLength": 256},
+        "criteria": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {"type": "string", "minLength": 1, "maxLength": 4096}
+        },
+        "specification": {"type": "object"}
       },
       "additionalProperties": false
     },

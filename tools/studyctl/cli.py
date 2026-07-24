@@ -54,7 +54,6 @@ def initialize_study(root: Path, study_id: str, title: str) -> Path:
         paths.runs,
         paths.observations,
         paths.evidence,
-        paths.failed_directions,
         paths.checkpoints,
         paths.generated,
     )
@@ -158,6 +157,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     graph_sequence_recover.add_argument("study_id")
 
+    observation_sequence_recover = subparsers.add_parser(
+        "recover-observation-sequence",
+        help=(
+            "index exactly one finalized Observation left unindexed by an "
+            "interrupted finalization"
+        ),
+    )
+    observation_sequence_recover.add_argument("study_id")
+
+    evidence_sequence_recover = subparsers.add_parser(
+        "recover-evidence-sequence",
+        help=(
+            "index exactly one finalized Evidence record left unindexed by an "
+            "interrupted finalization"
+        ),
+    )
+    evidence_sequence_recover.add_argument("study_id")
+
     validate = subparsers.add_parser("validate", help="validate authoritative records and references")
     validate.add_argument("study_id")
 
@@ -245,7 +262,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     intent_finalize = subparsers.add_parser(
         "intent-finalize",
-        help="freeze an ExperimentIntent after its evidence semantics are complete",
+        help=(
+            "freeze an ExperimentIntent; optional assessment semantics may "
+            "remain undeclared"
+        ),
     )
     intent_finalize.add_argument("study_id")
     intent_finalize.add_argument("--file", required=True)
@@ -258,7 +278,7 @@ def build_parser() -> argparse.ArgumentParser:
     plan_new.add_argument("--id", dest="control_graph_id", required=True)
     plan_new.add_argument("--intent", dest="intent_id", required=True)
     plan_new.add_argument("--intent-version", type=int, required=True)
-    plan_new.add_argument("--executor", default="studyctl")
+    plan_new.add_argument("--executor", default="external")
     plan_new.add_argument("--cpu-hours", type=float, default=0.0)
     plan_new.add_argument("--gpu-hours", type=float, default=0.0)
     plan_new.add_argument("--storage-gb", type=float, default=0.0)
@@ -290,6 +310,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--confirmation")
     run.add_argument("--slot")
+    run.add_argument(
+        "--intent",
+        dest="run_intent_id",
+        help=(
+            "bind this Run directly to a finalized ExperimentIntent "
+            "without requiring a PLAN"
+        ),
+    )
+    run.add_argument(
+        "--intent-version",
+        dest="run_intent_version",
+        type=int,
+        help="exact finalized ExperimentIntent version for --intent",
+    )
+    run.add_argument(
+        "--plan-node",
+        help="bind this Run to one exact node of the current active PLAN",
+    )
     run.add_argument("--cohort")
     run.add_argument("--estimated-gpu-hours", type=float, default=0.0)
     run.add_argument("--estimated-cpu-hours", type=float, default=0.0)
@@ -455,6 +493,16 @@ def dispatch(args: argparse.Namespace) -> int:
 
         print(recover_graph_record_sequence(paths))
         return 0
+    if name == "recover-observation-sequence":
+        from .observation import recover_observation_sequence
+
+        print(recover_observation_sequence(paths))
+        return 0
+    if name == "recover-evidence-sequence":
+        from .evidence import recover_evidence_sequence
+
+        print(recover_evidence_sequence(paths))
+        return 0
     if name == "status":
         from .rendering import render_status
 
@@ -543,6 +591,9 @@ def dispatch(args: argparse.Namespace) -> int:
             epistemic_mode=args.mode,
             confirmation_id=args.confirmation,
             confirmation_slot=args.slot,
+            intent_id=args.run_intent_id,
+            intent_version=args.run_intent_version,
+            control_node_id=args.plan_node,
             cohort_id=args.cohort,
             estimated_gpu_hours=args.estimated_gpu_hours,
             estimated_cpu_hours=args.estimated_cpu_hours,

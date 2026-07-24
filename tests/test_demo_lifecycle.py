@@ -381,7 +381,7 @@ class DemonstrationLifecycleTests(WorkflowTestCase):
 
         self.assertFalse(paths.verdict.exists())
 
-    def test_legacy_full_verdict_cannot_bypass_checkpoint_approval_binding(self) -> None:
+    def test_full_verdict_cannot_bypass_checkpoint_approval_binding(self) -> None:
         paths = self.initialize_approved_with_claim()
         checkpoint = load_json(
             finalize_compaction(paths, self.compaction_plan(paths, None))
@@ -396,11 +396,18 @@ class DemonstrationLifecycleTests(WorkflowTestCase):
         atomic_write_json(
             source_path,
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "study_id": paths.study_id,
                 "verdict_id": verdict_id,
                 "created_at": utc_now(),
                 "reviewer": {"identity": "Test Reviewer", "source": "test"},
+                "review_basis": {
+                    "mode": "waived",
+                    "reason": (
+                        "No imported independent Review was available for this "
+                        "manual boundary fixture."
+                    ),
+                },
                 "judged_scope": {
                     "commit": git_state(paths.root)["commit"],
                     "brief_sha256": sha256_file(paths.brief),

@@ -15,6 +15,7 @@
     "compaction_input_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "claims_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "evidence_inventory": {"$ref": "#/$defs/inventory_binding"},
+    "occurrence_inventory": {"$ref": "#/$defs/inventory_binding"},
     "archive_work_files": {"type": "array", "maxItems": 256, "items": {"type": "string", "minLength": 1, "maxLength": 1024}},
     "decisive_evidence": {"type": "array", "maxItems": 2048, "items": {"$ref": "#/$defs/evidence_ref"}},
     "contradictory_evidence": {"type": "array", "maxItems": 2048, "items": {"$ref": "#/$defs/evidence_ref"}},

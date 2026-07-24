@@ -363,13 +363,26 @@ class BoundedProjectionTests(WorkflowTestCase):
             selector_path = write_active_selector(paths)
         selector = load_json(selector_path)
 
+        self.assertEqual(selector["schema_version"], 2)
         self.assertLess(selector_path.stat().st_size, 98_304)
         self.assertEqual(projection["sequence"], self.graph_sequence_locator())
         self.assertLessEqual(
             len(canonical_json_bytes(projection)),
             GRAPH_RECORD_LOCATOR_BUDGET_BYTES,
         )
-        self.assertEqual(selector["graph_records"], projection)
+        expected_graph_records = {
+            key: value
+            for key, value in projection.items()
+            if key != "workspace_drafts"
+        }
+        self.assertEqual(selector["graph_records"], expected_graph_records)
+        self.assertEqual(
+            selector["workspace"],
+            {
+                "graph_record_drafts": projection["workspace_drafts"],
+                "assurance": "mutable_non_authoritative",
+            },
+        )
         expected = (
             (
                 "experiment_intents",

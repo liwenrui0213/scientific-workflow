@@ -35,12 +35,25 @@ Do not optimize only the easiest visible metric. A performance improvement is
 not eligible when it is obtained by weakening accuracy, convergence, invariants,
 data comparability, or another protected condition.
 
-When the next experiment warrants structure, first express its cognitive
-purpose as an ExperimentIntent: the EvidenceGap it addresses, requested
-observations, evidence requirements, scope, and assessment semantics. Then let
-the Agent design a ControlGraphSpec for how to obtain those observations.
-Alternative Plans may realize the same Intent, but a Plan must bind the exact
-finalized Intent and cannot own or silently change the scientific threshold.
+When the reason for the next experiment warrants a durable boundary, express
+its cognitive purpose as an ExperimentIntent: the EvidenceGap it addresses,
+requested observations, and any justified evidence requirements, scope, or
+assessment semantics. `assessment_semantics` may be `null`; do not invent a
+premature Claim threshold merely to complete a template.
+
+A PLAN is a separate, progressive formalization of **how**, not a mandatory
+companion to every Intent or Run. Create a ControlGraphSpec only when
+`check-formalization` requires it or real parallel dependencies, multi-worker
+orchestration, or comparable control complexity makes it useful. When present,
+it must bind the exact finalized Intent and cannot own or silently change the
+scientific threshold. ControlGraph v2 does not prescribe a DAG, fixed node
+categories, or a retry policy: the Agent chooses and records the topology and
+opaque control specifications within the Brief, repository profile, budget,
+and safety boundaries. `studyctl` validates and activates the exact record; it
+does not interpret or execute the whole graph. When the Agent executes one
+declared node, `--plan-node` binds Run v5 to the exact graph, finalized Intent,
+node ID, and node-spec hash. An active PLAN does not bind an ordinary Run
+implicitly.
 
 ## Build discriminating Evidence
 
@@ -77,6 +90,18 @@ the assessment. Do not promote every Run merely because it completed, and do
 not leave a result that changes an active Claim or important boundary only in
 raw logs.
 
+Observation v3 and Evidence v5 copy the exact finalized Intent-ref set derived
+from each source Run's independent `intent_binding`. Evidence v5 also pins the addressed Claim's
+statement-and-scope digest. These bindings prevent silent reinterpretation of
+which structured why or which Claim version was evaluated; they do not perform
+the scientific inference.
+
+For failures, keep three levels distinct. The immutable Run records what
+happened, including an absent declared output even though that makes the Run
+Evidence-ineligible. A proposed cause is only a candidate explanation until a
+discriminating analysis supports it. A reusable lesson is a scoped Claim backed
+by Claim-specific Evidence, not a free-form “failed direction” record.
+
 ## Separate correctness questions
 
 Ask separately:
@@ -95,7 +120,9 @@ Continue when a feasible experiment can materially distinguish live hypotheses,
 shrink important uncertainty, or test a relevant boundary.
 
 Compact when history has grown but the active scientific state can be expressed
-without losing support, contradiction, or representative failures.
+without losing support, contradiction, or representative failure facts. The
+resulting Checkpoint is a traceable derived snapshot for resumption and review,
+not a new scientific truth source.
 
 Review when the implementation and Evidence chain are mature enough for an
 independent attempt at falsification, or before a human Verdict.

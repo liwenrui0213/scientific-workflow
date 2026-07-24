@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "record_type": "experiment_intent",
   "study_id": "SC-0000",
   "intent_id": "INTENT-0000",
@@ -24,11 +24,7 @@
     "replace_with_observation_name"
   ],
   "evidence_requirements": [],
-  "assessment_semantics": {
-    "aggregation": "all_required",
-    "criteria": [],
-    "default_outcome": "inconclusive"
-  },
+  "assessment_semantics": null,
   "scope": null,
   "assumptions": [],
   "limitations": [],

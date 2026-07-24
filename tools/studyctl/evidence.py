@@ -6,10 +6,19 @@ import copy
 import os
 from pathlib import Path
 import re
+import stat
 from typing import Any, Iterator
 
 from .active_context import active_claims, require_growth_allowed
+from .cognitive_refs import (
+    intent_refs_from_manifests,
+    validate_exact_intent_refs,
+)
 from .evidence_sequence import (
+    advance_finalized_evidence_sequence,
+    finalized_evidence_inventory,
+    recover_unindexed_evidence_finalization,
+    require_consistent_evidence_finalizations,
     reserve_evidence_creation,
 )
 from .formalization import check_formalization
@@ -114,6 +123,125 @@ def _validate_claim_references(paths: StudyPaths, claim_ids: Sequence[str]) -> N
             "new Evidence may address only active Frontier Claim(s): "
             + ", ".join(inactive)
         )
+
+
+def _current_claim_spec_sha256(
+    paths: StudyPaths,
+    claim_id: str,
+    *,
+    allow_missing: bool = False,
+) -> str | None:
+    claims = _claims_object(paths)
+    claim = next(
+        (
+            item
+            for item in claims.get("claims", [])
+            if isinstance(item, dict) and item.get("claim_id") == claim_id
+        ),
+        None,
+    )
+    if claim is None:
+        if allow_missing:
+            return None
+        raise ValidationError(f"Evidence references missing Claim: {claim_id}")
+    from .confirmation import claim_spec_sha256
+
+    return claim_spec_sha256(claim)
+
+
+def _archived_claim_spec_sha256(paths: StudyPaths, claim_id: str) -> str:
+    """Resolve one Claim through a Checkpoint-pinned immutable archive record."""
+
+    records: dict[str, dict[str, Any]] = {}
+    for checkpoint_path in sorted(paths.checkpoints.glob("CHECKPOINT-*.json")):
+        checkpoint = load_json(checkpoint_path)
+        if not isinstance(checkpoint, dict):
+            raise ValidationError(
+                f"Checkpoint must be an object: {checkpoint_path}"
+            )
+        for ref in checkpoint.get("inactive_claim_refs", []):
+            if (
+                not isinstance(ref, dict)
+                or ref.get("claim_id") != claim_id
+            ):
+                continue
+            full_digest = ref.get("sha256")
+            raw_path = ref.get("record_path")
+            if not isinstance(full_digest, str) or not isinstance(raw_path, str):
+                raise ValidationError(
+                    f"archived Claim reference is malformed: {claim_id}"
+                )
+            expected_path = (
+                paths.checkpoints
+                / "claim-records"
+                / f"{claim_id}.{full_digest}.json"
+            )
+            expected_raw = expected_path.relative_to(paths.root).as_posix()
+            if raw_path != expected_raw:
+                raise ValidationError(
+                    f"archived Claim record path is not canonical: {claim_id}"
+                )
+            metadata = expected_path.lstat()
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+            ):
+                raise ValidationError(
+                    f"archived Claim must be a regular, non-linked file: "
+                    f"{claim_id}"
+                )
+            if metadata.st_mode & 0o222:
+                raise ValidationError(
+                    f"archived Claim must be sealed read-only: {claim_id}"
+                )
+            claim = load_json(expected_path)
+            if (
+                not isinstance(claim, dict)
+                or claim.get("claim_id") != claim_id
+                or sha256_json(claim) != full_digest
+            ):
+                raise ValidationError(
+                    f"archived Claim record hash or identity is invalid: "
+                    f"{claim_id}"
+                )
+            records[full_digest] = claim
+    if not records:
+        raise ValidationError(f"Evidence references missing Claim: {claim_id}")
+    if len(records) != 1:
+        raise ValidationError(
+            f"archived Claim has conflicting immutable versions: {claim_id}"
+        )
+    from .confirmation import claim_spec_sha256
+
+    return claim_spec_sha256(next(iter(records.values())))
+
+
+def _validate_claim_spec_binding(
+    paths: StudyPaths,
+    addresses: Any,
+    *,
+    allow_archived: bool = False,
+) -> str:
+    if not isinstance(addresses, dict):
+        raise ValidationError("Evidence addresses must be an object")
+    claim_ids = addresses.get("claim_ids")
+    if not isinstance(claim_ids, list) or len(claim_ids) != 1:
+        raise ValidationError("Evidence must address exactly one Claim")
+    claim_id = str(claim_ids[0])
+    expected = _current_claim_spec_sha256(
+        paths,
+        claim_id,
+        allow_missing=allow_archived,
+    )
+    if expected is None:
+        expected = _archived_claim_spec_sha256(paths, claim_id)
+    if addresses.get("claim_spec_sha256") != expected:
+        raise ValidationError(
+            "Evidence Claim specification changed after the draft was created; "
+            "create a new Claim or Evidence draft instead of reinterpreting it"
+        )
+    return expected
 
 
 def _terminal_run(paths: StudyPaths, run_id: str) -> dict[str, Any]:
@@ -712,6 +840,9 @@ def create_evidence_draft(
             "each new Evidence Argument must address exactly one Claim"
         )
     _validate_claim_references(paths, normalized_claim_ids)
+    claim_spec_digest = _current_claim_spec_sha256(
+        paths, normalized_claim_ids[0]
+    )
     run_refs, fingerprints, changed_fields, manifests = _run_references_for_draft(
         paths, run_ids
     )
@@ -772,8 +903,10 @@ def create_evidence_draft(
             "updated_at": timestamp,
             "addresses": {
                 "claim_ids": normalized_claim_ids,
+                "claim_spec_sha256": claim_spec_digest,
                 "question": None,
             },
+            "intent_refs": intent_refs_from_manifests(paths, manifests),
             "evidence_basis": evidence_basis,
             "observation_ref": promoted_observation_ref,
             "runs": run_refs,
@@ -1121,9 +1254,21 @@ def validate_evidence_basis(paths: StudyPaths, item: dict[str, Any]) -> None:
     validate_evidence_observation_ref(
         paths, item.get("observation_ref"), runs
     )
+    validate_exact_intent_refs(
+        paths,
+        item.get("intent_refs"),
+        manifests,
+        record_label="Evidence",
+    )
+    _validate_claim_spec_binding(
+        paths,
+        item.get("addresses"),
+        allow_archived=True,
+    )
     _validate_final_evidence_basis(paths, item, manifests)
 
 
+@serialized_study_authority
 def finalize_evidence(paths: StudyPaths, source_path: Path) -> Path:
     """Validate an edited draft and atomically replace it with an immutable record."""
     brief_issues = errors_only(brief_content_issues(paths) + brief_approval_issues(paths))
@@ -1155,6 +1300,10 @@ def finalize_evidence(paths: StudyPaths, source_path: Path) -> Path:
 
     destination = paths.evidence / f"{evidence_id}.v{version:04d}.json"
     with _evidence_lock(paths, evidence_id):
+        previous_finalized_inventory = finalized_evidence_inventory(paths)
+        require_consistent_evidence_finalizations(
+            paths, previous_finalized_inventory
+        )
         versions = _versions(paths, evidence_id)
         drafts = [(number, path, value) for number, path, value in versions if value["status"] == "draft"]
         if len(drafts) > 1:
@@ -1174,11 +1323,18 @@ def finalize_evidence(paths: StudyPaths, source_path: Path) -> Path:
 
         claim_ids = item.get("addresses", {}).get("claim_ids", [])
         _validate_claim_references(paths, claim_ids)
+        _validate_claim_spec_binding(paths, item.get("addresses"))
         fingerprints, changed_fields, manifests = _validate_run_references(paths, item)
         from .observation import validate_evidence_observation_ref
 
         validate_evidence_observation_ref(
             paths, item.get("observation_ref"), item.get("runs", [])
+        )
+        validate_exact_intent_refs(
+            paths,
+            item.get("intent_refs"),
+            manifests,
+            record_label="Evidence",
         )
         _validate_related_evidence(paths, item)
         _validate_final_content(item, fingerprints, changed_fields)
@@ -1214,4 +1370,17 @@ def finalize_evidence(paths: StudyPaths, source_path: Path) -> Path:
             mode=0o444,
             before_replace=_ensure_draft_unchanged,
         )
+        advance_finalized_evidence_sequence(
+            paths,
+            previous_inventory=previous_finalized_inventory,
+        )
         return destination
+
+
+@serialized_study_authority
+def recover_evidence_sequence(paths: StudyPaths) -> Path:
+    """Index one finalized Evidence record left by an interrupted publish."""
+
+    recover_unindexed_evidence_finalization(paths)
+    require_consistent_evidence_finalizations(paths)
+    return paths.evidence_sequence

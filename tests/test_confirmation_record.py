@@ -187,7 +187,7 @@ class ConfirmationRecordTests(WorkflowTestCase):
         record_path = self.paths.confirmations / "CONF-0001.json"
 
         self.assertEqual(record["record_sha256"], record_digest(record, "record_sha256"))
-        self.assertEqual(record["schema_version"], 2)
+        self.assertEqual(record["schema_version"], 3)
         self.assertEqual(record["campaign"]["sequence"], 1)
         self.assertTrue(record["campaign"]["campaign_id"].startswith("CAMP-"))
         self.assertEqual(record_path.stat().st_mode & 0o222, 0)

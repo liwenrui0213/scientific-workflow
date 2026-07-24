@@ -488,16 +488,17 @@ def _safe_draft_source(
 
 
 def _validate_intent_content(item: dict[str, Any]) -> None:
-    requirements = item.get("evidence_requirements")
-    if not isinstance(requirements, list) or not requirements:
-        raise ValidationError(
-            "finalized Experiment Intent requires at least one evidence requirement"
-        )
     semantics = item.get("assessment_semantics")
-    criteria = semantics.get("criteria") if isinstance(semantics, dict) else None
-    if not isinstance(criteria, list) or not criteria:
+    if semantics is None:
+        return
+    if not isinstance(semantics, dict):
         raise ValidationError(
-            "finalized Experiment Intent requires explicit assessment criteria"
+            "Experiment Intent assessment_semantics must be an object or null"
+        )
+    criteria = semantics.get("criteria")
+    if not isinstance(criteria, list):
+        raise ValidationError(
+            "Experiment Intent assessment criteria must be an array"
         )
     observations = set(item.get("requested_observations", []))
     criterion_ids: list[str] = []
@@ -542,11 +543,6 @@ def _validate_intent_content(item: dict[str, Any]) -> None:
             )
     if len(criterion_ids) != len(set(criterion_ids)):
         raise ValidationError("Experiment Intent criterion IDs must be unique")
-    scope = item.get("scope")
-    if not isinstance(scope, str) or not scope.strip():
-        raise ValidationError(
-            "finalized Experiment Intent requires an explicit non-empty scope"
-        )
 
 
 def _validate_intent_semantics(paths: StudyPaths, item: dict[str, Any]) -> None:
@@ -711,7 +707,7 @@ def create_control_graph_draft(
     *,
     intent_id: str,
     intent_version: int,
-    executor: str = "studyctl",
+    executor: str = "external",
     cpu_hours: float = 0.0,
     gpu_hours: float = 0.0,
     storage_gb: float = 0.0,
@@ -851,17 +847,12 @@ def _validate_control_graph_semantics(
         node_id = str(node.get("node_id", ""))
         node_ids.append(node_id)
         node_by_id[node_id] = node
-        is_loop = node.get("kind") == "loop"
-        if is_loop != isinstance(node.get("loop_contract"), dict):
-            raise ValidationError(
-                f"Control Graph node {node_id} must use loop_contract exactly "
-                "when kind is 'loop'"
-            )
-        if node.get("kind") in {"task", "validator", "loop", "publish"}:
-            command = node.get("command")
+        command = node.get("command")
+        if command is not None:
             if not isinstance(command, list) or not command:
                 raise ValidationError(
-                    f"Control Graph executable node {node_id} requires a command"
+                    f"Control Graph node {node_id} command must be a non-empty "
+                    "argument array when declared"
                 )
             if any(
                 not isinstance(argument, str) or not argument.strip()
@@ -876,70 +867,30 @@ def _validate_control_graph_semantics(
     edges = item.get("edges")
     if not isinstance(edges, list):
         raise ValidationError("Control Graph edges must be an array")
-    adjacency: dict[str, set[str]] = {node_id: set() for node_id in node_ids}
-    indegree: dict[str, int] = {node_id: 0 for node_id in node_ids}
-    edge_keys: set[tuple[str, str, str]] = set()
     for edge in edges:
         if not isinstance(edge, dict):
             raise ValidationError("Control Graph edge must be an object")
         source = str(edge.get("from", ""))
         target = str(edge.get("to", ""))
-        condition = str(edge.get("condition", ""))
         if source not in node_by_id or target not in node_by_id:
             raise ValidationError(
                 f"Control Graph edge endpoint is missing: {source} -> {target}"
             )
-        if source == target:
-            raise ValidationError(
-                "Control Graph top-level edges must be acyclic; use a bounded "
-                "loop node instead of a self-edge"
-            )
-        key = (source, target, condition)
-        if key in edge_keys:
-            raise ValidationError("Control Graph repeats an edge")
-        edge_keys.add(key)
-        if target not in adjacency[source]:
-            adjacency[source].add(target)
-            indegree[target] += 1
-    queue = sorted(node_id for node_id, degree in indegree.items() if degree == 0)
-    visited: list[str] = []
-    while queue:
-        node_id = queue.pop(0)
-        visited.append(node_id)
-        for target in sorted(adjacency[node_id]):
-            indegree[target] -= 1
-            if indegree[target] == 0:
-                queue.append(target)
-                queue.sort()
-    if len(visited) != len(node_ids):
-        raise ValidationError(
-            "Control Graph top-level edges contain a cycle; encapsulate iteration "
-            "inside a bounded loop node"
-        )
-    terminal_nodes = {
-        node_id for node_id, targets in adjacency.items() if not targets
-    }
     completion = item.get("completion")
     required = (
         completion.get("required_node_ids")
         if isinstance(completion, dict)
         else None
     )
-    if not isinstance(required, list) or not required:
+    if not isinstance(required, list):
         raise ValidationError(
-            "finalized Control Graph requires at least one completion node"
+            "Control Graph completion required_node_ids must be an array"
         )
     missing = sorted(set(required) - set(node_ids))
     if missing:
         raise ValidationError(
             "Control Graph completion references missing node(s): "
             + ", ".join(missing)
-        )
-    nonterminal = sorted(set(required) - terminal_nodes)
-    if nonterminal:
-        raise ValidationError(
-            "Control Graph completion nodes must be terminal: "
-            + ", ".join(nonterminal)
         )
 
 

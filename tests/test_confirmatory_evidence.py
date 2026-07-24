@@ -16,6 +16,10 @@ from tools.studyctl.evidence import (
 )
 from tools.studyctl.hashing import atomic_write_json, load_json
 from tools.studyctl.models import ValidationError, utc_now
+from tools.studyctl.observation import (
+    create_observation_draft,
+    finalize_observation,
+)
 from tools.studyctl.run_registry import execute_run
 from tools.studyctl.validation import errors_only, validate_study
 
@@ -117,6 +121,11 @@ class ConfirmatoryEvidenceTests(WorkflowTestCase):
                 "precision": "exact-integer",
                 "cohort_fields": {},
                 "input_paths": [],
+                "outcome_contract": {
+                    "acceptable_terminal_statuses": ["succeeded"],
+                    "observation_required": True,
+                    "required_output_paths": [],
+                },
             }
             for slot_id in slot_ids
         ]
@@ -153,6 +162,56 @@ class ConfirmatoryEvidenceTests(WorkflowTestCase):
     def populate_evidence(self, draft_path: Path) -> dict[str, object]:
         draft = load_json(draft_path)
         self.assertIsInstance(draft, dict)
+        if draft["evidence_basis"]["mode"] in {"confirmatory", "mixed"}:
+            observation_id = draft["evidence_id"].replace("EVID-", "OBS-")
+            observation_path = create_observation_draft(
+                self.paths,
+                observation_id,
+                [run_ref["run_id"] for run_ref in draft["runs"]],
+                ["confirmatory_use"],
+            )
+            observation = load_json(observation_path)
+            observation["promotion"]["rationale"] = (
+                "The confirmatory outcome contract requires a reusable formal Observation."
+            )
+            observation["analysis"].update(
+                {
+                    "method": self.method,
+                    "inclusion_rule": "Include every Run disclosed by this Evidence.",
+                    "exclusion_rule": "Exclude no listed Run.",
+                    "aggregation_rule": "Report the exact deterministic fixture result.",
+                }
+            )
+            if len(observation["cohorts"]) > 1:
+                observation["analysis"]["cohort_compatibility_justification"] = (
+                    "The fixture compares the same exact-integer outcome across "
+                    "the explicitly recorded exploratory and confirmatory Cohorts."
+                )
+            observation["results"]["primary"] = {
+                "value": 4,
+                "comparison": "equal",
+            }
+            observation["uncertainty"] = {
+                "statistical": "No sampling uncertainty.",
+                "numerical": "Exact integer arithmetic.",
+                "measurement": "No external measurement.",
+            }
+            observation["scope"] = "The exact deterministic fixture Runs."
+            observation["analysis_assumptions"] = [
+                "Each immutable Run accurately records its deterministic outcome."
+            ]
+            observation["limitations"] = [
+                "The fixture does not establish a broader scientific result."
+            ]
+            atomic_write_json(observation_path, observation)
+            finalized_observation = load_json(
+                finalize_observation(self.paths, observation_path)
+            )
+            draft["observation_ref"] = {
+                "observation_id": finalized_observation["observation_id"],
+                "version": finalized_observation["version"],
+                "sha256": finalized_observation["record_sha256"],
+            }
         draft["addresses"]["question"] = "Does the deterministic result equal four?"
         for run_ref in draft["runs"]:
             run_ref["role"] = "supporting"
@@ -434,7 +493,7 @@ class ConfirmatoryEvidenceTests(WorkflowTestCase):
             [str(first["run_id"]), str(second["run_id"])],
         )
         draft = self.populate_evidence(draft_path)
-        draft["runs"][0]["role"] = "failed_direction"
+        draft["runs"][0]["role"] = "failed_attempt"
         atomic_write_json(draft_path, draft)
         finalized = load_json(finalize_evidence(self.paths, draft_path))
         campaign = finalized["evidence_basis"]["confirmation_campaign"]
@@ -571,7 +630,7 @@ class ConfirmatoryEvidenceTests(WorkflowTestCase):
 
         with self.assertRaisesRegex(
             ValidationError,
-            "Claim statement or scope changed after Confirmation",
+            "Claim specification changed after the draft was created",
         ):
             finalize_evidence(self.paths, draft_path)
         self.assertEqual(load_json(draft_path)["status"], "draft")

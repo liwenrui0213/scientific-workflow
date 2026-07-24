@@ -21,10 +21,12 @@ from .checkpoint_sequence import (
 from .evidence_sequence import (
     evidence_sequence_temporary_paths,
     load_evidence_sequence,
+    require_consistent_evidence_finalizations,
 )
 from .observation_sequence import (
     load_observation_sequence,
     observation_sequence_temporary_paths,
+    require_consistent_observation_finalizations,
 )
 from .hashing import (
     canonical_json_bytes,
@@ -115,6 +117,63 @@ _RUN_V2_TOP_LEVEL_KEYS = {
     "integrity",
 }
 _RUN_V1_TOP_LEVEL_KEYS = _RUN_V2_TOP_LEVEL_KEYS - {"change_scope"}
+
+
+def _legacy_unattested_execution_boundary() -> dict[str, Any]:
+    """Return a schema-only V5 projection for Runs that predate isolation.
+
+    This object is never written to an immutable legacy Manifest and does not
+    grant Evidence eligibility.  It exists only so shared current-schema fields
+    can continue to be checked without pretending the historical Run had a
+    kernel-enforced execution capsule.
+    """
+
+    environment: dict[str, str] = {}
+    return {
+        "mode": "sealed",
+        "backend": "macos-seatbelt",
+        "backend_version": "legacy-unattested",
+        "policy_format": "seatbelt-profile-v1",
+        "policy_sha256": "0" * 64,
+        "environment_allowlist": [],
+        "environment_variables": environment,
+        "environment_sha256": sha256_json(environment),
+        "network_access": False,
+        "repository_write_access": False,
+        "declared_inputs_only": True,
+        "declared_outputs_only": True,
+        "read_only_paths": [],
+        "writable_paths": [],
+        "output_staging": "direct",
+        "device_paths": [],
+    }
+
+
+def _project_legacy_execution_boundary(raw: Any) -> Any:
+    """Fill V5-only capsule metadata in a transient V3/V4 schema view.
+
+    The returned object is used only by schema validation. Evidence eligibility
+    always inspects the immutable original Manifest, so an absent historical
+    binding remains absent and cannot be upgraded by this projection.
+    """
+
+    if not isinstance(raw, dict):
+        return raw
+    projected = copy.deepcopy(raw)
+    backend = projected.get("backend")
+    if backend == "linux-bubblewrap":
+        projected.setdefault("policy_format", "bubblewrap-mount-policy-v1")
+        projected.setdefault("output_staging", "private-copy-out")
+    elif backend == "macos-seatbelt":
+        projected.setdefault("policy_format", "seatbelt-profile-v1")
+        projected.setdefault("output_staging", "direct")
+    projected.setdefault("backend_version", "legacy-unattested")
+    projected.setdefault("device_paths", [])
+    projected.setdefault("environment_variables", {})
+    environment = projected.get("environment_variables")
+    if isinstance(environment, dict):
+        projected.setdefault("environment_sha256", sha256_json(environment))
+    return projected
 
 
 def _run_v2_shape_messages(value: dict[str, Any]) -> list[str]:
@@ -499,15 +558,20 @@ def object_schema_issues(
                 for message in v2_messages
             ]
         # Validate all fields shared with the current Run contract through a
-        # transient V4 view, adding only fields that did not exist in V2.
+        # transient V5 view, adding only fields that did not exist in V2.
         validation_value = copy.deepcopy(value)
-        validation_value["schema_version"] = 4
+        validation_value["schema_version"] = 5
         validation_value["epistemic_role"] = {
             "mode": "exploratory",
             "confirmation_id": None,
             "confirmation_sha256": None,
             "slot_id": None,
         }
+        validation_value["control_binding"] = None
+        validation_value["intent_binding"] = None
+        validation_value["execution_boundary"] = (
+            _legacy_unattested_execution_boundary()
+        )
         brief = validation_value["brief"]
         brief["snapshot"] = {
             "path": "<legacy-v2-unattested-brief>",
@@ -562,17 +626,22 @@ def object_schema_issues(
                 for message in v1_messages
             ]
         # V1 manifests are immutable historical records. Validate a transient
-        # V4-shaped view instead of rewriting disk; their synthetic scope stays
+        # V5-shaped view instead of rewriting disk; their synthetic scope stays
         # deliberately Evidence-ineligible and their epistemic role is
         # conservatively exploratory.
         validation_value = copy.deepcopy(value)
-        validation_value["schema_version"] = 4
+        validation_value["schema_version"] = 5
         validation_value["epistemic_role"] = {
             "mode": "exploratory",
             "confirmation_id": None,
             "confirmation_sha256": None,
             "slot_id": None,
         }
+        validation_value["control_binding"] = None
+        validation_value["intent_binding"] = None
+        validation_value["execution_boundary"] = (
+            _legacy_unattested_execution_boundary()
+        )
         execution = validation_value.get("execution")
         if isinstance(execution, dict):
             execution.setdefault("cwd_relative", ".")
@@ -684,22 +753,66 @@ def object_schema_issues(
         # exploratory/confirmatory provenance.  Its immutable absence of an
         # epistemic role is always interpreted as exploratory; it can never be
         # upgraded after the fact merely by changing a label.
-        if "epistemic_role" in value:
+        unexpected = next(
+            (
+                field
+                for field in ("epistemic_role", "control_binding", "intent_binding")
+                if field in value
+            ),
+            None,
+        )
+        if unexpected is not None:
             return [
                 ValidationIssue(
                     "ERROR",
                     str(path),
-                    "$: additional property is not allowed: 'epistemic_role'",
+                    f"$: additional property is not allowed: {unexpected!r}",
                 )
             ]
         validation_value = copy.deepcopy(value)
-        validation_value["schema_version"] = 4
+        validation_value["schema_version"] = 5
         validation_value["epistemic_role"] = {
             "mode": "exploratory",
             "confirmation_id": None,
             "confirmation_sha256": None,
             "slot_id": None,
         }
+        validation_value["control_binding"] = None
+        validation_value["intent_binding"] = None
+        validation_value["execution_boundary"] = (
+            _project_legacy_execution_boundary(
+                validation_value.get("execution_boundary")
+            )
+        )
+    elif original_run_version == 4:
+        # V4 introduced immutable epistemic roles but predates Control Graph
+        # node binding. Preserve its exact historical bytes and project only a
+        # null binding into the transient current-schema validation view.
+        unexpected = next(
+            (
+                field
+                for field in ("control_binding", "intent_binding")
+                if field in value
+            ),
+            None,
+        )
+        if unexpected is not None:
+            return [
+                ValidationIssue(
+                    "ERROR",
+                    str(path),
+                    f"$: additional property is not allowed: {unexpected!r}",
+                )
+            ]
+        validation_value = copy.deepcopy(value)
+        validation_value["schema_version"] = 5
+        validation_value["control_binding"] = None
+        validation_value["intent_binding"] = None
+        validation_value["execution_boundary"] = (
+            _project_legacy_execution_boundary(
+                validation_value.get("execution_boundary")
+            )
+        )
     return [
         ValidationIssue("ERROR", str(path), message)
         for message in validate_schema_instance(validation_value, schema)
@@ -935,14 +1048,14 @@ def run_ledger_issues(
         current = load_ledger(paths)
         if current is None:
             if any(
-                manifest.get("schema_version") in {3, 4}
+                manifest.get("schema_version") in {3, 4, 5}
                 for _, manifest in runs.values()
             ):
                 return [
                     ValidationIssue(
                         "ERROR",
                         str(path),
-                        "Run ledger is missing for current V3/V4 Run history",
+                        "Run ledger is missing for current V3/V4/V5 Run history",
                     )
                 ]
             if runs:
@@ -1139,7 +1252,7 @@ def run_index(paths: StudyPaths) -> dict[str, tuple[Path, dict[str, Any]]]:
             raise ValidationError(
                 f"Run {run_id} identity does not match directory {path.parent.name}"
             )
-        if value.get("schema_version") in {1, 2, 3, 4}:
+        if value.get("schema_version") in {1, 2, 3, 4, 5}:
             # Budget registration is a hard authorization boundary. Validate
             # its reservation and terminal digest before any caller can use
             # this index to admit a later Run.
@@ -1281,9 +1394,9 @@ def _run_brief_authority_issues(
     *,
     for_evidence: bool,
 ) -> list[ValidationIssue]:
-    """Verify the immutable Brief and approval that authorized a V3/V4 Run."""
+    """Verify the immutable Brief and approval that authorized a V3+ Run."""
 
-    if manifest.get("schema_version") not in {3, 4}:
+    if manifest.get("schema_version") not in {3, 4, 5}:
         return []
     issues: list[ValidationIssue] = []
     run_id = str(manifest.get("run_id") or "<unknown Run>")
@@ -1475,11 +1588,19 @@ def run_dependency_integrity_issues(
     elif (
         not isinstance(schema_version, int)
         or isinstance(schema_version, bool)
-        or schema_version not in {2, 3, 4}
+        or schema_version not in {2, 3, 4, 5}
     ):
         issues.append(
             ValidationIssue("ERROR", run_id, f"unsupported Run schema_version: {schema_version!r}")
         )
+
+    if schema_version == 5:
+        try:
+            from .cognitive_refs import validate_run_control_binding
+
+            validate_run_control_binding(paths, manifest)
+        except (ValidationError, OSError, ValueError) as exc:
+            issues.append(ValidationIssue("ERROR", run_id, str(exc)))
 
     issues.extend(
         _run_brief_authority_issues(
@@ -1490,7 +1611,7 @@ def run_dependency_integrity_issues(
     )
 
     change_scope = manifest.get("change_scope")
-    if isinstance(change_scope, dict) and schema_version in {2, 3, 4}:
+    if isinstance(change_scope, dict) and schema_version in {2, 3, 4, 5}:
         for key, required in (
             ("repository_profile", True),
             ("changeset", False),
@@ -1701,7 +1822,7 @@ def retained_run_output_budget_issues(
 
 def sealed_run_evidence_eligible(manifest: dict[str, Any]) -> bool:
     schema_version = manifest.get("schema_version")
-    if schema_version not in {2, 3, 4}:
+    if schema_version not in {2, 3, 4, 5}:
         return False
     if manifest.get("status") not in {"succeeded", "failed", "interrupted"}:
         return False
@@ -1715,24 +1836,50 @@ def sealed_run_evidence_eligible(manifest: dict[str, Any]) -> bool:
         boundary.get("environment_variables") if isinstance(boundary, dict) else None
     )
     environment_binding_valid = (
-        backend == "macos-seatbelt"
-        and (
-            boundary_environment is None
-            or (
-                isinstance(boundary_environment, dict)
-                and boundary.get("environment_sha256")
-                == sha256_json(boundary_environment)
-            )
-        )
-    ) or (
-        backend == "linux-bubblewrap"
+        backend in supported_backends
         and isinstance(boundary_environment, dict)
+        and all(
+            isinstance(name, str)
+            and bool(name)
+            and isinstance(value, str)
+            for name, value in boundary_environment.items()
+        )
         and boundary.get("environment_sha256") == sha256_json(boundary_environment)
+    )
+    boundary_lists_valid = (
+        isinstance(boundary, dict)
+        and isinstance(boundary.get("environment_allowlist"), list)
+        and all(
+            isinstance(name, str) and name
+            for name in boundary["environment_allowlist"]
+        )
+        and len(boundary["environment_allowlist"])
+        == len(set(boundary["environment_allowlist"]))
+        and set(boundary_environment or {}).issubset(
+            set(boundary["environment_allowlist"])
+        )
+        and isinstance(boundary.get("read_only_paths"), list)
+        and all(
+            isinstance(path, str) and path for path in boundary["read_only_paths"]
+        )
+        and isinstance(boundary.get("writable_paths"), list)
+        and all(
+            isinstance(path, str) and path for path in boundary["writable_paths"]
+        )
+        and isinstance(boundary.get("device_paths"), list)
+        and all(
+            isinstance(path, str) and path for path in boundary["device_paths"]
+        )
+    )
+    backend_version_valid = (
+        isinstance(boundary, dict)
+        and isinstance(boundary.get("backend_version"), str)
+        and bool(boundary["backend_version"].strip())
     )
     backend_policy_valid = (
         backend == "macos-seatbelt"
-        and boundary.get("policy_format") in {None, "seatbelt-profile-v1"}
-        and boundary.get("output_staging") in {None, "direct"}
+        and boundary.get("policy_format") == "seatbelt-profile-v1"
+        and boundary.get("output_staging") == "direct"
     ) or (
         backend == "linux-bubblewrap"
         and boundary.get("policy_format") == "bubblewrap-mount-policy-v1"
@@ -1786,8 +1933,10 @@ def sealed_run_evidence_eligible(manifest: dict[str, Any]) -> bool:
         and boundary.get("mode") == "sealed"
         and boundary.get("declared_inputs_only") is True
         and boundary.get("backend") in supported_backends
+        and backend_version_valid
         and backend_policy_valid
         and environment_binding_valid
+        and boundary_lists_valid
         and isinstance(boundary.get("policy_sha256"), str)
         and re.fullmatch(r"[0-9a-f]{64}", boundary["policy_sha256"]) is not None
         and boundary.get("repository_write_access") is False
@@ -1800,11 +1949,11 @@ def effective_run_epistemic_mode(manifest: dict[str, Any]) -> str:
     """Return the only epistemic mode supported by the immutable Run bytes.
 
     V1--V3 predate the V4 role binding and are therefore permanently
-    exploratory.  For V4, schema validation is responsible for the exact role
-    shape; this helper still fails conservatively when used on malformed input.
+    exploratory. For V4 and V5, schema validation is responsible for the exact
+    role shape; this helper still fails conservatively on malformed input.
     """
 
-    if manifest.get("schema_version") != 4:
+    if manifest.get("schema_version") not in {4, 5}:
         return "exploratory"
     role = manifest.get("epistemic_role")
     if isinstance(role, dict) and role.get("mode") == "confirmatory":
@@ -1956,7 +2105,7 @@ def _run_issues(paths: StudyPaths) -> tuple[list[ValidationIssue], dict[str, tup
                     )
                 )
             change_scope = manifest.get("change_scope", {})
-            if manifest.get("schema_version") in {2, 3, 4}:
+            if manifest.get("schema_version") in {2, 3, 4, 5}:
                 expected_eligibility = sealed_run_evidence_eligible(manifest)
                 if change_scope.get("evidence_eligible") is not expected_eligibility:
                     issues.append(
@@ -1975,7 +2124,7 @@ def _run_issues(paths: StudyPaths) -> tuple[list[ValidationIssue], dict[str, tup
                     )
                 )
             budget = manifest.get("budget", {})
-            if manifest.get("schema_version") in {3, 4} and isinstance(budget, dict):
+            if manifest.get("schema_version") in {3, 4, 5} and isinstance(budget, dict):
                 try:
                     manifest_budget_commitment(manifest)
                     expected_budget = budget_projection(
@@ -2203,6 +2352,7 @@ def observation_sequence_issues(paths: StudyPaths) -> list[ValidationIssue]:
                     "Observation record count",
                 )
             )
+        require_consistent_observation_finalizations(paths)
         high_water_mark = int(sequence["high_water_mark"])
         previous_watermark = 0
         for checkpoint_path in checkpoint_paths(paths):
@@ -2514,11 +2664,36 @@ def _strong_confirmatory_evidence(
     paths: StudyPaths,
     item: dict[str, Any],
 ) -> bool:
+    if item.get("assessment") != "supports":
+        return False
     basis = item.get("evidence_basis")
     if not isinstance(basis, dict) or basis.get("mode") not in {
         "confirmatory",
         "mixed",
     }:
+        return False
+    planned_slot_ids = basis.get("planned_slot_ids")
+    included_slot_ids = basis.get("included_slot_ids")
+    if (
+        not isinstance(planned_slot_ids, list)
+        or not planned_slot_ids
+        or included_slot_ids != planned_slot_ids
+        or basis.get("missing_slot_ids") != []
+        or basis.get("excluded_confirmatory_runs") != []
+    ):
+        return False
+    confirmatory_run_ids = basis.get("confirmatory_run_ids")
+    if not isinstance(confirmatory_run_ids, list) or not confirmatory_run_ids:
+        return False
+    confirmatory_ids = set(confirmatory_run_ids)
+    supporting_refs = [
+        ref
+        for ref in item.get("runs", [])
+        if isinstance(ref, dict)
+        and ref.get("run_id") in confirmatory_ids
+        and ref.get("role") == "supporting"
+    ]
+    if not supporting_refs:
         return False
     campaign = basis.get("confirmation_campaign")
     campaign_confirmations = (
@@ -2539,6 +2714,7 @@ def _strong_confirmatory_evidence(
             paths, str(latest_ref.get("confirmation_id", ""))
         )
         current_campaign = confirmation_campaign_records(paths, latest)
+        runs = run_index(paths)
     except (OSError, ValidationError, WorkflowError):
         return False
     current_latest = current_campaign[-1]
@@ -2549,14 +2725,121 @@ def _strong_confirmatory_evidence(
         != current_latest.get("campaign", {}).get("sequence")
     ):
         return False
+    declared_campaign = [
+        (
+            ref.get("confirmation_id"),
+            ref.get("sha256"),
+            ref.get("sequence"),
+        )
+        for ref in campaign_confirmations
+        if isinstance(ref, dict)
+    ]
+    current_campaign_identity = [
+        (
+            record.get("confirmation_id"),
+            record.get("record_sha256"),
+            record.get("campaign", {}).get("sequence"),
+        )
+        for record in current_campaign
+    ]
+    if declared_campaign != current_campaign_identity:
+        return False
     held_out = basis.get("held_out")
     if not isinstance(held_out, dict):
         return False
     status = held_out.get("status")
     freshness = held_out.get("freshness")
-    return (status == "held_out" and freshness == "fresh") or (
-        status == "not_applicable" and freshness == "not_applicable"
-    )
+    if not (
+        (status == "held_out" and freshness == "fresh")
+        or (status == "not_applicable" and freshness == "not_applicable")
+    ):
+        return False
+
+    observation = None
+    if item.get("observation_ref") is not None:
+        try:
+            from .observation import validate_evidence_observation_ref
+
+            observation = validate_evidence_observation_ref(
+                paths,
+                item.get("observation_ref"),
+                item.get("runs", []),
+            )
+        except (OSError, ValidationError, WorkflowError):
+            return False
+
+    confirmations_by_id = {
+        str(record.get("confirmation_id")): record for record in current_campaign
+    }
+    for run_ref in supporting_refs:
+        run_id = str(run_ref.get("run_id", ""))
+        indexed = runs.get(run_id)
+        if indexed is None:
+            return False
+        _, manifest = indexed
+        if run_ref.get("manifest_sha256") != manifest.get("integrity", {}).get(
+            "manifest_sha256"
+        ):
+            return False
+        role = manifest.get("epistemic_role")
+        if not isinstance(role, dict) or role.get("mode") != "confirmatory":
+            return False
+        confirmation_id = str(role.get("confirmation_id", ""))
+        confirmation = confirmations_by_id.get(confirmation_id)
+        if (
+            confirmation is None
+            or role.get("confirmation_sha256")
+            != confirmation.get("record_sha256")
+        ):
+            return False
+        slot = next(
+            (
+                candidate
+                for candidate in confirmation.get("run_slots", [])
+                if isinstance(candidate, dict)
+                and candidate.get("slot_id") == role.get("slot_id")
+            ),
+            None,
+        )
+        if slot is None:
+            return False
+        if confirmation.get("schema_version") == 3:
+            outcome_contract = slot.get("outcome_contract")
+            if not isinstance(outcome_contract, dict):
+                return False
+            acceptable_statuses = outcome_contract.get(
+                "acceptable_terminal_statuses"
+            )
+            if (
+                not isinstance(acceptable_statuses, list)
+                or manifest.get("status") not in acceptable_statuses
+            ):
+                return False
+            outputs_by_path = {
+                output.get("path"): output
+                for output in manifest.get("outputs", [])
+                if isinstance(output, dict)
+            }
+            for output_path in outcome_contract.get("required_output_paths", []):
+                output = outputs_by_path.get(output_path)
+                if (
+                    not isinstance(output, dict)
+                    or output.get("present") is not True
+                    or not isinstance(output.get("size"), int)
+                    or not isinstance(output.get("sha256"), str)
+                    or not output["sha256"]
+                ):
+                    return False
+            if outcome_contract.get("observation_required") is True and observation is None:
+                return False
+        else:
+            # Historical v2 Confirmation Records remain readable, but they did
+            # not freeze an outcome contract.  They therefore use the narrow,
+            # fail-closed promotion fallback: a successful supporting Run plus
+            # a finalized Observation that binds its exact manifest.
+            if manifest.get("status") != "succeeded" or observation is None:
+                return False
+    return True
 
 
 def evidence_sequence_issues(paths: StudyPaths) -> list[ValidationIssue]:
@@ -2591,6 +2874,7 @@ def evidence_sequence_issues(paths: StudyPaths) -> list[ValidationIssue]:
                     "Evidence sequence high_water_mark is below the visible Evidence record count",
                 )
             )
+        require_consistent_evidence_finalizations(paths)
         previous_watermark = 0
         for checkpoint_path in checkpoint_paths(paths):
             checkpoint = load_json(checkpoint_path)
@@ -2650,6 +2934,8 @@ def _claims_issues(
         claims_by_id: dict[str, dict[str, Any]] = {}
         lifecycles: dict[str, str] = {}
         refs_by_claim: dict[str, dict[str, set[tuple[str, int]]]] = {}
+        from .confirmation import claim_spec_sha256
+
         for claim in claims_data.get("claims", []):
             if not isinstance(claim, dict):
                 issues.append(
@@ -2719,6 +3005,17 @@ def _claims_issues(
                         issues.append(ValidationIssue("ERROR", str(paths.claims), f"Claim {claim_id} has stale Evidence hash {key}"))
                     if claim_id not in item.get("addresses", {}).get("claim_ids", []):
                         issues.append(ValidationIssue("ERROR", str(paths.claims), f"Evidence {key} does not address Claim {claim_id}"))
+                    elif item.get("addresses", {}).get(
+                        "claim_spec_sha256"
+                    ) != claim_spec_sha256(claim):
+                        issues.append(
+                            ValidationIssue(
+                                "ERROR",
+                                str(paths.claims),
+                                f"Evidence {key} binds a different statement/scope "
+                                f"for Claim {claim_id}",
+                            )
+                        )
                     assessment = item.get("assessment")
                     if group_name == "supporting" and assessment != "supports":
                         issues.append(
@@ -2776,7 +3073,7 @@ def _claims_issues(
                 )
             if state in {"partially_supported", "numerically_supported"} and not groups["supporting"]:
                 issues.append(ValidationIssue("ERROR", str(paths.claims), f"Claim {claim_id} state {state} requires supporting Evidence"))
-            if state == "partially_supported" and (
+            if state in {"partially_supported", "numerically_supported"} and (
                 not isinstance(claim.get("scope"), str)
                 or not str(claim.get("scope")).strip()
             ):
@@ -2784,7 +3081,7 @@ def _claims_issues(
                     ValidationIssue(
                         "ERROR",
                         str(paths.claims),
-                        f"Claim {claim_id} state partially_supported requires an explicit bounded scope",
+                        f"Claim {claim_id} state {state} requires an explicit bounded scope",
                     )
                 )
             if state == "numerically_supported" and not has_strong_confirmation:
@@ -2792,9 +3089,37 @@ def _claims_issues(
                     ValidationIssue(
                         "ERROR",
                         str(paths.claims),
-                        f"Claim {claim_id} state numerically_supported requires fresh held-out or not-applicable confirmatory Evidence",
+                        f"Claim {claim_id} state numerically_supported requires "
+                        "fresh held-out or not-applicable confirmatory Evidence "
+                        "satisfying the frozen outcome contract",
                     )
                 )
+            if state == "numerically_supported" and groups["contradictory"]:
+                conflict_disposition = claim.get("conflict_disposition")
+                disposition_status = (
+                    conflict_disposition.get("status")
+                    if isinstance(conflict_disposition, dict)
+                    else None
+                )
+                synthesis = (
+                    conflict_disposition.get("synthesis")
+                    if isinstance(conflict_disposition, dict)
+                    else None
+                )
+                if (
+                    disposition_status not in {"resolved", "scope_limited"}
+                    or not isinstance(synthesis, str)
+                    or not synthesis.strip()
+                ):
+                    issues.append(
+                        ValidationIssue(
+                            "ERROR",
+                            str(paths.claims),
+                            f"Claim {claim_id} state numerically_supported with "
+                            "contradictory Evidence requires a resolved or "
+                            "scope_limited conflict_disposition with non-empty synthesis",
+                        )
+                    )
             if state == "contradicted" and not groups["contradictory"]:
                 issues.append(ValidationIssue("ERROR", str(paths.claims), f"Claim {claim_id} state contradicted requires contradictory Evidence"))
             if state == "inconclusive" and evidence_count == 0:
@@ -2881,13 +3206,28 @@ def _claims_issues(
             if item.get("status") != "finalized":
                 continue
             assessment = item.get("assessment")
+            if assessment not in {"contradicts", "mixed"}:
+                # A finalized Evidence record already carries its exact Claim
+                # specification binding. Requiring every supporting record to
+                # be mirrored immediately in CLAIMS.json would turn the normal
+                # evidence-to-claim update interval into an invalid state.
+                # Counterevidence remains fail-closed because omitting it could
+                # silently overstate the Claim.
+                continue
             for claim_id in item.get("addresses", {}).get("claim_ids", []):
                 groups = refs_by_claim.get(claim_id)
                 if groups is None:
                     continue
                 key = (evidence_id, version)
-                if assessment in {"contradicts", "mixed"} and key not in groups["contradictory"]:
-                    issues.append(ValidationIssue("ERROR", str(paths.claims), f"Claim {claim_id} omits contradictory Evidence {key}"))
+                if key not in groups["contradictory"]:
+                    issues.append(
+                        ValidationIssue(
+                            "ERROR",
+                            str(paths.claims),
+                            f"Claim {claim_id} omits finalized Evidence {key} "
+                            "from its contradictory disposition",
+                        )
+                    )
         return issues, claims_data
     except (ValidationError, OSError, ValueError) as exc:
         issues.append(ValidationIssue("ERROR", str(paths.claims), str(exc)))
@@ -3083,7 +3423,27 @@ def _checkpoint_issues(
 ) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
     observation_records = observations or {}
+    try:
+        from .graph_record_sequence import require_graph_record_sequence
+
+        current_graph_sequence = require_graph_record_sequence(paths)
+        current_graph_locator = {
+            "path": paths.graph_record_sequence.relative_to(
+                paths.root
+            ).as_posix(),
+            "size": paths.graph_record_sequence.stat().st_size,
+            "file_sha256": sha256_file(paths.graph_record_sequence),
+        }
+    except (OSError, ValidationError, ValueError):
+        # The graph-record sequence validator reports the primary authority
+        # failure. Checkpoint comparisons below remain meaningful only when
+        # that live sequence is itself valid.
+        current_graph_sequence = None
+        current_graph_locator = None
     previous: dict[str, Any] | None = None
+    previous_graph_high_water_mark = 0
+    previous_graph_inventory_sha256: str | None = None
+    previous_graph_locator: dict[str, Any] | None = None
     previous_claim_states: dict[str, tuple[str, str | None]] = {}
     terminal_claim_states: dict[str, tuple[str, str | None]] = {}
     terminal_claim_digests: dict[str, str] = {}
@@ -3106,6 +3466,126 @@ def _checkpoint_issues(
                 issues.append(ValidationIssue("ERROR", str(path), "Checkpoint filename does not match ID"))
             if item.get("checkpoint_sha256") != record_digest(item, "checkpoint_sha256"):
                 issues.append(ValidationIssue("ERROR", str(path), "checkpoint_sha256 does not match"))
+            graph_sequence = item.get("graph_record_sequence")
+            if isinstance(graph_sequence, dict):
+                canonical_graph_sequence_path = (
+                    paths.graph_record_sequence.relative_to(paths.root).as_posix()
+                )
+                if graph_sequence.get("path") != canonical_graph_sequence_path:
+                    issues.append(
+                        ValidationIssue(
+                            "ERROR",
+                            str(path),
+                            "Checkpoint Graph-record sequence path is not the "
+                            "canonical Study authority",
+                        )
+                    )
+                graph_high_water_mark = graph_sequence.get("high_water_mark")
+                graph_inventory_sha256 = graph_sequence.get("inventory_sha256")
+                if (
+                    isinstance(graph_high_water_mark, int)
+                    and not isinstance(graph_high_water_mark, bool)
+                    and graph_high_water_mark >= 0
+                    and isinstance(graph_inventory_sha256, str)
+                ):
+                    if graph_high_water_mark < previous_graph_high_water_mark:
+                        issues.append(
+                            ValidationIssue(
+                                "ERROR",
+                                str(path),
+                                "Checkpoint Graph-record high-water mark regressed "
+                                f"from {previous_graph_high_water_mark} to "
+                                f"{graph_high_water_mark}",
+                            )
+                        )
+                    if (
+                        graph_high_water_mark
+                        == previous_graph_high_water_mark
+                        and previous_graph_inventory_sha256 is not None
+                        and graph_inventory_sha256
+                        != previous_graph_inventory_sha256
+                    ):
+                        issues.append(
+                            ValidationIssue(
+                                "ERROR",
+                                str(path),
+                                "Checkpoint Graph-record inventory changed without "
+                                "advancing its high-water mark",
+                            )
+                        )
+                    if (
+                        graph_high_water_mark
+                        == previous_graph_high_water_mark
+                        and previous_graph_locator is not None
+                        and any(
+                            graph_sequence.get(field)
+                            != previous_graph_locator.get(field)
+                            for field in ("path", "size", "file_sha256")
+                        )
+                    ):
+                        issues.append(
+                            ValidationIssue(
+                                "ERROR",
+                                str(path),
+                                "Checkpoint Graph-record sequence locator changed "
+                                "without advancing its high-water mark",
+                            )
+                        )
+                    if current_graph_sequence is not None:
+                        current_high_water_mark = int(
+                            current_graph_sequence["high_water_mark"]
+                        )
+                        if graph_high_water_mark > current_high_water_mark:
+                            issues.append(
+                                ValidationIssue(
+                                    "ERROR",
+                                    str(paths.graph_record_sequence),
+                                    "Graph-record sequence high_water_mark is below "
+                                    f"Checkpoint {checkpoint_id} watermark "
+                                    f"{graph_high_water_mark}",
+                                )
+                            )
+                        elif (
+                            graph_high_water_mark == current_high_water_mark
+                            and graph_inventory_sha256
+                            != current_graph_sequence["inventory_sha256"]
+                        ):
+                            issues.append(
+                                ValidationIssue(
+                                    "ERROR",
+                                    str(paths.graph_record_sequence),
+                                    "Graph-record sequence inventory differs from "
+                                    f"Checkpoint {checkpoint_id} at the same "
+                                    "high-water mark",
+                                )
+                            )
+                        elif (
+                            graph_high_water_mark == current_high_water_mark
+                            and current_graph_locator is not None
+                            and any(
+                                graph_sequence.get(field)
+                                != current_graph_locator[field]
+                                for field in ("path", "size", "file_sha256")
+                            )
+                        ):
+                            issues.append(
+                                ValidationIssue(
+                                    "ERROR",
+                                    str(paths.graph_record_sequence),
+                                    "Graph-record sequence file binding differs "
+                                    f"from Checkpoint {checkpoint_id} at the same "
+                                    "high-water mark",
+                                )
+                            )
+                    if graph_high_water_mark >= previous_graph_high_water_mark:
+                        previous_graph_high_water_mark = graph_high_water_mark
+                        previous_graph_inventory_sha256 = (
+                            graph_inventory_sha256
+                        )
+                        previous_graph_locator = {
+                            field: graph_sequence.get(field)
+                            for field in ("path", "size", "file_sha256")
+                        }
             for index, claim in enumerate(item.get("claims_snapshot", [])):
                 for message in validate_schema_instance(
                     claim,
@@ -3362,35 +3842,6 @@ def _checkpoint_issues(
                                 "ERROR", str(path), f"representative Run hash is stale: {run_id}"
                             )
                         )
-                elif failure.get("kind") == "failed_direction":
-                    failed_path = _resolve_recorded_path(
-                        paths.root, str(failure.get("path", ""))
-                    )
-                    try:
-                        failed_path.resolve(strict=True).relative_to(
-                            (paths.study / "failed-directions").resolve()
-                        )
-                    except (OSError, ValueError):
-                        issues.append(
-                            ValidationIssue(
-                                "ERROR", str(path), "representative failed-direction path is missing or unsafe"
-                            )
-                        )
-                        continue
-                    if failed_path.is_symlink() or not failed_path.is_file():
-                        issues.append(
-                            ValidationIssue(
-                                "ERROR", str(path), "representative failed direction is not a regular file"
-                            )
-                        )
-                    elif failure.get("size") != failed_path.stat().st_size or failure.get(
-                        "sha256"
-                    ) != sha256_file(failed_path):
-                        issues.append(
-                            ValidationIssue(
-                                "ERROR", str(path), "representative failed-direction hash/size is stale"
-                            )
-                        )
             for archived in item.get("archived_work_files", []):
                 archived_path = _resolve_recorded_path(paths.root, str(archived.get("archived_path", "")))
                 try:
@@ -3541,6 +3992,19 @@ def _verdict_issues(
             issues.extend(object_schema_issues(paths.root, "verdict", path, item))
             if item.get("verdict_sha256") != record_digest(item, "verdict_sha256"):
                 issues.append(ValidationIssue("ERROR", str(path), "verdict_sha256 does not match"))
+            if item.get("schema_version") == 2:
+                try:
+                    from .review import validate_review_basis
+
+                    validate_review_basis(paths, item.get("review_basis"))
+                except (ValidationError, OSError, ValueError) as exc:
+                    issues.append(
+                        ValidationIssue(
+                            "ERROR",
+                            str(path),
+                            f"Verdict Review basis is invalid: {exc}",
+                        )
+                    )
             if item.get("study_id") != paths.study_id:
                 issues.append(ValidationIssue("ERROR", str(path), "Verdict study_id mismatch"))
             verdict_id = str(item.get("verdict_id", ""))

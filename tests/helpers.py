@@ -99,7 +99,7 @@ class WorkflowTestCase(unittest.TestCase):
             "backend_version": "integration-test-double",
             "policy_format": "seatbelt-profile-v1",
             "policy_sha256": sha256_json(policy),
-            "environment_allowlist": [],
+            "environment_allowlist": sorted(portable_environment),
             "environment_variables": portable_environment,
             "environment_sha256": sha256_json(portable_environment),
             "network_access": False,
@@ -247,13 +247,14 @@ class WorkflowTestCase(unittest.TestCase):
         manifests: list[dict[str, Any]],
         *,
         evidence_id: str = "EVID-0001",
+        claim_id: str = "CLAIM-0001",
         compatibility_justification: str | None = None,
         assessment: str = "supports",
     ) -> dict[str, Any]:
         draft_path = create_evidence_draft(
             paths,
             evidence_id,
-            ["CLAIM-0001"],
+            [claim_id],
             [manifest["run_id"] for manifest in manifests],
         )
         item = load_json(draft_path)

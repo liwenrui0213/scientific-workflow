@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 from pathlib import Path
+import stat
 from typing import Any
 
 from .active_context import (
@@ -16,6 +17,7 @@ from .git_state import git_diff_metadata, git_state
 from .hashing import (
     atomic_write_bytes,
     atomic_write_json,
+    file_record,
     load_json,
     record_digest,
     sha256_file,
@@ -626,4 +628,189 @@ def import_and_render_review(paths: StudyPaths, source: Path) -> Path:
     markdown_output = paths.generated / "REVIEW.md"
     atomic_write_json(structured_output, review)
     atomic_write_bytes(markdown_output, render_review_markdown(review))
+    _archive_review_basis(paths, structured_output, packet)
     return markdown_output
+
+
+def _review_history(paths: StudyPaths) -> Path:
+    return paths.study / "review-history"
+
+
+def _archived_review_path(paths: StudyPaths, digest: str) -> Path:
+    return _review_history(paths) / f"REVIEW-{digest}.json"
+
+
+def _archived_packet_path(paths: StudyPaths, digest: str) -> Path:
+    return _review_history(paths) / f"REVIEW_PACKET-{digest}.json"
+
+
+def _archive_exact_bytes(source: Path, destination: Path, digest: str) -> None:
+    if destination.exists():
+        if (
+            destination.is_symlink()
+            or not destination.is_file()
+            or destination.stat().st_nlink != 1
+            or sha256_file(destination) != digest
+        ):
+            raise ValidationError(
+                f"immutable Review archive conflicts with expected digest: {destination}"
+            )
+        destination.chmod(0o444)
+        return
+    atomic_write_bytes(
+        destination,
+        source.read_bytes(),
+        overwrite=False,
+        mode=0o444,
+    )
+
+
+def _archive_review_basis(
+    paths: StudyPaths, review_path: Path, packet_path: Path
+) -> dict[str, Any]:
+    review_digest = sha256_file(review_path)
+    packet_digest = sha256_file(packet_path)
+    history = _review_history(paths)
+    history.mkdir(parents=True, exist_ok=True)
+    archived_review = _archived_review_path(paths, review_digest)
+    archived_packet = _archived_packet_path(paths, packet_digest)
+    _archive_exact_bytes(review_path, archived_review, review_digest)
+    _archive_exact_bytes(packet_path, archived_packet, packet_digest)
+    return {
+        "mode": "reviewed",
+        "review": file_record(archived_review, paths.root),
+        "review_packet": file_record(archived_packet, paths.root),
+    }
+
+
+def current_review_basis(paths: StudyPaths) -> dict[str, Any]:
+    """Return the exact imported Review basis or an explicit transparent waiver."""
+
+    review_path = paths.generated / "REVIEW.json"
+    packet_path = paths.generated / "REVIEW_PACKET.json"
+    if not review_path.is_file():
+        return {
+            "mode": "waived",
+            "reason": (
+                "No imported independent Review was available when this Verdict "
+                "was confirmed."
+            ),
+        }
+    if not packet_path.is_file():
+        raise ValidationError(
+            "generated REVIEW.json exists without REVIEW_PACKET.json; regenerate "
+            "and re-import the independent Review before Verdict"
+        )
+    review = load_json(review_path)
+    if not isinstance(review, dict):
+        raise ValidationError("generated REVIEW.json must contain an object")
+    issues = object_schema_issues(paths.root, "review", review_path, review)
+    if issues:
+        raise ValidationError(
+            "generated REVIEW.json is invalid:\n"
+            + "\n".join(item.render() for item in issues)
+        )
+    if review.get("study_id") != paths.study_id:
+        raise ValidationError("generated REVIEW.json belongs to a different Study")
+    packet_digest = sha256_file(packet_path)
+    if review.get("review_packet_sha256") != packet_digest:
+        raise ValidationError(
+            "generated REVIEW.json does not bind the current REVIEW_PACKET.json"
+        )
+    review_digest = sha256_file(review_path)
+    archived_review = _archived_review_path(paths, review_digest)
+    archived_packet = _archived_packet_path(paths, packet_digest)
+    if not archived_review.is_file() or not archived_packet.is_file():
+        raise ValidationError(
+            "import the independent Review again to create its immutable digest archive"
+        )
+    basis = {
+        "mode": "reviewed",
+        "review": file_record(archived_review, paths.root),
+        "review_packet": file_record(archived_packet, paths.root),
+    }
+    validate_review_basis(paths, basis)
+    return basis
+
+
+def _validate_archived_file(
+    paths: StudyPaths,
+    value: Any,
+    *,
+    expected_prefix: str,
+) -> Path:
+    if not isinstance(value, dict) or set(value) != {"path", "size", "sha256"}:
+        raise ValidationError("Review basis file reference has an invalid structure")
+    raw_path = value.get("path")
+    if not isinstance(raw_path, str) or not raw_path:
+        raise ValidationError("Review basis file reference requires a path")
+    candidate = paths.root / raw_path
+    history = _review_history(paths).resolve(strict=False)
+    try:
+        candidate.resolve(strict=True).relative_to(history)
+    except (FileNotFoundError, ValueError) as exc:
+        raise ValidationError(
+            "Review basis must reference an immutable review-history file"
+        ) from exc
+    if (
+        candidate.is_symlink()
+        or not candidate.is_file()
+        or candidate.stat().st_nlink != 1
+        or candidate.stat().st_mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise ValidationError(
+            f"Review basis archive must be regular, single-link, and read-only: {raw_path}"
+        )
+    digest = value.get("sha256")
+    if (
+        not candidate.name.startswith(expected_prefix)
+        or not isinstance(digest, str)
+        or candidate.name != f"{expected_prefix}{digest}.json"
+        or value != file_record(candidate, paths.root)
+    ):
+        raise ValidationError(f"Review basis archive binding is stale: {raw_path}")
+    return candidate
+
+
+def validate_review_basis(paths: StudyPaths, basis: Any) -> None:
+    """Replay a Verdict's immutable independent-Review binding or waiver."""
+
+    if not isinstance(basis, dict):
+        raise ValidationError("Verdict review_basis must be an object")
+    mode = basis.get("mode")
+    if mode == "waived":
+        if set(basis) != {"mode", "reason"}:
+            raise ValidationError("waived Review basis has an invalid structure")
+        reason = basis.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValidationError("Review waiver requires a non-empty reason")
+        return
+    if mode != "reviewed" or set(basis) != {
+        "mode",
+        "review",
+        "review_packet",
+    }:
+        raise ValidationError("reviewed Review basis has an invalid structure")
+    review_path = _validate_archived_file(
+        paths, basis.get("review"), expected_prefix="REVIEW-"
+    )
+    packet_path = _validate_archived_file(
+        paths,
+        basis.get("review_packet"),
+        expected_prefix="REVIEW_PACKET-",
+    )
+    review = load_json(review_path)
+    if not isinstance(review, dict):
+        raise ValidationError("archived Review must contain an object")
+    issues = object_schema_issues(paths.root, "review", review_path, review)
+    if issues:
+        raise ValidationError(
+            "archived Review is invalid:\n"
+            + "\n".join(item.render() for item in issues)
+        )
+    if review.get("study_id") != paths.study_id:
+        raise ValidationError("archived Review belongs to a different Study")
+    if review.get("review_packet_sha256") != sha256_file(packet_path):
+        raise ValidationError(
+            "archived Review does not bind its archived REVIEW_PACKET"
+        )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import os
 from pathlib import Path
 import subprocess
@@ -297,11 +298,16 @@ class SealedExecutionBoundaryTests(unittest.TestCase):
             "execution_boundary": {
                 "mode": "sealed",
                 "backend": "linux-bubblewrap",
+                "backend_version": "bubblewrap 0.9.0",
                 "policy_format": "bubblewrap-mount-policy-v1",
                 "policy_sha256": "a" * 64,
                 "output_staging": "private-copy-out",
+                "environment_allowlist": ["HOME", "TMPDIR"],
                 "environment_variables": effective_environment,
                 "environment_sha256": sha256_json(effective_environment),
+                "read_only_paths": [],
+                "writable_paths": [],
+                "device_paths": [],
                 "declared_inputs_only": True,
                 "repository_write_access": False,
                 "declared_outputs_only": True,
@@ -320,6 +326,69 @@ class SealedExecutionBoundaryTests(unittest.TestCase):
         ] = "bubblewrap-mount-policy-v1"
         manifest["execution_boundary"]["environment_sha256"] = "b" * 64
         self.assertFalse(sealed_run_evidence_eligible(manifest))
+
+    def test_seatbelt_boundary_requires_complete_policy_and_environment_binding(
+        self,
+    ) -> None:
+        change_state = {
+            "outcome": "PASS",
+            "git": {"available": True},
+            "changed_paths": [],
+        }
+        effective_environment = {
+            "HOME": "${CAPSULE_HOME}",
+            "TMPDIR": "${CAPSULE_HOME}/tmp",
+        }
+        manifest = {
+            "schema_version": 5,
+            "status": "succeeded",
+            "change_scope": {
+                "before": change_state,
+                "after": change_state,
+            },
+            "execution_boundary": {
+                "mode": "sealed",
+                "backend": "macos-seatbelt",
+                "backend_version": "15.0",
+                "policy_format": "seatbelt-profile-v1",
+                "policy_sha256": "a" * 64,
+                "output_staging": "direct",
+                "environment_allowlist": ["HOME", "TMPDIR"],
+                "environment_variables": effective_environment,
+                "environment_sha256": sha256_json(effective_environment),
+                "read_only_paths": ["/usr/bin/python3"],
+                "writable_paths": [],
+                "device_paths": [],
+                "declared_inputs_only": True,
+                "repository_write_access": False,
+                "declared_outputs_only": True,
+                "network_access": False,
+            },
+            "inputs": [],
+            "outputs": [],
+            "formalization": {"artifacts_unchanged_during_run": True},
+        }
+
+        self.assertTrue(sealed_run_evidence_eligible(manifest))
+        for required_field in (
+            "backend_version",
+            "policy_format",
+            "output_staging",
+            "environment_allowlist",
+            "environment_variables",
+            "environment_sha256",
+            "read_only_paths",
+            "writable_paths",
+            "device_paths",
+        ):
+            with self.subTest(required_field=required_field):
+                forged = copy.deepcopy(manifest)
+                del forged["execution_boundary"][required_field]
+                self.assertFalse(sealed_run_evidence_eligible(forged))
+
+        forged = copy.deepcopy(manifest)
+        forged["execution_boundary"]["environment_allowlist"] = ["HOME"]
+        self.assertFalse(sealed_run_evidence_eligible(forged))
 
     def test_linux_object_store_input_is_reexposed_read_only_after_masking(
         self,

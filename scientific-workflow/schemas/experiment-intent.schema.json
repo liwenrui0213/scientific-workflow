@@ -26,7 +26,7 @@
     "record_sha256"
   ],
   "properties": {
-    "schema_version": {"const": 1},
+    "schema_version": {"const": 2},
     "record_type": {"const": "experiment_intent"},
     "study_id": {"type": "string", "pattern": "^SC-[0-9]{4,}$"},
     "intent_id": {"type": "string", "pattern": "^INTENT-[0-9]{4,}$"},
@@ -105,46 +105,51 @@
       "items": {"type": "string", "minLength": 1, "maxLength": 4096}
     },
     "assessment_semantics": {
-      "type": "object",
-      "required": ["aggregation", "criteria", "default_outcome"],
-      "properties": {
-        "aggregation": {"enum": ["all_required", "any_sufficient", "manual_synthesis"]},
-        "criteria": {
-          "type": "array",
-          "maxItems": 64,
-          "items": {
-            "type": "object",
-            "required": [
-              "criterion_id",
-              "observation",
-              "operator",
-              "target",
-              "unit",
-              "on_pass",
-              "on_fail"
-            ],
-            "properties": {
-              "criterion_id": {"type": "string", "pattern": "^CRIT-[0-9]{3,}$"},
-              "observation": {"type": "string", "minLength": 1, "maxLength": 256},
-              "operator": {
-                "enum": ["eq", "ne", "lt", "lte", "gt", "gte"]
-              },
-              "target": {"type": ["number", "string", "boolean"]},
-              "unit": {
-                "oneOf": [
-                  {"type": "null"},
-                  {"type": "string", "minLength": 1, "maxLength": 128}
-                ]
-              },
-              "on_pass": {"enum": ["supports", "contradicts", "inconclusive", "no_update"]},
-              "on_fail": {"enum": ["supports", "contradicts", "inconclusive", "no_update"]}
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "required": ["aggregation", "criteria", "default_outcome"],
+          "properties": {
+            "aggregation": {"enum": ["all_required", "any_sufficient", "manual_synthesis"]},
+            "criteria": {
+              "type": "array",
+              "maxItems": 64,
+              "items": {
+                "type": "object",
+                "required": [
+                  "criterion_id",
+                  "observation",
+                  "operator",
+                  "target",
+                  "unit",
+                  "on_pass",
+                  "on_fail"
+                ],
+                "properties": {
+                  "criterion_id": {"type": "string", "pattern": "^CRIT-[0-9]{3,}$"},
+                  "observation": {"type": "string", "minLength": 1, "maxLength": 256},
+                  "operator": {
+                    "enum": ["eq", "ne", "lt", "lte", "gt", "gte"]
+                  },
+                  "target": {"type": ["number", "string", "boolean"]},
+                  "unit": {
+                    "oneOf": [
+                      {"type": "null"},
+                      {"type": "string", "minLength": 1, "maxLength": 128}
+                    ]
+                  },
+                  "on_pass": {"enum": ["supports", "contradicts", "inconclusive", "no_update"]},
+                  "on_fail": {"enum": ["supports", "contradicts", "inconclusive", "no_update"]}
+                },
+                "additionalProperties": false
+              }
             },
-            "additionalProperties": false
-          }
-        },
-        "default_outcome": {"enum": ["inconclusive", "requires_human_review"]}
-      },
-      "additionalProperties": false
+            "default_outcome": {"enum": ["inconclusive", "requires_human_review"]}
+          },
+          "additionalProperties": false
+        }
+      ]
     },
     "scope": {"type": ["string", "null"], "maxLength": 8192},
     "assumptions": {

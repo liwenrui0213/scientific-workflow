@@ -40,9 +40,24 @@
         "supporting_evidence": {"type": "array", "maxItems": 64, "uniqueItems": true, "items": {"$ref": "#/$defs/evidence_ref"}},
         "contradictory_evidence": {"type": "array", "maxItems": 64, "uniqueItems": true, "items": {"$ref": "#/$defs/evidence_ref"}},
         "other_evidence": {"type": "array", "maxItems": 64, "uniqueItems": true, "items": {"$ref": "#/$defs/evidence_ref"}},
+        "conflict_disposition": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/conflict_disposition"}
+          ]
+        },
         "uncertainty": {"type": ["string", "null"], "maxLength": 4096},
         "limitations": {"type": "array", "maxItems": 32, "items": {"type": "string", "maxLength": 1024}},
         "updated_at": {"type": "string", "minLength": 1, "maxLength": 64}
+      },
+      "additionalProperties": false
+    },
+    "conflict_disposition": {
+      "type": "object",
+      "required": ["status", "synthesis"],
+      "properties": {
+        "status": {"enum": ["resolved", "scope_limited", "unresolved"]},
+        "synthesis": {"type": "string", "minLength": 1, "maxLength": 4096}
       },
       "additionalProperties": false
     },

@@ -9,7 +9,7 @@
     "verdict_sha256"
   ],
   "properties": {
-    "schema_version": {"const": 1},
+    "schema_version": {"enum": [1, 2]},
     "study_id": {"type": "string", "pattern": "^SC-[0-9]{4,}$"},
     "verdict_id": {"type": "string", "pattern": "^VERDICT-[0-9]{4,}$"},
     "created_at": {"type": "string", "minLength": 1},
@@ -22,6 +22,7 @@
       },
       "additionalProperties": false
     },
+    "review_basis": {"$ref": "#/$defs/review_basis"},
     "authorization": {
       "type": "object",
       "required": [
@@ -98,7 +99,49 @@
     },
     "verdict_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"}
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"schema_version": {"const": 2}},
+        "required": ["schema_version"]
+      },
+      "then": {"required": ["review_basis"]}
+    }
+  ],
   "$defs": {
+    "file_ref": {
+      "type": "object",
+      "required": ["path", "size", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "size": {"type": "integer", "minimum": 0},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "review_basis": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["mode", "review", "review_packet"],
+          "properties": {
+            "mode": {"const": "reviewed"},
+            "review": {"$ref": "#/$defs/file_ref"},
+            "review_packet": {"$ref": "#/$defs/file_ref"}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["mode", "reason"],
+          "properties": {
+            "mode": {"const": "waived"},
+            "reason": {"type": "string", "minLength": 1, "maxLength": 4096}
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
     "checkpoint_ref": {
       "type": "object",
       "required": ["checkpoint_id", "sha256"],

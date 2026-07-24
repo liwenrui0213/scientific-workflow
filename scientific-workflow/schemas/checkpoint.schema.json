@@ -5,15 +5,17 @@
   "type": "object",
   "required": [
     "schema_version", "study_id", "checkpoint_id", "created_at", "brief",
+    "repository_profile", "host_change_scope",
+    "prepared_active_work_inventory_sha256",
     "active_formal_artifacts", "claims_file_sha256", "claims_snapshot",
-    "inactive_claim_refs", "active_context_watermarks", "frontier",
+    "inactive_claim_refs", "graph_record_sequence", "active_context_watermarks", "frontier",
     "decisive_evidence", "contradictory_evidence", "decisive_observations",
     "budget_state", "formalization_debt", "representative_failures", "archived_work_files",
     "previous_checkpoint", "compaction_plan_sha256",
     "checkpoint_sha256"
   ],
   "properties": {
-    "schema_version": {"const": 4},
+    "schema_version": {"const": 5},
     "study_id": {"type": "string", "pattern": "^SC-[0-9]{4,}$", "maxLength": 64},
     "checkpoint_id": {"type": "string", "pattern": "^CHECKPOINT-[0-9]{6}$"},
     "created_at": {"type": "string", "minLength": 1, "maxLength": 64},
@@ -36,6 +38,7 @@
     "claims_file_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "claims_snapshot": {"type": "array", "maxItems": 64, "uniqueItems": true, "items": {"type": "object"}},
     "inactive_claim_refs": {"type": "array", "maxItems": 256, "uniqueItems": true, "items": {"$ref": "#/$defs/inactive_claim_ref"}},
+    "graph_record_sequence": {"$ref": "#/$defs/graph_record_sequence"},
     "active_context_watermarks": {"$ref": "#/$defs/active_context_watermarks"},
     "frontier": {"type": "object"},
     "decisive_evidence": {"type": "array", "maxItems": 2048, "uniqueItems": true, "items": {"$ref": "#/$defs/evidence_ref"}},
@@ -78,6 +81,20 @@
       },
       "additionalProperties": false
     },
+    "graph_record_sequence": {
+      "type": "object",
+      "required": [
+        "path", "size", "file_sha256", "high_water_mark", "inventory_sha256"
+      ],
+      "properties": {
+        "path": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "size": {"type": "integer", "minimum": 0},
+        "file_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "high_water_mark": {"type": "integer", "minimum": 0},
+        "inventory_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
     "file_binding": {
       "type": "object",
       "required": ["path", "sha256"],
@@ -93,7 +110,7 @@
         "outcome", "git_available", "consequential_paths", "fingerprint_sha256"
       ],
       "properties": {
-        "outcome": {"enum": ["PASS", "ADVISORY"]},
+        "outcome": {"enum": ["PASS", "ADVISORY", "BLOCKED"]},
         "git_available": {"type": "boolean"},
         "consequential_paths": {
           "$ref": "#/$defs/bounded_host_paths"
@@ -201,19 +218,12 @@
     },
     "failure_ref": {
       "type": "object",
-      "required": ["kind"],
+      "required": ["kind", "run_id", "manifest_sha256"],
       "properties": {
-        "kind": {"enum": ["run", "failed_direction"]},
+        "kind": {"const": "run"},
         "run_id": {"type": "string", "pattern": "^RUN-[0-9]{6}$"},
-        "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-        "path": {"type": "string", "minLength": 1},
-        "size": {"type": "integer", "minimum": 0},
-        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
       },
-      "oneOf": [
-        {"required": ["run_id", "manifest_sha256"], "properties": {"kind": {"const": "run"}}},
-        {"required": ["path", "size", "sha256"], "properties": {"kind": {"const": "failed_direction"}}}
-      ],
       "additionalProperties": false
     },
     "archived_file": {

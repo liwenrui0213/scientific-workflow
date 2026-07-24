@@ -25,6 +25,7 @@ from .models import (
     HumanGateError,
     StudyPaths,
     ValidationError,
+    VERDICT_SCHEMA_VERSION,
     WorkflowError,
     require_id,
     utc_now,
@@ -821,12 +822,15 @@ def _build_generated_verdict(
             "a Verdict without selected Claims must use scientific decision "
             "requires_more_evidence"
         )
+    from .review import current_review_basis
+
     verdict = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": VERDICT_SCHEMA_VERSION,
         "study_id": paths.study_id,
         "verdict_id": _next_verdict_id(paths),
         "created_at": utc_now(),
         "reviewer": reviewer_identity(paths.root),
+        "review_basis": current_review_basis(paths),
         "judged_scope": _current_judged_scope(paths, claim_ids),
         "implementation_verdict": {
             **choices["implementation_verdict"],
@@ -978,6 +982,10 @@ def _validate_current_verdict_scope(paths: StudyPaths, verdict: dict[str, Any]) 
     _validate_claim_references(paths, scope.get("claims"))
     _validate_evidence_references(paths, scope.get("evidence"))
     _validate_checkpoint_reference(paths, scope.get("checkpoint"))
+    if verdict.get("schema_version") == VERDICT_SCHEMA_VERSION:
+        from .review import validate_review_basis
+
+        validate_review_basis(paths, verdict.get("review_basis"))
     if scope.get("claims") and scope.get("checkpoint") is None:
         raise ValidationError(
             "Verdict Claim references require the latest Checkpoint snapshot"
@@ -1053,6 +1061,11 @@ def record_verdict(
                 )
             # Compatibility path for previously prepared full Verdict sources.
             verdict = supplied
+    if verdict.get("schema_version") != VERDICT_SCHEMA_VERSION:
+        raise ValidationError(
+            "new Verdicts must use the current schema_version with an immutable "
+            "Review digest binding or explicit waiver"
+        )
     if not agent_initiated and verdict.get("authorization") is not None:
         raise ValidationError(
             "Verdict authorization is reserved for --agent-initiated decision input"
@@ -1109,6 +1122,19 @@ def record_verdict(
         "Reviewer: " + json.dumps(verdict["reviewer"], ensure_ascii=False, sort_keys=True),
         file=stdout,
     )
+    review_basis = verdict["review_basis"]
+    if review_basis["mode"] == "reviewed":
+        print(
+            "Independent Review: "
+            f"{review_basis['review']['sha256']} "
+            f"(packet {review_basis['review_packet']['sha256']})",
+            file=stdout,
+        )
+    else:
+        print(
+            "Independent Review waiver: " + str(review_basis["reason"]),
+            file=stdout,
+        )
     if agent_initiated:
         authorization = verdict["authorization"]
         print(

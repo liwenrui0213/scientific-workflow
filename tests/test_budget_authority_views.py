@@ -325,6 +325,8 @@ class BudgetAuthorityViewTests(WorkflowTestCase):
         legacy = copy.deepcopy(current)
         legacy["schema_version"] = 1
         legacy.pop("epistemic_role")
+        legacy.pop("control_binding")
+        legacy.pop("intent_binding")
         legacy.pop("execution_boundary")
         legacy.pop("change_scope")
         legacy.pop("failure")
