@@ -9,7 +9,7 @@
     "verdict_sha256"
   ],
   "properties": {
-    "schema_version": {"enum": [1, 2]},
+    "schema_version": {"enum": [1, 2, 3]},
     "study_id": {"type": "string", "pattern": "^SC-[0-9]{4,}$"},
     "verdict_id": {"type": "string", "pattern": "^VERDICT-[0-9]{4,}$"},
     "created_at": {"type": "string", "minLength": 1},
@@ -50,7 +50,8 @@
           ]
         },
         "claims": {"type": "array", "items": {"$ref": "#/$defs/claim_ref"}},
-        "evidence": {"type": "array", "items": {"$ref": "#/$defs/evidence_ref"}}
+        "evidence": {"type": "array", "items": {"$ref": "#/$defs/evidence_ref"}},
+        "active_context": {"$ref": "#/$defs/active_context_ref"}
       },
       "additionalProperties": false
     },
@@ -106,6 +107,19 @@
         "required": ["schema_version"]
       },
       "then": {"required": ["review_basis"]}
+    },
+    {
+      "if": {
+        "properties": {"schema_version": {"const": 3}},
+        "required": ["schema_version"]
+      },
+      "then": {
+        "required": ["review_basis"],
+        "properties": {
+          "review_basis": {"$ref": "#/$defs/current_review_basis"},
+          "judged_scope": {"required": ["active_context"]}
+        }
+      }
     }
   ],
   "$defs": {
@@ -121,26 +135,73 @@
     },
     "review_basis": {
       "oneOf": [
-        {
+        {"$ref": "#/$defs/reviewed_basis"},
+        {"$ref": "#/$defs/authorized_waiver"},
+        {"$ref": "#/$defs/legacy_waiver"}
+      ]
+    },
+    "current_review_basis": {
+      "oneOf": [
+        {"$ref": "#/$defs/reviewed_basis"},
+        {"$ref": "#/$defs/authorized_waiver"}
+      ]
+    },
+    "reviewed_basis": {
+      "type": "object",
+      "required": ["mode", "review", "review_packet"],
+      "properties": {
+        "mode": {"const": "reviewed"},
+        "review": {"$ref": "#/$defs/file_ref"},
+        "review_packet": {"$ref": "#/$defs/file_ref"}
+      },
+      "additionalProperties": false
+    },
+    "authorized_waiver": {
+      "type": "object",
+      "required": ["mode", "reason", "authorization"],
+      "properties": {
+        "mode": {"const": "waived"},
+        "reason": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "authorization": {
           "type": "object",
-          "required": ["mode", "review", "review_packet"],
+          "required": ["source", "text", "text_sha256"],
           "properties": {
-            "mode": {"const": "reviewed"},
-            "review": {"$ref": "#/$defs/file_ref"},
-            "review_packet": {"$ref": "#/$defs/file_ref"}
-          },
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "required": ["mode", "reason"],
-          "properties": {
-            "mode": {"const": "waived"},
-            "reason": {"type": "string", "minLength": 1, "maxLength": 4096}
+            "source": {
+              "enum": [
+                "interactive_human_confirmation",
+                "explicit_user_instruction"
+              ]
+            },
+            "text": {"type": "string", "minLength": 1, "maxLength": 16384},
+            "text_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
           },
           "additionalProperties": false
         }
-      ]
+      },
+      "additionalProperties": false
+    },
+    "legacy_waiver": {
+      "type": "object",
+      "required": ["mode", "reason"],
+      "properties": {
+        "mode": {"const": "waived"},
+        "reason": {"type": "string", "minLength": 1, "maxLength": 4096}
+      },
+      "additionalProperties": false
+    },
+    "active_context_ref": {
+      "type": "object",
+      "required": ["path", "size", "sha256", "selector_sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "size": {"type": "integer", "minimum": 0},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "selector_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
     },
     "checkpoint_ref": {
       "type": "object",

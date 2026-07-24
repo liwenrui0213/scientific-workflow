@@ -1,0 +1,144 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/scientific-workflow/review-packet.schema.json",
+  "title": "Independent Review packet",
+  "type": "object",
+  "required": [
+    "schema_version", "study_id", "brief", "active_context",
+    "active_formal_artifacts", "graph_records", "claims", "observations",
+    "observation_trigger_registry", "evidence", "evidence_inventory",
+    "decisive_evidence", "contradictory_evidence", "other_evidence",
+    "decisive_run_sources", "contradictory_run_sources", "other_run_sources",
+    "run_inventory", "confirmation_records", "confirmation_attempt_inventory",
+    "cohort_fingerprints", "protected_condition_hash_checks",
+    "git_diff_metadata", "repository_profile", "change_scope",
+    "unresolved_formalization_debt", "formalization_check",
+    "reproducibility_commands", "known_deviations", "authority_validation",
+    "latest_checkpoint", "compaction_pressure", "review_scope", "packet_sha256"
+  ],
+  "properties": {
+    "schema_version": {"const": 2},
+    "study_id": {"type": "string", "pattern": "^SC-[0-9]{4,}$"},
+    "brief": {
+      "type": "object",
+      "required": ["path", "sha256", "approval"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "approval": {"type": ["object", "null"]}
+      },
+      "additionalProperties": false
+    },
+    "active_context": {"$ref": "#/$defs/active_context_ref"},
+    "active_formal_artifacts": {"type": "array"},
+    "graph_records": {"type": "object"},
+    "claims": {"type": "object"},
+    "observations": {"type": "object"},
+    "observation_trigger_registry": {"type": "object"},
+    "evidence": {"type": "array"},
+    "evidence_inventory": {"type": "object"},
+    "decisive_evidence": {"type": "array"},
+    "contradictory_evidence": {"type": "array"},
+    "other_evidence": {"type": "array"},
+    "decisive_run_sources": {"type": "array"},
+    "contradictory_run_sources": {"type": "array"},
+    "other_run_sources": {"type": "array"},
+    "run_inventory": {"type": "object"},
+    "confirmation_records": {"type": "array"},
+    "confirmation_attempt_inventory": {"type": "object"},
+    "cohort_fingerprints": {"type": "object"},
+    "protected_condition_hash_checks": {"type": "object"},
+    "git_diff_metadata": {"type": "object"},
+    "repository_profile": {"type": "object"},
+    "change_scope": {"type": "object"},
+    "unresolved_formalization_debt": {"type": ["array", "object"]},
+    "formalization_check": {"type": "object"},
+    "reproducibility_commands": {"type": "array"},
+    "known_deviations": {"type": "array", "items": {"type": "string"}},
+    "authority_validation": {"type": "object"},
+    "latest_checkpoint": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "object"}
+      ]
+    },
+    "compaction_pressure": {"type": "object"},
+    "review_scope": {"$ref": "#/$defs/review_scope"},
+    "packet_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "$defs": {
+    "active_context_ref": {
+      "type": "object",
+      "required": ["path", "size", "sha256", "selector_sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "size": {"type": "integer", "minimum": 0},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "selector_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "checkpoint_ref": {
+      "type": "object",
+      "required": ["checkpoint_id", "sha256"],
+      "properties": {
+        "checkpoint_id": {"type": "string", "pattern": "^CHECKPOINT-[0-9]{6}$"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "claim_ref": {
+      "type": "object",
+      "required": ["claim_id", "sha256"],
+      "properties": {
+        "claim_id": {"type": "string", "pattern": "^CLAIM-[0-9]{4,}$"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "evidence_ref": {
+      "type": "object",
+      "required": ["evidence_id", "version", "sha256"],
+      "properties": {
+        "evidence_id": {"type": "string", "pattern": "^EVID-[0-9]{4,}$"},
+        "version": {"type": "integer", "minimum": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "review_scope": {
+      "type": "object",
+      "required": [
+        "commit", "brief_sha256", "checkpoint", "claims", "evidence",
+        "evidence_inventory_sha256", "active_context"
+      ],
+      "properties": {
+        "commit": {"type": ["string", "null"]},
+        "brief_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "checkpoint": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/checkpoint_ref"}
+          ]
+        },
+        "claims": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/claim_ref"}
+        },
+        "evidence": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/evidence_ref"}
+        },
+        "evidence_inventory_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "active_context": {"$ref": "#/$defs/active_context_ref"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

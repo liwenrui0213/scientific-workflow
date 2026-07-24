@@ -1,0 +1,126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/scientific-workflow/confirmation-abandonment.schema.json",
+  "title": "Immutable whole-campaign Confirmation abandonment",
+  "x-maxCanonicalBytes": 65536,
+  "type": "object",
+  "required": [
+    "schema_version",
+    "study_id",
+    "record_type",
+    "campaign_id",
+    "scope",
+    "status",
+    "claim_versions",
+    "confirmation_records",
+    "planned_slot_ids",
+    "rationale",
+    "authorization",
+    "abandoned_at",
+    "record_sha256"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "study_id": {
+      "type": "string",
+      "pattern": "^SC-[0-9]{4,}$",
+      "maxLength": 64
+    },
+    "record_type": {"const": "confirmation_campaign_abandonment"},
+    "campaign_id": {
+      "type": "string",
+      "pattern": "^CAMP-[0-9a-f]{64}$"
+    },
+    "scope": {"const": "whole_campaign"},
+    "status": {"const": "abandoned"},
+    "claim_versions": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/claim_version"}
+    },
+    "confirmation_records": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 256,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/confirmation_record"}
+    },
+    "planned_slot_ids": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 256,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^CONF-[0-9]{4,}/SLOT-[0-9]{3,}$",
+        "maxLength": 129
+      }
+    },
+    "rationale": {"type": "string", "minLength": 1, "maxLength": 4096},
+    "authorization": {"$ref": "#/$defs/authorization"},
+    "abandoned_at": {"type": "string", "minLength": 1, "maxLength": 64},
+    "record_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  },
+  "$defs": {
+    "claim_version": {
+      "type": "object",
+      "required": ["claim_id", "spec_sha256"],
+      "properties": {
+        "claim_id": {
+          "type": "string",
+          "pattern": "^CLAIM-[0-9]{4,}$",
+          "maxLength": 64
+        },
+        "spec_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "confirmation_record": {
+      "type": "object",
+      "required": ["confirmation_id", "sha256", "sequence"],
+      "properties": {
+        "confirmation_id": {
+          "type": "string",
+          "pattern": "^CONF-[0-9]{4,}$",
+          "maxLength": 64
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "sequence": {"type": "integer", "minimum": 1}
+      },
+      "additionalProperties": false
+    },
+    "authorization": {
+      "type": "object",
+      "required": [
+        "mode",
+        "source",
+        "assurance",
+        "instruction",
+        "instruction_sha256"
+      ],
+      "properties": {
+        "mode": {"const": "agent_initiated"},
+        "source": {"const": "explicit_user_instruction"},
+        "assurance": {"const": "cooperative"},
+        "instruction": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "instruction_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

@@ -643,6 +643,7 @@ class CompactionTests(_CompactionPlanMixin, WorkflowTestCase):
         checkpoint_paths = {item["path"] for item in checkpoint["active_formal_artifacts"]}
         self.assertEqual(checkpoint_paths, active_paths)
 
+        self.commit_all("freeze formal artifacts submitted for independent Review")
         packet = load_json(create_review_packet(paths))
         packet_paths = {item["path"] for item in packet["active_formal_artifacts"]}
         self.assertEqual(packet_paths, active_paths)
@@ -950,6 +951,7 @@ class ReviewTests(_CompactionPlanMixin, WorkflowTestCase):
             decisive_evidence=[evidence_ref],
         )
         checkpoint_path = finalize_compaction(paths, plan)
+        self.commit_all("freeze complete independent Review packet scope")
 
         packet_path = create_review_packet(paths, base_ref="main")
         packet = load_json(packet_path)
@@ -1020,9 +1022,10 @@ class ReviewTests(_CompactionPlanMixin, WorkflowTestCase):
 
     def test_review_render_validates_and_preserves_source_references(self) -> None:
         paths = self.initialize_approved_with_claim()
+        self.commit_all("freeze independent Review rendering scope")
         packet_path = create_review_packet(paths)
         review = self.review_document(paths, packet_path)
-        source = self.root / "independent-review.json"
+        source = self.root / ".objects" / "independent-review.json"
         atomic_write_json(source, review)
 
         markdown_path = import_and_render_review(paths, source)
@@ -1067,12 +1070,13 @@ class ReviewTests(_CompactionPlanMixin, WorkflowTestCase):
 
     def test_review_render_rejects_schema_invalid_and_stale_reviews(self) -> None:
         paths = self.initialize_approved_with_claim()
+        self.commit_all("freeze independent Review rejection scope")
         packet_path = create_review_packet(paths)
         review = self.review_document(paths, packet_path)
 
         invalid = json.loads(json.dumps(review))
         invalid["implementation_findings"][0]["sources"] = []
-        invalid_source = self.root / "invalid-review.json"
+        invalid_source = self.root / ".objects" / "invalid-review.json"
         atomic_write_json(invalid_source, invalid)
         with self.assertRaisesRegex(ValidationError, "invalid structured review"):
             import_and_render_review(paths, invalid_source)
@@ -1081,21 +1085,25 @@ class ReviewTests(_CompactionPlanMixin, WorkflowTestCase):
 
         missing_locator = json.loads(json.dumps(review))
         missing_locator["implementation_findings"][0]["sources"] = [{"kind": "file"}]
-        missing_locator_source = self.root / "missing-locator-review.json"
+        missing_locator_source = (
+            self.root / ".objects" / "missing-locator-review.json"
+        )
         atomic_write_json(missing_locator_source, missing_locator)
         with self.assertRaisesRegex(ValidationError, "invalid structured review"):
             import_and_render_review(paths, missing_locator_source)
 
         missing_reviewer = json.loads(json.dumps(review))
         missing_reviewer["reviewer"] = {}
-        missing_reviewer_source = self.root / "missing-reviewer.json"
+        missing_reviewer_source = (
+            self.root / ".objects" / "missing-reviewer.json"
+        )
         atomic_write_json(missing_reviewer_source, missing_reviewer)
         with self.assertRaisesRegex(ValidationError, "invalid structured review"):
             import_and_render_review(paths, missing_reviewer_source)
 
         stale = json.loads(json.dumps(review))
         stale["review_packet_sha256"] = "0" * 64
-        stale_source = self.root / "stale-review.json"
+        stale_source = self.root / ".objects" / "stale-review.json"
         atomic_write_json(stale_source, stale)
         with self.assertRaisesRegex(
             ValidationError,

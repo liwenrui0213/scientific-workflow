@@ -27,6 +27,11 @@ class HookPolicyTests(WorkflowTestCase):
             "tool_input": {"command": command},
         }
 
+    def bash_event_at(self, command: str, cwd: str) -> dict[str, Any]:
+        event = self.bash_event(command)
+        event["cwd"] = cwd
+        return event
+
     def patch_event(self, action: str, path: str) -> dict[str, Any]:
         return {
             "tool_name": "ApplyPatch",
@@ -112,9 +117,12 @@ class HookPolicyTests(WorkflowTestCase):
             f"studies/{paths.study_id}/OBSERVATIONS.sequence.json",
             f"studies/{paths.study_id}/CHECKPOINTS.sequence.json",
             f"studies/{paths.study_id}/EVIDENCE.sequence.json",
+            f"studies/{paths.study_id}/CONFIRMATIONS.sequence.json",
             f"studies/{paths.study_id}/GRAPH_RECORDS.sequence.json",
+            f"studies/{paths.study_id}/REVIEW_VERDICTS.sequence.json",
             f"studies/{paths.study_id}/intents/INTENT-0001.v0001.json",
             f"studies/{paths.study_id}/control-plans/CG-0001.v0001.json",
+            f"studies/{paths.study_id}/control-plans/lifecycle/PLAN-EVENT-000001.json",
             f"studies/{paths.study_id}/formal/PLAN.json",
             f"studies/{paths.study_id}/checkpoints/CHECKPOINT-000001.json",
             f"studies/{paths.study_id}/checkpoints/claim-records/CLAIM-0001.{'0' * 64}.json",
@@ -124,6 +132,39 @@ class HookPolicyTests(WorkflowTestCase):
                     HOOK_POLICY.decide(self.patch_event("Update", relative)),
                     expected,
                 )
+
+    def test_sealed_graph_paths_are_blocked_from_study_relative_cwds(
+        self,
+    ) -> None:
+        paths = self.initialize()
+        expected = (
+            "Checkpoint, sequence, finalized graph, active PLAN, and archived "
+            "Claim records are sealed authority and must not be changed or "
+            "removed directly."
+        )
+        study_cwd = str(paths.study)
+        lifecycle_cwd = str(paths.control_graphs / "lifecycle")
+        cases = (
+            self.bash_event_at("rm formal/PLAN.json", study_cwd),
+            self.bash_event_at("chmod 644 formal/PLAN.json", study_cwd),
+            self.bash_event_at(
+                "rm PLAN-EVENT-000001.json",
+                lifecycle_cwd,
+            ),
+            {
+                "tool_name": "Write",
+                "cwd": study_cwd,
+                "tool_input": {
+                    "file_path": (
+                        "control-plans/lifecycle/PLAN-EVENT-000001.json"
+                    ),
+                    "content": "replacement\n",
+                },
+            },
+        )
+        for event in cases:
+            with self.subTest(event=event):
+                self.assertEqual(HOOK_POLICY.decide(event), expected)
 
     def test_human_owned_and_sealed_records_are_blocked(self) -> None:
         paths = self.initialize_approved_with_claim()
@@ -230,13 +271,24 @@ class HookPolicyTests(WorkflowTestCase):
                     "Add",
                     f"studies/{paths.study_id}/formal/confirmations/CONF-0001.json",
                 ),
-                "Frozen Confirmation Records may be written only by studyctl confirmation-finalize.",
+                "Confirmation records may be written only by studyctl "
+                "confirmation-finalize or confirmation-abandon.",
             ),
             (
                 self.bash_event(
                     f"rm studies/{paths.study_id}/formal/confirmations/CONF-0001.json"
                 ),
-                "Frozen Confirmation Records may be written only by studyctl confirmation-finalize.",
+                "Confirmation records may be written only by studyctl "
+                "confirmation-finalize or confirmation-abandon.",
+            ),
+            (
+                self.patch_event(
+                    "Add",
+                    f"studies/{paths.study_id}/formal/confirmations/"
+                    f"CAMP-{'0' * 64}.abandonment.json",
+                ),
+                "Confirmation records may be written only by studyctl "
+                "confirmation-finalize or confirmation-abandon.",
             ),
             (
                 self.direct_file_event(
@@ -249,6 +301,17 @@ class HookPolicyTests(WorkflowTestCase):
         for event, expected_reason in cases:
             with self.subTest(expected_reason=expected_reason):
                 self.assertEqual(HOOK_POLICY.decide(event), expected_reason)
+        review_archive = (
+            f"studies/{paths.study_id}/review-history/REVIEW-"
+            f"{'0' * 64}.json"
+        )
+        self.assertEqual(
+            HOOK_POLICY.decide(
+                self.patch_event("Delete", review_archive)
+            ),
+            "Imported Review archives are sealed authority and must not be "
+            "changed or removed directly.",
+        )
 
     def test_benign_reads_unapproved_brief_and_unreferenced_draft_are_permitted(self) -> None:
         paths = self.initialize()
@@ -257,6 +320,10 @@ class HookPolicyTests(WorkflowTestCase):
 
         permitted = (
             self.bash_event(f"sed -n '1,20p' studies/{paths.study_id}/BRIEF.md"),
+            self.bash_event(
+                "python -m tools.studyctl "
+                f"recover-review-verdict-sequence {paths.study_id}"
+            ),
             self.patch_event("Update", f"studies/{paths.study_id}/BRIEF.md"),
             self.patch_event(
                 "Update",

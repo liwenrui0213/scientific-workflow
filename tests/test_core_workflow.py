@@ -33,6 +33,10 @@ from tools.studyctl.models import (
     utc_now,
 )
 from tools.studyctl.rendering import render_status
+from tools.studyctl.review import current_review_scope
+from tools.studyctl.review_verdict_sequence import (
+    migrate_legacy_review_verdict_sequence,
+)
 from tools.studyctl.run_registry import execute_run
 from tools.studyctl.validation import (
     brief_approval_issues,
@@ -70,7 +74,7 @@ class CoreWorkflowTests(WorkflowTestCase):
         atomic_write_json(paths.claims, claims)
 
     def valid_verdict_source(self, paths: object, verdict_id: str) -> dict[str, object]:
-        """Return a current full-source Verdict for manual boundary tests."""
+        """Return a historical schema-v2 Verdict fixture for replay tests."""
 
         return {
             "schema_version": 2,
@@ -130,6 +134,14 @@ class CoreWorkflowTests(WorkflowTestCase):
                 "rationale": "The fixture establishes workflow behavior, not a scientific conclusion.",
                 "scope": "Only the deterministic workflow fixture is judged.",
             },
+            "review_waiver": {
+                "reason": (
+                    "No independent Review was commissioned for this "
+                    "implementation-only fixture."
+                ),
+                "source": "interactive_human_confirmation",
+                "authorization_text": f"WAIVE INDEPENDENT REVIEW {self.study_id}",
+            },
         }
 
     def agent_verdict_decisions(
@@ -154,6 +166,17 @@ class CoreWorkflowTests(WorkflowTestCase):
                 "rationale": "The fixture establishes workflow behavior, not a scientific conclusion.",
                 "scope": "Only the deterministic workflow fixture is judged.",
             },
+            "review_waiver": {
+                "reason": (
+                    "No independent Review was commissioned for this "
+                    "implementation-only fixture."
+                ),
+                "source": "explicit_user_instruction",
+                "authorization_text": (
+                    "I explicitly waive independent Review for this "
+                    "implementation-only Verdict."
+                ),
+            },
         }
 
     def interactive_verdict_input(self, paths: object, verdict_id: str) -> str:
@@ -164,6 +187,8 @@ class CoreWorkflowTests(WorkflowTestCase):
                 "requires_more_evidence",
                 "The fixture establishes workflow behavior, not a scientific conclusion.",
                 "Only the deterministic workflow fixture is judged.",
+                "No independent Review was commissioned for this implementation-only fixture.",
+                f"WAIVE INDEPENDENT REVIEW {paths.study_id}",
                 f"RECORD VERDICT {paths.study_id} {verdict_id}",
                 "",
             )
@@ -309,7 +334,13 @@ class CoreWorkflowTests(WorkflowTestCase):
                 "checkpoint": None,
                 "claims": [],
                 "evidence": [],
+                "active_context": current_review_scope(paths)["active_context"],
             },
+        )
+        self.assertEqual(recorded["review_basis"]["mode"], "waived")
+        self.assertEqual(
+            recorded["review_basis"]["authorization"]["source"],
+            "interactive_human_confirmation",
         )
         self.assertEqual(recorded["implementation_verdict"]["conditions"], [])
         self.assertEqual(recorded["scientific_verdict"]["conditions"], [])
@@ -359,7 +390,13 @@ class CoreWorkflowTests(WorkflowTestCase):
                 "checkpoint": None,
                 "claims": [],
                 "evidence": [],
+                "active_context": current_review_scope(paths)["active_context"],
             },
+        )
+        self.assertEqual(recorded["review_basis"]["mode"], "waived")
+        self.assertEqual(
+            recorded["review_basis"]["authorization"]["source"],
+            "explicit_user_instruction",
         )
         self.assertEqual(
             authorization,
@@ -414,7 +451,7 @@ class CoreWorkflowTests(WorkflowTestCase):
             (
                 "legacy full Verdict source",
                 legacy_path,
-                HumanGateError,
+                ValidationError,
                 "accepts only decision input",
             )
         )
@@ -440,7 +477,7 @@ class CoreWorkflowTests(WorkflowTestCase):
 
         self.assertEqual(list(paths.study.glob("VERDICT*.json")), [])
 
-    def test_manual_full_verdict_rejects_agent_authorization_branch(self) -> None:
+    def test_manual_full_verdict_is_historical_read_only_input(self) -> None:
         paths = self.initialize()
         self.fill_brief(paths)
         self.approve(paths)
@@ -457,14 +494,13 @@ class CoreWorkflowTests(WorkflowTestCase):
         source_path = self.root / ".objects" / "manual-with-agent-authorization.json"
         atomic_write_json(source_path, source)
 
-        with self.assertRaisesRegex(
-            ValidationError,
-            "authorization is reserved for --agent-initiated",
-        ):
+        with self.assertRaisesRegex(ValidationError, "accepts only decision input"):
             record_verdict(
                 paths,
                 source_path,
-                stdin=TTYBuffer(),
+                stdin=TTYBuffer(
+                    f"WAIVE INDEPENDENT REVIEW {paths.study_id}\n"
+                ),
                 stdout=TTYBuffer(),
             )
 
@@ -475,10 +511,10 @@ class CoreWorkflowTests(WorkflowTestCase):
         self.fill_brief(paths)
         self.approve(paths)
         self.commit_all("freeze empty-Claim Verdict invariant fixture")
-        source = self.valid_verdict_source(paths, "VERDICT-0001")
-        source["scientific_verdict"]["decision"] = "accepted_within_scope"
+        decisions = self.verdict_decisions()
+        decisions["scientific_verdict"]["decision"] = "accepted_within_scope"
         source_path = self.root / ".objects" / "empty-claim-accepted-verdict.json"
-        atomic_write_json(source_path, source)
+        atomic_write_json(source_path, decisions)
 
         with self.assertRaisesRegex(
             ValidationError,
@@ -487,22 +523,31 @@ class CoreWorkflowTests(WorkflowTestCase):
             record_verdict(
                 paths,
                 source_path,
-                stdin=TTYBuffer(),
+                stdin=TTYBuffer(
+                    f"WAIVE INDEPENDENT REVIEW {paths.study_id}\n"
+                ),
                 stdout=TTYBuffer(),
             )
 
         self.assertEqual(list(paths.study.glob("VERDICT*.json")), [])
 
+        source = self.valid_verdict_source(paths, "VERDICT-0001")
+        source["scientific_verdict"]["decision"] = "accepted_within_scope"
         source["confirmation"] = {
             "typed_text": "RECORD VERDICT SC-0001 VERDICT-0001",
             "confirmed_at": utc_now(),
         }
         source["verdict_sha256"] = record_digest(source, "verdict_sha256")
+        if paths.review_verdict_sequence.exists():
+            paths.review_verdict_sequence.unlink()
         atomic_write_json(paths.verdict, source, mode=0o444)
-        self.assertIn(
-            "Verdict without selected Claims must use scientific decision requires_more_evidence",
-            self.error_messages(paths),
-        )
+        with self.assertRaisesRegex(
+            ValidationError,
+            "without selected Claims must use scientific decision "
+            "requires_more_evidence",
+        ):
+            migrate_legacy_review_verdict_sequence(paths)
+        self.assertFalse(paths.review_verdict_sequence.exists())
 
     def test_validation_rejects_tampered_agent_verdict_authorization(self) -> None:
         paths = self.initialize()
@@ -547,7 +592,9 @@ class CoreWorkflowTests(WorkflowTestCase):
             record_verdict(
                 paths,
                 decisions_path,
-                stdin=TTYBuffer(),
+                stdin=TTYBuffer(
+                    f"WAIVE INDEPENDENT REVIEW {paths.study_id}\n"
+                ),
                 stdout=TTYBuffer(),
             )
 
@@ -591,17 +638,14 @@ class CoreWorkflowTests(WorkflowTestCase):
         self.assertEqual(calls, 3)
         self.assertFalse(paths.verdict.exists())
 
-    def test_full_verdict_cannot_bypass_clean_worktree_binding(self) -> None:
+    def test_decision_input_cannot_bypass_clean_worktree_binding(self) -> None:
         paths = self.initialize()
         self.fill_brief(paths)
         self.approve(paths)
         self.commit_all("freeze legacy clean-worktree Verdict fixture")
         verdict_id = "VERDICT-0001"
-        source_path = self.root / ".objects" / "legacy-dirty-verdict.json"
-        atomic_write_json(
-            source_path,
-            self.valid_verdict_source(paths, verdict_id),
-        )
+        source_path = self.root / ".objects" / "dirty-verdict-decisions.json"
+        atomic_write_json(source_path, self.verdict_decisions())
         (self.root / "unreviewed-legacy-change.txt").write_text(
             "This change is absent from the judged commit.\n",
             encoding="utf-8",
@@ -609,18 +653,21 @@ class CoreWorkflowTests(WorkflowTestCase):
 
         with self.assertRaisesRegex(
             ValidationError,
-            "Verdict requires a clean Git worktree",
+            "Verdict requires a clean scientific worktree",
         ):
             record_verdict(
                 paths,
                 source_path,
-                stdin=TTYBuffer(f"RECORD VERDICT {paths.study_id} {verdict_id}\n"),
+                stdin=TTYBuffer(
+                    f"WAIVE INDEPENDENT REVIEW {paths.study_id}\n"
+                    f"RECORD VERDICT {paths.study_id} {verdict_id}\n"
+                ),
                 stdout=TTYBuffer(),
             )
 
         self.assertFalse(paths.verdict.exists())
 
-    def test_verdict_claim_scope_requires_a_hash_pinned_reference(self) -> None:
+    def test_full_verdict_claim_scope_cannot_be_newly_imported(self) -> None:
         paths = self.initialize_approved_with_claim()
         self.commit_all("freeze legacy Verdict compatibility fixture")
         verdict_id = "VERDICT-0001"
@@ -631,7 +678,7 @@ class CoreWorkflowTests(WorkflowTestCase):
 
         with self.assertRaisesRegex(
             ValidationError,
-            "Verdict source does not match the Verdict schema",
+            "accepts only decision input",
         ):
             record_verdict(
                 paths,
@@ -649,7 +696,7 @@ class CoreWorkflowTests(WorkflowTestCase):
         atomic_write_json(source_path, source)
         with self.assertRaisesRegex(
             ValidationError,
-            "Claim references require the latest Checkpoint snapshot",
+            "accepts only decision input",
         ):
             record_verdict(
                 paths,
@@ -673,14 +720,16 @@ class CoreWorkflowTests(WorkflowTestCase):
         verdict_id = "VERDICT-0001"
         source = self.valid_verdict_source(paths, verdict_id)
         source["judged_scope"]["evidence"] = [evidence_ref]
-        source_path = self.root / ".objects" / "evidence-scoped-verdict.json"
-        atomic_write_json(source_path, source)
-        verdict_path = record_verdict(
-            paths,
-            source_path,
-            stdin=TTYBuffer(f"RECORD VERDICT {paths.study_id} {verdict_id}\n"),
-            stdout=TTYBuffer(),
-        )
+        source["confirmation"] = {
+            "typed_text": f"RECORD VERDICT {paths.study_id} {verdict_id}",
+            "confirmed_at": utc_now(),
+        }
+        source["verdict_sha256"] = record_digest(source, "verdict_sha256")
+        verdict_path = paths.verdict
+        if paths.review_verdict_sequence.exists():
+            paths.review_verdict_sequence.unlink()
+        atomic_write_json(verdict_path, source, mode=0o444)
+        migrate_legacy_review_verdict_sequence(paths)
         original = load_json(verdict_path)
         self.assertEqual(self.error_messages(paths), [])
 

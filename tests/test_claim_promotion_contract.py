@@ -125,7 +125,7 @@ class ClaimPromotionContractTests(WorkflowTestCase):
         ]
         atomic_write_json(draft_path, draft)
         finalized = load_json(finalize_confirmation(self.paths, draft_path))
-        self.assertEqual(finalized["schema_version"], 3)
+        self.assertEqual(finalized["schema_version"], 4)
         self.assertEqual(finalized["status"], "finalized")
         return finalized
 

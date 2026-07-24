@@ -19,6 +19,7 @@ from .budget import (
 )
 from .formalization import artifact_ready, collect_formalization_debt, load_policy
 from .hashing import atomic_write_bytes, load_json, sha256_file
+from .locking import study_authority_lock
 from .models import CLAIMS_SCHEMA_VERSION, StudyPaths, ValidationError, WorkflowError
 from .run_ledger import (
     bootstrap_or_reconcile_ledger,
@@ -60,14 +61,21 @@ def _generic_formal_artifact_active(path: Path) -> bool:
 
 def active_formal_artifacts(paths: StudyPaths) -> list[dict[str, Any]]:
     policy = load_policy(paths)
+    plan_path = paths.study / str(policy["formal_artifacts"]["PLAN"])
     known = {
         (paths.study / relative).resolve(): kind
         for kind, relative in policy["formal_artifacts"].items()
+        if kind != "PLAN"
     }
     records: list[dict[str, Any]] = []
     if not paths.formal.is_dir():
         return records
     for path in sorted(paths.formal.rglob("*"), key=lambda item: item.as_posix()):
+        if path == plan_path or plan_path in path.parents:
+            # PLAN.json is a mutable control pointer, not scientific formal
+            # context. Its immutable graph record and lifecycle locator are
+            # projected separately by ``current_graph_record_locators``.
+            continue
         if path.is_symlink() or not path.is_file():
             continue
         relative = path.relative_to(paths.formal)
@@ -289,7 +297,7 @@ def _render_unsupported_claims_status(
     return output
 
 
-def render_status(paths: StudyPaths) -> Path:
+def _render_status_under_authority(paths: StudyPaths) -> Path:
     validation_issues = validate_study(paths)
     authority_errors = [item for item in validation_issues if item.level == "ERROR"]
     authority_warnings = [item for item in validation_issues if item.level == "WARNING"]
@@ -369,51 +377,62 @@ def render_status(paths: StudyPaths) -> Path:
     confirmation_projection: dict[str, Any] | None = None
     graph_record_projection: dict[str, Any] | None = None
     workspace_projection: dict[str, Any] | None = None
-    try:
-        if pressure_error is None:
-            selector_path, compaction_due_path = refresh_active_projection(
-                paths,
-                claims_data=claims_data,
-                pressure=pressure,
-            )
-        else:
-            selector_path = write_active_selector(paths, claims_data=claims_data)
-            compaction_due_path = paths.generated / "COMPACTION_DUE.json"
-        selector_data = load_json(selector_path)
-        raw_confirmations = (
-            selector_data.get("confirmations")
-            if isinstance(selector_data, dict)
-            else None
+    selector_path = paths.generated / "ACTIVE_CONTEXT.json"
+    compaction_due_path = paths.generated / "COMPACTION_DUE.json"
+    if authority_errors:
+        # STATUS may describe invalid authority, but it must not replace the
+        # last known-good navigation or compaction projections with a view
+        # derived from authority that deterministic validation rejected.
+        selector_error = (
+            "authoritative validation failed; ACTIVE_CONTEXT.json and "
+            "COMPACTION_DUE.json were left unchanged"
         )
-        if not isinstance(raw_confirmations, dict):
-            raise ValidationError(
-                "ACTIVE_CONTEXT.json lacks the bounded Confirmation index"
+    else:
+        try:
+            if pressure_error is None:
+                selector_path, compaction_due_path = refresh_active_projection(
+                    paths,
+                    claims_data=claims_data,
+                    pressure=pressure,
+                )
+            else:
+                selector_path = write_active_selector(paths, claims_data=claims_data)
+            selector_data = load_json(selector_path)
+            raw_confirmations = (
+                selector_data.get("confirmations")
+                if isinstance(selector_data, dict)
+                else None
             )
-        confirmation_projection = raw_confirmations
-        raw_graph_records = (
-            selector_data.get("graph_records")
-            if isinstance(selector_data, dict)
-            else None
-        )
-        if not isinstance(raw_graph_records, dict):
-            raise ValidationError(
-                "ACTIVE_CONTEXT.json lacks the bounded graph-record index"
+            if not isinstance(raw_confirmations, dict):
+                raise ValidationError(
+                    "ACTIVE_CONTEXT.json lacks the bounded Confirmation index"
+                )
+            confirmation_projection = raw_confirmations
+            raw_graph_records = (
+                selector_data.get("graph_records")
+                if isinstance(selector_data, dict)
+                else None
             )
-        graph_record_projection = raw_graph_records
-        raw_workspace = (
-            selector_data.get("workspace")
-            if isinstance(selector_data, dict)
-            else None
-        )
-        if not isinstance(raw_workspace, dict):
-            raise ValidationError(
-                "ACTIVE_CONTEXT.json lacks the bounded Workspace index"
+            if not isinstance(raw_graph_records, dict):
+                raise ValidationError(
+                    "ACTIVE_CONTEXT.json lacks the bounded graph-record index"
+                )
+            graph_record_projection = raw_graph_records
+            raw_workspace = (
+                selector_data.get("workspace")
+                if isinstance(selector_data, dict)
+                else None
             )
-        workspace_projection = raw_workspace
-    except (ValidationError, WorkflowError, OSError, ValueError) as exc:
+            if not isinstance(raw_workspace, dict):
+                raise ValidationError(
+                    "ACTIVE_CONTEXT.json lacks the bounded Workspace index"
+                )
+            workspace_projection = raw_workspace
+        except (ValidationError, WorkflowError, OSError, ValueError) as exc:
+            selector_error = str(exc)
+    if selector_error is not None:
         selector_path = paths.generated / "ACTIVE_CONTEXT.json"
         compaction_due_path = paths.generated / "COMPACTION_DUE.json"
-        selector_error = str(exc)
     try:
         from .workspace import evaluate_changes, repository_profile_path
 
@@ -867,6 +886,13 @@ def render_status(paths: StudyPaths) -> Path:
     output = paths.generated / "STATUS.md"
     atomic_write_bytes(output, ("\n".join(lines) + "\n").encode("utf-8"))
     return output
+
+
+def render_status(paths: StudyPaths) -> Path:
+    """Render status and projections from one locked authority snapshot."""
+
+    with study_authority_lock(paths):
+        return _render_status_under_authority(paths)
 
 
 REVIEW_SECTIONS = (

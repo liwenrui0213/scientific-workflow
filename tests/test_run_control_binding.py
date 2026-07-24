@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import copy
 import sys
+from unittest.mock import patch
 
 from tests.helpers import WorkflowTestCase
+from tools.studyctl.active_context import build_active_selector
 from tools.studyctl.cli import main as studyctl_main
 from tools.studyctl.graph_records import (
     activate_control_graph,
     create_control_graph_draft,
     create_experiment_intent_draft,
+    deactivate_control_graph,
     finalize_control_graph,
     finalize_experiment_intent,
 )
@@ -147,6 +150,14 @@ class RunControlBindingTests(WorkflowTestCase):
             manifest["intent_binding"], active["realizes_intent"]
         )
         self.assertEqual(
+            [
+                item["kind"]
+                for item in manifest["formal_artifacts"]
+                if item.get("kind") == "PLAN"
+            ],
+            ["PLAN"],
+        )
+        self.assertEqual(
             object_schema_issues(
                 self.root, "run", manifest_path, manifest
             ),
@@ -224,6 +235,190 @@ class RunControlBindingTests(WorkflowTestCase):
         self.assertEqual(manifest["schema_version"], 5)
         self.assertIsNone(manifest["intent_binding"])
         self.assertIsNone(manifest["control_binding"])
+        self.assertTrue(manifest["change_scope"]["evidence_eligible"])
+        self.assertFalse(
+            any(
+                item.get("kind") == "PLAN"
+                for item in manifest["formal_artifacts"]
+            )
+        )
+
+    def test_ordinary_run_and_evidence_never_consult_ambient_plan(self) -> None:
+        paths = self.initialize_approved_with_claim()
+        self._activate_plan(paths)
+
+        with patch(
+            "tools.studyctl.graph_records.active_control_graph",
+            side_effect=AssertionError(
+                "ordinary scientific growth must not consult ambient PLAN"
+            ),
+        ):
+            manifest = self.successful_run(paths)
+            evidence_path = create_evidence_draft(
+                paths,
+                "EVID-0001",
+                ["CLAIM-0001"],
+                [manifest["run_id"]],
+            )
+            selector = build_active_selector(paths)
+
+        self.assertTrue(evidence_path.is_file())
+        self.assertFalse(
+            any(
+                item.get("kind") == "PLAN"
+                for item in manifest["formal_artifacts"]
+            )
+        )
+        self.assertNotIn(
+            "PLAN",
+            {
+                item["kind"]
+                for item in selector["active_formal_artifacts"]["sources"]
+            },
+        )
+        graph = selector["graph_records"]["control_graphs"]["items"][0]
+        self.assertEqual(graph["lifecycle"]["state"], "active")
+
+    def test_malformed_ambient_plan_does_not_block_ordinary_growth(self) -> None:
+        paths = self.initialize_approved_with_claim()
+        plan_path = paths.formal / "PLAN.json"
+        plan_path.write_text("{not-json", encoding="utf-8")
+
+        manifest = self.successful_run(paths)
+        evidence_path = create_evidence_draft(
+            paths,
+            "EVID-0001",
+            ["CLAIM-0001"],
+            [manifest["run_id"]],
+        )
+
+        self.assertTrue(evidence_path.is_file())
+        self.assertIsNone(manifest["control_binding"])
+        self.assertTrue(manifest["change_scope"]["evidence_eligible"])
+        self.assertFalse(
+            any(
+                item.get("kind") == "PLAN"
+                for item in manifest["formal_artifacts"]
+            )
+        )
+
+    def test_plan_symlink_is_ignored_only_by_ordinary_run(self) -> None:
+        paths = self.initialize_approved_with_claim()
+        self._activate_plan(paths)
+        plan_path = paths.formal / "PLAN.json"
+        graph_path = paths.control_graphs / "CG-0001.v0001.json"
+        plan_path.unlink()
+        plan_path.symlink_to(graph_path)
+
+        manifest = self.successful_run(paths)
+
+        self.assertIsNone(manifest["control_binding"])
+        self.assertTrue(manifest["change_scope"]["evidence_eligible"])
+        self.assertFalse(
+            any(
+                item.get("kind") == "PLAN"
+                for item in manifest["formal_artifacts"]
+            )
+        )
+        evidence_path = create_evidence_draft(
+            paths,
+            "EVID-0001",
+            ["CLAIM-0001"],
+            [manifest["run_id"]],
+        )
+        self.assertTrue(evidence_path.is_file())
+        with self.assertRaisesRegex(
+            ValidationError, "regular non-symlink file"
+        ):
+            self._bound_run(paths, control_node_id="run_fixture")
+        self.assertEqual(
+            sorted(path.name for path in paths.runs.glob("RUN-*")),
+            ["RUN-000001"],
+        )
+
+    def test_plan_directory_is_ignored_only_by_ordinary_growth(self) -> None:
+        paths = self.initialize_approved_with_claim()
+        self._activate_plan(paths)
+        plan_path = paths.formal / "PLAN.json"
+        plan_path.unlink()
+        plan_path.mkdir()
+        (plan_path / "child.json").write_text(
+            '{"status":"active","must_not_be_read":"ambient PLAN child"}\n',
+            encoding="utf-8",
+        )
+
+        manifest = self.successful_run(paths)
+        evidence_path = create_evidence_draft(
+            paths,
+            "EVID-0001",
+            ["CLAIM-0001"],
+            [manifest["run_id"]],
+        )
+
+        self.assertTrue(evidence_path.is_file())
+        self.assertIsNone(manifest["control_binding"])
+        self.assertTrue(manifest["change_scope"]["evidence_eligible"])
+        self.assertFalse(
+            any(
+                item.get("path", "").startswith("formal/PLAN.json")
+                for item in manifest["formal_artifacts"]
+            )
+        )
+        with self.assertRaisesRegex(
+            ValidationError, "regular non-symlink file"
+        ):
+            self._bound_run(paths, control_node_id="run_fixture")
+        self.assertEqual(
+            sorted(path.name for path in paths.runs.glob("RUN-*")),
+            ["RUN-000001"],
+        )
+
+    def test_stale_active_plan_does_not_block_or_taint_ordinary_run(
+        self,
+    ) -> None:
+        paths = self.initialize_approved_with_claim()
+        self._activate_plan(paths)
+        self._finalize_intent(paths)
+
+        manifest = self.successful_run(paths)
+
+        self.assertIsNone(manifest["intent_binding"])
+        self.assertIsNone(manifest["control_binding"])
+        self.assertTrue(manifest["change_scope"]["evidence_eligible"])
+        self.assertTrue(
+            manifest["formalization"]["artifacts_unchanged_during_run"]
+        )
+        self.assertFalse(
+            any(
+                item.get("kind") == "PLAN"
+                for item in manifest["formal_artifacts"]
+            )
+        )
+        evidence_path = create_evidence_draft(
+            paths,
+            "EVID-0001",
+            ["CLAIM-0001"],
+            [manifest["run_id"]],
+        )
+        self.assertTrue(evidence_path.is_file())
+
+        with self.assertRaisesRegex(ValidationError, "superseded"):
+            self._bound_run(paths, control_node_id="run_fixture")
+
+    def test_deactivated_plan_cannot_bind_an_explicit_run(self) -> None:
+        paths = self.initialize_approved_with_claim()
+        self._activate_plan(paths)
+        deactivate_control_graph(
+            paths,
+            reason="The graph is no longer selected for execution.",
+        )
+
+        with self.assertRaisesRegex(
+            ValidationError, "requires an active formal/PLAN.json"
+        ):
+            self._bound_run(paths, control_node_id="run_fixture")
+
+        self.assertEqual(list(paths.runs.glob("RUN-*")), [])
 
     def test_cli_intent_binding_does_not_require_a_plan(self) -> None:
         paths = self.initialize_approved_with_claim()

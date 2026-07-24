@@ -45,6 +45,16 @@ def normalize_graph_record_inventory(
             record_id = require_id("experiment_intent", str(raw.get("id", "")))
         elif kind == "control_graph":
             record_id = require_id("control_graph", str(raw.get("id", "")))
+        elif kind == "plan_lifecycle":
+            record_id = str(raw.get("id", ""))
+            if (
+                len(record_id) < len("PLAN-EVENT-000001")
+                or not record_id.startswith("PLAN-EVENT-")
+                or not record_id.removeprefix("PLAN-EVENT-").isdigit()
+            ):
+                raise ValidationError(
+                    "Graph-record plan_lifecycle ID is invalid"
+                )
         else:
             raise ValidationError("Graph-record inventory kind is unsupported")
         version = raw.get("version")

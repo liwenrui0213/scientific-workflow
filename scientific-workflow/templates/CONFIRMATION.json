@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "study_id": null,
   "confirmation_id": null,
   "status": "draft",
@@ -12,7 +12,9 @@
     "rationale": "",
     "changes": [],
     "supersedes": null,
-    "invalidity_reason": null
+    "invalidity_reason": null,
+    "predecessor_campaign": null,
+    "restart_rationale": null
   },
   "candidates": [
     {

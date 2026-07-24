@@ -583,7 +583,7 @@ def _interactive_verdict_choices(
     stdout: TextIO,
 ) -> dict[str, Any]:
     # Fail before asking for human judgment when the mechanical scope is stale.
-    _current_judged_scope(paths, [])
+    initial_scope = _current_judged_scope(paths, [])
     available = _checkpoint_claims(paths)
     if available:
         print("Claims frozen by the latest Checkpoint:", file=stdout)
@@ -619,7 +619,7 @@ def _interactive_verdict_choices(
         stdout,
         "Scientific scope accepted or rejected by this decision: ",
     )
-    return {
+    choices = {
         "input_version": 1,
         "claim_ids": claim_ids,
         "implementation_verdict": {
@@ -634,6 +634,33 @@ def _interactive_verdict_choices(
             "conditions": [],
         },
     }
+    review_requires_waiver = not (paths.generated / "REVIEW.json").is_file()
+    if not review_requires_waiver:
+        from .review import current_review_basis
+
+        try:
+            current_review_basis(paths, judged_scope=initial_scope)
+        except ValidationError as exc:
+            review_requires_waiver = True
+            print(
+                "The imported independent Review does not match the current "
+                f"judgment scope: {exc}",
+                file=stdout,
+            )
+    if review_requires_waiver:
+        waiver_reason = _prompt_line(
+            stdin,
+            stdout,
+            "Independent Review waiver reason: ",
+        )
+        waiver_phrase = f"WAIVE INDEPENDENT REVIEW {paths.study_id}"
+        _confirmation(stdin, stdout, waiver_phrase)
+        choices["review_waiver"] = {
+            "reason": waiver_reason,
+            "source": "interactive_human_confirmation",
+            "authorization_text": waiver_phrase,
+        }
+    return choices
 
 
 def _validate_verdict_choices(
@@ -650,13 +677,54 @@ def _validate_verdict_choices(
     expected_version = 2 if agent_initiated else 1
     if agent_initiated:
         required.add("authorization")
-    if set(choices) != required or choices.get("input_version") != expected_version:
+    allowed_fields = required | {"review_waiver"}
+    if (
+        not required.issubset(choices)
+        or not set(choices).issubset(allowed_fields)
+        or choices.get("input_version") != expected_version
+    ):
         raise ValidationError(
             "Verdict decision input must contain exactly "
             f"input_version={expected_version}, claim_ids, implementation_verdict, and "
             "scientific_verdict"
             + (", plus authorization" if agent_initiated else "")
         )
+    waiver = choices.get("review_waiver")
+    if waiver is not None:
+        if not isinstance(waiver, dict) or set(waiver) != {
+            "reason",
+            "source",
+            "authorization_text",
+        }:
+            raise ValidationError(
+                "review_waiver must contain exactly reason, source, and "
+                "authorization_text"
+            )
+        reason = waiver.get("reason")
+        text = waiver.get("authorization_text")
+        expected_source = (
+            "explicit_user_instruction"
+            if agent_initiated
+            else "interactive_human_confirmation"
+        )
+        if waiver.get("source") != expected_source:
+            raise ValidationError(
+                f"review_waiver source must be {expected_source}"
+            )
+        if (
+            not isinstance(reason, str)
+            or not reason.strip()
+            or _contains_placeholder(reason)
+        ):
+            raise ValidationError("review_waiver requires a completed reason")
+        if (
+            not isinstance(text, str)
+            or not text.strip()
+            or _contains_placeholder(text)
+        ):
+            raise ValidationError(
+                "review_waiver requires exact human authorization text"
+            )
     if agent_initiated:
         authorization = choices.get("authorization")
         if not isinstance(authorization, dict) or set(authorization) != {
@@ -723,9 +791,18 @@ def _validate_verdict_choices(
 
 def _current_verdict_authority(
     paths: StudyPaths,
+    *,
+    require_consistent_authority: bool = True,
+    pending_authority_path: Path | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any]]:
     """Validate authority that every new Verdict format must share."""
 
+    from .review_verdict_sequence import (
+        require_consistent_review_verdict_authority,
+    )
+
+    if require_consistent_authority:
+        require_consistent_review_verdict_authority(paths)
     _raise_validation_issues(
         "Verdict requires a fresh approved Brief",
         brief_content_issues(paths) + brief_approval_issues(paths),
@@ -740,10 +817,66 @@ def _current_verdict_authority(
             "latest Checkpoint does not bind the current Brief approval; compact before Verdict"
         )
     repository = git_state(paths.root)
-    if repository.get("available") and repository.get("dirty"):
+    if not repository.get("available") or not repository.get("commit"):
         raise ValidationError(
-            "Verdict requires a clean Git worktree; commit the reviewed state first"
+            "new Verdicts require an available Git repository and a committed "
+            "revision"
         )
+    if repository.get("available") and repository.get("dirty"):
+        generated_root = paths.generated.relative_to(paths.root).as_posix()
+        history_root = (
+            paths.study / "review-history"
+        ).relative_to(paths.root).as_posix()
+        sequence_path = paths.review_verdict_sequence.relative_to(
+            paths.root
+        ).as_posix()
+        pending_path = (
+            pending_authority_path.relative_to(paths.root).as_posix()
+            if pending_authority_path is not None
+            else None
+        )
+        disallowed: list[str] = []
+        for line in repository.get("status", []):
+            rendered = str(line)
+            raw_path = rendered[3:] if len(rendered) > 3 else ""
+            status_code = rendered[:2]
+            in_generated = raw_path == generated_root or raw_path.startswith(
+                generated_root + "/"
+            )
+            in_history = raw_path == history_root or raw_path.startswith(
+                history_root + "/"
+            )
+            history_addition = in_history and status_code in {
+                "??",
+                "A ",
+                " A",
+            }
+            sequence_change = (
+                raw_path == sequence_path and "D" not in status_code
+            )
+            pending_authority_addition = (
+                pending_path is not None
+                and raw_path == pending_path
+                and status_code in {"??", "A ", " A"}
+            )
+            if (
+                " -> " in raw_path
+                or (
+                    not in_generated
+                    and not history_addition
+                    and not sequence_change
+                    and not pending_authority_addition
+                )
+            ):
+                disallowed.append(rendered)
+        if disallowed:
+            raise ValidationError(
+                "Verdict requires a clean scientific worktree; only generated "
+                "Review projections, immutable review-history additions, and "
+                "the consistent Review/Verdict sequence may remain uncommitted. "
+                "Unexpected changes: "
+                + ", ".join(disallowed[:8])
+            )
     return approval, latest, repository
 
 
@@ -799,12 +932,15 @@ def _current_judged_scope(paths: StudyPaths, claim_ids: list[str]) -> dict[str, 
             "checkpoint_id": latest["checkpoint_id"],
             "sha256": latest["checkpoint_sha256"],
         }
+    from .review import current_review_scope
+
     return {
         "commit": repository.get("commit"),
         "brief_sha256": sha256_file(paths.brief),
         "checkpoint": checkpoint_ref,
         "claims": claim_refs,
         "evidence": evidence_refs,
+        "active_context": current_review_scope(paths)["active_context"],
     }
 
 
@@ -824,14 +960,19 @@ def _build_generated_verdict(
         )
     from .review import current_review_basis
 
+    judged_scope = _current_judged_scope(paths, claim_ids)
     verdict = {
         "schema_version": VERDICT_SCHEMA_VERSION,
         "study_id": paths.study_id,
         "verdict_id": _next_verdict_id(paths),
         "created_at": utc_now(),
         "reviewer": reviewer_identity(paths.root),
-        "review_basis": current_review_basis(paths),
-        "judged_scope": _current_judged_scope(paths, claim_ids),
+        "review_basis": current_review_basis(
+            paths,
+            judged_scope=judged_scope,
+            waiver=choices.get("review_waiver"),
+        ),
+        "judged_scope": judged_scope,
         "implementation_verdict": {
             **choices["implementation_verdict"],
             "conditions": list(choices["implementation_verdict"].get("conditions", [])),
@@ -969,8 +1110,18 @@ def _validate_checkpoint_reference(paths: StudyPaths, ref: Any) -> None:
         raise ValidationError("judged_scope.checkpoint is not an exact Checkpoint reference")
 
 
-def _validate_current_verdict_scope(paths: StudyPaths, verdict: dict[str, Any]) -> None:
-    _current_verdict_authority(paths)
+def _validate_current_verdict_scope(
+    paths: StudyPaths,
+    verdict: dict[str, Any],
+    *,
+    require_consistent_authority: bool = True,
+    pending_authority_path: Path | None = None,
+) -> None:
+    _current_verdict_authority(
+        paths,
+        require_consistent_authority=require_consistent_authority,
+        pending_authority_path=pending_authority_path,
+    )
     scope = verdict.get("judged_scope")
     if not isinstance(scope, dict):
         raise ValidationError("judged_scope must be an object")
@@ -983,9 +1134,25 @@ def _validate_current_verdict_scope(paths: StudyPaths, verdict: dict[str, Any]) 
     _validate_evidence_references(paths, scope.get("evidence"))
     _validate_checkpoint_reference(paths, scope.get("checkpoint"))
     if verdict.get("schema_version") == VERDICT_SCHEMA_VERSION:
-        from .review import validate_review_basis
+        from .review import current_review_scope, validate_review_basis
 
-        validate_review_basis(paths, verdict.get("review_basis"))
+        current_active_context = current_review_scope(paths)["active_context"]
+        if scope.get("active_context") != current_active_context:
+            raise ValidationError(
+                "judged_scope.active_context does not match the current "
+                "ACTIVE_CONTEXT identity"
+            )
+
+        validate_review_basis(
+            paths,
+            verdict.get("review_basis"),
+            judged_scope=scope,
+            require_current=True,
+            allow_unindexed_review_verdict_authority=(
+                not require_consistent_authority
+            ),
+            pending_authority_path=pending_authority_path,
+        )
     if scope.get("claims") and scope.get("checkpoint") is None:
         raise ValidationError(
             "Verdict Claim references require the latest Checkpoint snapshot"
@@ -1024,9 +1191,10 @@ def record_verdict(
 ) -> Path:
     """Record human-owned decisions in a mechanically scoped immutable Verdict.
 
-    Interactive mode collects and confirms the decisions directly. Agent-initiated
-    mode accepts only a version-2 decision input that preserves the explicit user
-    instruction authorizing those decisions; it cannot import a complete Verdict.
+    Interactive mode collects decisions directly or accepts decision-only input.
+    Agent-initiated mode accepts only a version-2 decision input that preserves
+    the explicit user instruction authorizing those decisions. Complete Verdict
+    records are historical read-only artifacts and can never be newly imported.
     """
 
     if agent_initiated:
@@ -1048,6 +1216,29 @@ def record_verdict(
         if not isinstance(supplied, dict):
             raise ValidationError("Verdict source must contain a JSON object")
         if "input_version" in supplied:
+            if not agent_initiated:
+                _validate_verdict_choices(
+                    supplied,
+                    agent_initiated=False,
+                )
+                waiver = supplied.get("review_waiver")
+                if waiver is not None:
+                    assert isinstance(waiver, dict)
+                    print(
+                        "Decision file requests an Independent Review waiver: "
+                        + str(waiver["reason"]),
+                        file=stdout,
+                    )
+                    waiver_phrase = (
+                        f"WAIVE INDEPENDENT REVIEW {paths.study_id}"
+                    )
+                    _confirmation(stdin, stdout, waiver_phrase)
+                    supplied = dict(supplied)
+                    supplied["review_waiver"] = {
+                        "reason": waiver["reason"],
+                        "source": "interactive_human_confirmation",
+                        "authorization_text": waiver_phrase,
+                    }
             verdict = _build_generated_verdict(
                 paths,
                 supplied,
@@ -1055,12 +1246,10 @@ def record_verdict(
             )
             generated_claim_ids = list(supplied["claim_ids"])
         else:
-            if agent_initiated:
-                raise HumanGateError(
-                    "agent-initiated Verdict accepts only decision input, not a complete Verdict record"
-                )
-            # Compatibility path for previously prepared full Verdict sources.
-            verdict = supplied
+            raise ValidationError(
+                "new Verdict recording accepts only decision input; complete "
+                "Verdict records are historical read-only artifacts"
+            )
     if verdict.get("schema_version") != VERDICT_SCHEMA_VERSION:
         raise ValidationError(
             "new Verdicts must use the current schema_version with an immutable "
@@ -1156,6 +1345,14 @@ def record_verdict(
             )
     if destination.exists():
         raise WorkflowError(f"refusing to overwrite existing Verdict: {destination}")
+    from .review_verdict_sequence import (
+        advance_review_verdict_sequence,
+        review_verdict_authority_inventory,
+    )
+
+    previous_review_verdict_inventory = review_verdict_authority_inventory(
+        paths
+    )
     recorded_at = utc_now()
     if agent_initiated:
         verdict["confirmation"] = {
@@ -1173,5 +1370,9 @@ def record_verdict(
         object_schema_issues(paths.root, "verdict", destination, verdict),
     )
     atomic_write_json(destination, verdict, overwrite=False, mode=0o444)
+    advance_review_verdict_sequence(
+        paths,
+        previous_inventory=previous_review_verdict_inventory,
+    )
     print(f"Recorded immutable Verdict: {destination}", file=stdout)
     return destination

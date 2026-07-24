@@ -1176,6 +1176,39 @@ def _validate_final_evidence_basis(
             + ", ".join(changed)
         )
     mode = str(expected["mode"])
+    if item.get("status") == "draft" and campaign_records:
+        confirmatory_ids = set(expected["confirmatory_run_ids"])
+        confirmatory_supporting = [
+            str(run_ref.get("run_id"))
+            for run_ref in item.get("runs", [])
+            if isinstance(run_ref, dict)
+            and run_ref.get("run_id") in confirmatory_ids
+            and run_ref.get("role") == "supporting"
+        ]
+        if confirmatory_supporting or (
+            mode == "confirmatory" and item.get("assessment") == "supports"
+        ):
+            from .confirmation import (
+                load_confirmation_campaign_abandonment,
+                require_active_confirmation_campaign_tail,
+            )
+
+            campaign_id = str(
+                campaign_records[0].get("campaign", {}).get("campaign_id", "")
+            )
+            if (
+                load_confirmation_campaign_abandonment(paths, campaign_id)
+                is not None
+            ):
+                raise ValidationError(
+                    f"abandoned Confirmation campaign {campaign_id} cannot form "
+                    "a supporting confirmatory Evidence basis"
+                )
+
+            require_active_confirmation_campaign_tail(
+                paths,
+                campaign_records[-1],
+            )
     missing_slots = expected["missing_slot_ids"]
     if mode in {"confirmatory", "mixed"} and missing_slots:
         raise ValidationError(

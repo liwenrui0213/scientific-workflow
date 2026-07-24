@@ -202,12 +202,15 @@ class BoundedProjectionTests(WorkflowTestCase):
         )
 
     def test_active_selector_indexes_large_sources_without_embedding_them(self) -> None:
-        paths = self.initialize_approved_with_claim()
+        paths = self.initialize()
+        self.fill_brief(paths)
         brief_marker = "BRIEF-CONTENT-MUST-NOT-BE-EMBEDDED-" + "b" * 180_000
         paths.brief.write_text(
             paths.brief.read_text(encoding="utf-8") + brief_marker,
             encoding="utf-8",
         )
+        self.add_proposed_claim(paths)
+        self.approve(paths)
         formal_marker = "FORMAL-CONTENT-MUST-NOT-BE-EMBEDDED-" + "f" * 180_000
         formal_path = paths.formal / "MODEL.md"
         formal_path.write_text(
@@ -509,6 +512,7 @@ class BoundedProjectionTests(WorkflowTestCase):
         self.commit_all("record bounded-projection fixture")
         marker = "EVIDENCE-PAYLOAD-MUST-NOT-BE-PROJECTED-" + "z" * 20_000
         finalized = self.finalized_other_evidence(paths, marker)
+        self.commit_all("freeze the current Review scope")
 
         packet_path = create_review_packet(paths)
         packet = load_json(packet_path)

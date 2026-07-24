@@ -175,6 +175,15 @@ def _latest_checkpoint(paths: StudyPaths) -> dict[str, Any] | None:
 def _latest_checkpoint_source(
     paths: StudyPaths,
 ) -> tuple[Path, dict[str, Any]] | None:
+    sources = _checkpoint_sources(paths)
+    return sources[-1] if sources else None
+
+
+def _checkpoint_sources(
+    paths: StudyPaths,
+) -> list[tuple[Path, dict[str, Any]]]:
+    """Return the complete visible Checkpoint chain in sequence order."""
+
     sequence = require_checkpoint_sequence(paths)
     high_water_mark = int(sequence["high_water_mark"])
     candidates = sorted(paths.checkpoints.glob("CHECKPOINT-*.json"))
@@ -187,11 +196,20 @@ def _latest_checkpoint_source(
             "visible Checkpoints do not match the monotone Checkpoint sequence"
         )
     if high_water_mark == 0:
-        return None
-    path = candidates[-1]
-    value = load_json(path)
-    if not isinstance(value, dict):
-        raise ValidationError("latest Checkpoint must be an object")
+        return []
+    sources: list[tuple[Path, dict[str, Any]]] = []
+    for path in candidates:
+        value = load_json(path)
+        if not isinstance(value, dict):
+            raise ValidationError("Checkpoint must be an object")
+        if value.get("checkpoint_sha256") != record_digest(
+            value, "checkpoint_sha256"
+        ):
+            raise ValidationError(
+                f"Checkpoint digest is invalid: {path.name}"
+            )
+        sources.append((path, value))
+    path, value = sources[-1]
     latest = sequence.get("latest_checkpoint")
     if not isinstance(latest, dict) or (
         latest.get("checkpoint_id") != value.get("checkpoint_id")
@@ -200,7 +218,7 @@ def _latest_checkpoint_source(
         raise ValidationError(
             "latest Checkpoint does not match the monotone Checkpoint sequence"
         )
-    return path, value
+    return sources
 
 
 def _active_formal_source_index(paths: StudyPaths) -> dict[str, Any]:
@@ -249,6 +267,9 @@ def _bounded_locator_index(
 
 
 def _confirmation_source_index(paths: StudyPaths) -> dict[str, Any]:
+    from .confirmation_sequence import (
+        require_consistent_confirmation_authority,
+    )
     """Index resumable Confirmation work without making it active formal context.
 
     Finalized records are immutable history.  Their pending slots, running
@@ -260,7 +281,11 @@ def _confirmation_source_index(paths: StudyPaths) -> dict[str, Any]:
 
     # Local imports avoid cycles: validation and run_registry both use active
     # context helpers during their normal module initialization.
-    from .confirmation import load_final_confirmation
+    from .confirmation import (
+        confirmation_draft_state,
+        load_confirmation_campaign_abandonment,
+        load_final_confirmation,
+    )
     from .run_registry import confirmation_binding
     from .validation import evidence_index, run_index
 
@@ -330,6 +355,7 @@ def _confirmation_source_index(paths: StudyPaths) -> dict[str, Any]:
     finalized_ids = {path.stem for path in finalized_paths}
 
     drafts: list[dict[str, Any]] = []
+    stale_drafts: list[dict[str, Any]] = []
     if paths.active_work.is_dir():
         for path in sorted(
             paths.active_work.glob("CONF-*.confirmation.draft.json"),
@@ -344,19 +370,25 @@ def _confirmation_source_index(paths: StudyPaths) -> dict[str, Any]:
                 # Finalization retains the editable source for provenance; it
                 # is no longer resumable once the immutable record exists.
                 continue
-            drafts.append(
-                {
-                    "confirmation_id": confirmation_id,
-                    "path": path.relative_to(paths.root).as_posix(),
-                    "size": path.stat().st_size,
-                    "sha256": sha256_file(path),
-                }
-            )
+            state = confirmation_draft_state(paths, path)
+            locator = {
+                "confirmation_id": confirmation_id,
+                "path": path.relative_to(paths.root).as_posix(),
+                "size": path.stat().st_size,
+                "sha256": sha256_file(path),
+                "draft_state": state["state"],
+                "state_reason": state["reason"],
+            }
+            if state["state"] == "resumable":
+                drafts.append(locator)
+            else:
+                stale_drafts.append(locator)
 
     history: list[dict[str, Any]] = []
     pending: list[dict[str, Any]] = []
     in_progress: list[dict[str, Any]] = []
     awaiting_evidence: list[dict[str, Any]] = []
+    abandonment_locators: dict[str, dict[str, Any] | None] = {}
     if finalized_paths:
         for path in finalized_paths:
             confirmation_id = path.stem
@@ -371,7 +403,40 @@ def _confirmation_source_index(paths: StudyPaths) -> dict[str, Any]:
             consumed_ids = {
                 str(item["slot_id"]) for item in record_attempts
             }
-            pending_ids = [slot_id for slot_id in slot_ids if slot_id not in consumed_ids]
+            unconsumed_ids = [
+                slot_id for slot_id in slot_ids if slot_id not in consumed_ids
+            ]
+            campaign_id = str(
+                record.get("campaign", {}).get("campaign_id", "")
+            )
+            if campaign_id not in abandonment_locators:
+                abandonment = load_confirmation_campaign_abandonment(
+                    paths, campaign_id
+                )
+                if abandonment is None:
+                    abandonment_locators[campaign_id] = None
+                else:
+                    abandonment_path = (
+                        paths.confirmations
+                        / f"{campaign_id}.abandonment.json"
+                    )
+                    abandonment_locators[campaign_id] = {
+                        "campaign_id": campaign_id,
+                        "status": "abandoned",
+                        "path": abandonment_path.relative_to(
+                            paths.root
+                        ).as_posix(),
+                        "size": abandonment_path.stat().st_size,
+                        "sha256": sha256_file(abandonment_path),
+                        "record_sha256": abandonment.get("record_sha256"),
+                        "abandoned_at": abandonment.get("abandoned_at"),
+                        "rationale_preview": str(
+                            abandonment.get("rationale", "")
+                        )[:240],
+                    }
+            abandonment_locator = abandonment_locators[campaign_id]
+            campaign_abandoned = abandonment_locator is not None
+            pending_ids = [] if campaign_abandoned else unconsumed_ids
             claim_ids = [str(item["claim_id"]) for item in record["claims"]]
             finalized_evidence_count = evidence_counts.get(key, 0)
             draft_evidence = sorted(
@@ -384,7 +449,11 @@ def _confirmation_source_index(paths: StudyPaths) -> dict[str, Any]:
             has_running_slot = bool(running_slots)
             history_item = {
                 "confirmation_id": confirmation_id,
-                "campaign_id": record.get("campaign", {}).get("campaign_id"),
+                "campaign_id": campaign_id,
+                "campaign_status": (
+                    "abandoned" if campaign_abandoned else "active"
+                ),
+                "abandonment": deepcopy(abandonment_locator),
                 "campaign_sequence": record.get("campaign", {}).get("sequence"),
                 "path": path.relative_to(paths.root).as_posix(),
                 "size": path.stat().st_size,
@@ -392,7 +461,8 @@ def _confirmation_source_index(paths: StudyPaths) -> dict[str, Any]:
                 "record_sha256": record_sha256,
                 "frozen_at": record.get("frozen_at"),
                 "planned_slot_count": len(slot_ids),
-                "consumed_slot_count": len(slot_ids) - len(pending_ids),
+                "consumed_slot_count": len(slot_ids) - len(unconsumed_ids),
+                "unconsumed_slot_count": len(unconsumed_ids),
                 "pending_slot_count": len(pending_ids),
                 "running_slot_count": len(running_slots),
                 "finalized_evidence_count": finalized_evidence_count,
@@ -431,7 +501,8 @@ def _confirmation_source_index(paths: StudyPaths) -> dict[str, Any]:
                     }
                 )
             if draft_evidence or (
-                not has_running_slot
+                not campaign_abandoned
+                and not has_running_slot
                 and not pending_ids
                 and finalized_evidence_count == 0
             ):
@@ -440,9 +511,20 @@ def _confirmation_source_index(paths: StudyPaths) -> dict[str, Any]:
     completed_count = sum(
         int(item["finalized_evidence_count"]) > 0 for item in history
     )
+    sequence = require_consistent_confirmation_authority(paths)
     return {
+        "authority": {
+            **_source_locator(paths, paths.confirmation_sequence),
+            "high_water_mark": sequence["high_water_mark"],
+            "inventory_sha256": sequence["inventory_sha256"],
+            "sequence_sha256": sequence["sequence_sha256"],
+        },
         "drafts": _bounded_locator_index(
             drafts,
+            limit=CONFIRMATION_SOURCE_LIMIT,
+        ),
+        "stale_drafts": _bounded_locator_index(
+            stale_drafts,
             limit=CONFIRMATION_SOURCE_LIMIT,
         ),
         "pending_finalized": _bounded_locator_index(
@@ -680,6 +762,80 @@ def _claim_evidence_keys(claims_data: Mapping[str, Any]) -> set[tuple[str, int]]
     return keys
 
 
+def _archived_claim_dispositions(
+    paths: StudyPaths,
+) -> tuple[set[tuple[str, int]], list[dict[str, Any]]]:
+    """Read Evidence dispositions preserved in immutable archived Claims.
+
+    The returned locators identify the exact archived Claim sources used for
+    attention filtering.  They do not import the archived Claim as current
+    cognitive state.
+    """
+
+    keys: set[tuple[str, int]] = set()
+    sources: dict[tuple[str, str], dict[str, Any]] = {}
+    claim_records_root = (paths.checkpoints / "claim-records").resolve()
+    for checkpoint_path, checkpoint in _checkpoint_sources(paths):
+        references = checkpoint.get("inactive_claim_refs", [])
+        if not isinstance(references, list):
+            raise ValidationError(
+                f"Checkpoint inactive_claim_refs must be an array: "
+                f"{checkpoint_path.name}"
+            )
+        for reference in references:
+            if not isinstance(reference, dict):
+                raise ValidationError(
+                    "Checkpoint inactive Claim reference must be an object"
+                )
+            claim_id = reference.get("claim_id")
+            recorded_path = reference.get("record_path")
+            claim_digest = reference.get("sha256")
+            if (
+                not isinstance(claim_id, str)
+                or not isinstance(recorded_path, str)
+                or not isinstance(claim_digest, str)
+            ):
+                raise ValidationError(
+                    "Checkpoint inactive Claim reference is incomplete"
+                )
+            record_path = paths.root / recorded_path
+            try:
+                record_path.resolve(strict=True).relative_to(
+                    claim_records_root
+                )
+            except (OSError, ValueError) as exc:
+                raise ValidationError(
+                    "Checkpoint inactive Claim record path is missing or unsafe"
+                ) from exc
+            if record_path.is_symlink() or not record_path.is_file():
+                raise ValidationError(
+                    "Checkpoint inactive Claim record is not a regular file"
+                )
+            archived_claim = load_json(record_path)
+            if (
+                not isinstance(archived_claim, dict)
+                or archived_claim.get("claim_id") != claim_id
+                or sha256_json(archived_claim) != claim_digest
+            ):
+                raise ValidationError(
+                    "Checkpoint inactive Claim record does not match its "
+                    "content-addressed reference"
+                )
+            dispositioned = _claim_evidence_keys(
+                {"claims": [archived_claim]}
+            )
+            keys.update(dispositioned)
+            source_key = (claim_id, claim_digest)
+            sources[source_key] = {
+                "claim_id": claim_id,
+                "lifecycle": archived_claim.get("lifecycle"),
+                "state": archived_claim.get("state"),
+                "dispositioned_evidence_count": len(dispositioned),
+                "source": _source_locator(paths, record_path),
+            }
+    return keys, [sources[key] for key in sorted(sources)]
+
+
 def build_occurrence_locator(
     paths: StudyPaths,
     *,
@@ -706,24 +862,29 @@ def build_occurrence_locator(
         sealed_run_evidence_eligible,
     )
 
+    terminal_statuses = {"succeeded", "failed", "interrupted", "incomplete"}
     run_occurrences: list[dict[str, Any]] = []
     for run_id, (manifest_path, manifest) in sorted(
         run_index(paths).items(),
         reverse=True,
     ):
         status = str(manifest.get("status", ""))
-        facts: list[str] = []
-        if status in {"failed", "interrupted", "incomplete"}:
-            facts.append(f"run_status_{status}")
-        missing_output_count = sum(
-            1
-            for output in manifest.get("outputs", [])
-            if isinstance(output, dict) and output.get("present") is False
-        )
-        if missing_output_count:
-            facts.append("missing_declared_output")
-        if not sealed_run_evidence_eligible(manifest):
-            facts.append("evidence_ineligible_attempt")
+        if status not in terminal_statuses:
+            facts = ["in_progress"]
+            missing_output_count = 0
+        else:
+            facts = []
+            if status in {"failed", "interrupted", "incomplete"}:
+                facts.append(f"run_status_{status}")
+            missing_output_count = sum(
+                1
+                for output in manifest.get("outputs", [])
+                if isinstance(output, dict) and output.get("present") is False
+            )
+            if missing_output_count:
+                facts.append("missing_declared_output")
+            if not sealed_run_evidence_eligible(manifest):
+                facts.append("evidence_ineligible_attempt")
         if not facts:
             continue
         run_occurrences.append(
@@ -742,7 +903,12 @@ def build_occurrence_locator(
             }
         )
 
-    dispositioned = _claim_evidence_keys(claims_data)
+    archived_dispositioned, archived_disposition_sources = (
+        _archived_claim_dispositions(paths)
+    )
+    dispositioned = (
+        _claim_evidence_keys(claims_data) | archived_dispositioned
+    )
     undispositioned_evidence: list[dict[str, Any]] = []
     for key, (evidence_path, evidence) in sorted(
         evidence_index(paths).items(),
@@ -791,6 +957,7 @@ def build_occurrence_locator(
     complete_inventory = {
         "run_occurrences": run_occurrences,
         "finalized_undispositioned_evidence": undispositioned_evidence,
+        "archived_claim_dispositions": archived_disposition_sources,
     }
     return {
         "run_occurrences": _bounded_locator_index(
@@ -807,6 +974,10 @@ def build_occurrence_locator(
             "run_ledger": run_authority,
             "evidence_sequence": evidence_authority,
             "claims": _source_locator(paths, paths.claims),
+            "archived_claim_dispositions": _bounded_locator_index(
+                archived_disposition_sources,
+                limit=ACTIVE_CONTEXT_OCCURRENCE_ITEM_LIMIT,
+            ),
         },
         "assurance": "derived_occurrence_facts_only",
     }

@@ -66,15 +66,21 @@ class StudyRoutingTests(WorkflowTestCase):
                 "rationale": "The fixture does not establish a scientific conclusion.",
                 "scope": "Only the deterministic routing fixture is judged.",
             },
+            "review_waiver": {
+                "reason": "This routing-only fixture does not commission an independent Review.",
+                "source": "interactive_human_confirmation",
+                "authorization_text": f"WAIVE INDEPENDENT REVIEW {paths.study_id}",
+            },
         }
         source_path = self.root / "routing-verdict-decisions.json"
         atomic_write_json(source_path, source)
         self.commit_all("freeze routing Verdict input")
+        waiver_phrase = f"WAIVE INDEPENDENT REVIEW {paths.study_id}"
         phrase = f"RECORD VERDICT {paths.study_id} {verdict_id}"
         record_verdict(
             paths,
             source_path,
-            stdin=TTYBuffer(phrase + "\n"),
+            stdin=TTYBuffer(waiver_phrase + "\n" + phrase + "\n"),
             stdout=TTYBuffer(),
         )
 

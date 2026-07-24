@@ -9,12 +9,21 @@ import subprocess
 from typing import Any, Mapping, Sequence
 
 from .formalization import load_policy
+from .confirmation_sequence import (
+    advance_confirmation_sequence,
+    confirmation_authority_inventory,
+    confirmation_sequence_temporary_paths,
+    recover_unindexed_confirmation_authority,
+    require_confirmation_sequence,
+    require_consistent_confirmation_authority,
+)
 from .hashing import (
     atomic_write_json,
     file_record,
     load_json,
     record_digest,
     sha256_bytes,
+    sha256_file,
     sha256_json,
 )
 from .models import (
@@ -40,6 +49,8 @@ _CAMPAIGN_TERMINAL_RUN_STATUSES = {
 _MAX_CAMPAIGN_CONFIRMATIONS = 256
 _MAX_CAMPAIGN_SLOTS = 256
 _CONFIRMATORY_RUN_SCHEMA_VERSIONS = frozenset({4, 5})
+_CAMPAIGN_ID_PATTERN = re.compile(r"^CAMP-[0-9a-f]{64}$")
+_CAMPAIGN_ABANDONMENT_SUFFIX = ".abandonment.json"
 
 
 def claim_spec_sha256(claim: dict[str, Any]) -> str:
@@ -103,14 +114,58 @@ def _claim_version_key(
     return tuple(sorted(versions))
 
 
-def confirmation_campaign_id(claims: Sequence[dict[str, Any]]) -> str:
-    """Derive one campaign identity from exact Claim IDs and specifications."""
+def _campaign_predecessor_ref(value: Any) -> dict[str, str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {
+        "campaign_id",
+        "abandonment_sha256",
+    }:
+        raise ValidationError(
+            "Confirmation predecessor_campaign must contain exactly campaign_id "
+            "and abandonment_sha256"
+        )
+    campaign_id = value.get("campaign_id")
+    abandonment_sha256 = value.get("abandonment_sha256")
+    if (
+        not isinstance(campaign_id, str)
+        or _CAMPAIGN_ID_PATTERN.fullmatch(campaign_id) is None
+    ):
+        raise ValidationError("Confirmation predecessor campaign_id is invalid")
+    if (
+        not isinstance(abandonment_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", abandonment_sha256) is None
+    ):
+        raise ValidationError(
+            "Confirmation predecessor abandonment_sha256 is invalid"
+        )
+    return {
+        "campaign_id": campaign_id,
+        "abandonment_sha256": abandonment_sha256,
+    }
+
+
+def confirmation_campaign_id(
+    claims: Sequence[dict[str, Any]],
+    predecessor_campaign: Mapping[str, Any] | None = None,
+) -> str:
+    """Derive a campaign identity from Claim versions and an optional restart."""
 
     payload = [
         {"claim_id": claim_id, "spec_sha256": spec_sha256}
         for claim_id, spec_sha256 in _claim_version_key(claims)
     ]
-    return "CAMP-" + sha256_json(payload)
+    predecessor = _campaign_predecessor_ref(predecessor_campaign)
+    if predecessor is None:
+        # Preserve the deterministic identity of every historical v2/v3
+        # campaign and of a first v4 campaign.
+        digest_input: Any = payload
+    else:
+        digest_input = {
+            "claim_versions": payload,
+            "predecessor_campaign": predecessor,
+        }
+    return "CAMP-" + sha256_json(digest_input)
 
 
 def _confirmation_ref(record: dict[str, Any]) -> dict[str, str]:
@@ -341,6 +396,13 @@ def _campaign_sequence_errors(records: Sequence[dict[str, Any]]) -> list[str]:
         records,
         key=lambda record: int(record.get("campaign", {}).get("sequence", 0)),
     )
+    first_campaign = (
+        ordered[0].get("campaign")
+        if ordered and isinstance(ordered[0].get("campaign"), dict)
+        else {}
+    )
+    expected_origin = first_campaign.get("predecessor_campaign")
+    expected_restart_rationale = first_campaign.get("restart_rationale")
     for expected_sequence, record in enumerate(ordered, start=1):
         campaign = record.get("campaign")
         if not isinstance(campaign, dict):
@@ -356,6 +418,16 @@ def _campaign_sequence_errors(records: Sequence[dict[str, Any]]) -> list[str]:
         if campaign.get("predecessor") != expected_predecessor:
             errors.append(
                 f"Confirmation campaign predecessor is invalid at {confirmation_id}"
+            )
+        if campaign.get("predecessor_campaign") != expected_origin:
+            errors.append(
+                "Confirmation campaign restart predecessor is inconsistent at "
+                f"{confirmation_id}"
+            )
+        if campaign.get("restart_rationale") != expected_restart_rationale:
+            errors.append(
+                "Confirmation campaign restart rationale is inconsistent at "
+                f"{confirmation_id}"
             )
     return errors
 
@@ -406,10 +478,24 @@ def _existing_campaign_records(
     paths: StudyPaths,
     claims: Sequence[dict[str, Any]],
 ) -> list[dict[str, Any]]:
+    records, _ = _campaign_context(paths, claims)
+    return records
+
+
+def _campaign_groups_for_claims(
+    paths: StudyPaths,
+    claims: Sequence[dict[str, Any]],
+    *,
+    confirmation_records: Sequence[dict[str, Any]] | None = None,
+) -> dict[str, list[dict[str, Any]]]:
     target_versions = _claim_version_key(claims)
-    campaign_id = confirmation_campaign_id(claims)
-    records: list[dict[str, Any]] = []
-    for record in _all_confirmation_records(paths):
+    groups: dict[str, list[dict[str, Any]]] = {}
+    records = (
+        _all_confirmation_records(paths)
+        if confirmation_records is None
+        else confirmation_records
+    )
+    for record in records:
         record_versions = _claim_version_key(record.get("claims", []))
         overlap = set(target_versions) & set(record_versions)
         if overlap and record_versions != target_versions:
@@ -418,24 +504,182 @@ def _existing_campaign_records(
                 f"campaign Claim sets; conflicting record: {record.get('confirmation_id')}"
             )
         record_campaign = record.get("campaign")
+        campaign_id = (
+            record_campaign.get("campaign_id")
+            if isinstance(record_campaign, dict)
+            else None
+        )
+        if record_versions == target_versions and isinstance(campaign_id, str):
+            groups.setdefault(campaign_id, []).append(record)
+    for campaign_id, records in groups.items():
+        errors = _campaign_sequence_errors(records)
+        if errors:
+            raise ValidationError(f"{campaign_id}: " + "; ".join(errors))
+        groups[campaign_id] = sorted(
+            records, key=lambda item: int(item["campaign"]["sequence"])
+        )
+    return groups
+
+
+def _confirmation_campaign_chain(
+    paths: StudyPaths,
+    claims: Sequence[dict[str, Any]],
+    *,
+    confirmation_records: Sequence[dict[str, Any]] | None = None,
+    abandonments: Mapping[str, dict[str, Any]] | None = None,
+) -> list[list[dict[str, Any]]]:
+    """Load the single append-only campaign chain for exact Claim versions."""
+
+    groups = _campaign_groups_for_claims(
+        paths,
+        claims,
+        confirmation_records=confirmation_records,
+    )
+    if not groups:
+        return []
+    roots: list[str] = []
+    children: dict[str, list[str]] = {}
+    for campaign_id, records in groups.items():
+        campaign = records[0]["campaign"]
+        predecessor = _campaign_predecessor_ref(
+            campaign.get("predecessor_campaign")
+        )
+        if predecessor is None:
+            roots.append(campaign_id)
+            continue
+        abandonment = (
+            load_confirmation_campaign_abandonment(
+                paths, predecessor["campaign_id"]
+            )
+            if abandonments is None
+            else abandonments.get(predecessor["campaign_id"])
+        )
+        if abandonment is None:
+            raise ValidationError(
+                f"Confirmation campaign {campaign_id} references a missing "
+                "predecessor abandonment"
+            )
         if (
-            record_versions == target_versions
-            and isinstance(record_campaign, dict)
-            and record_campaign.get("campaign_id") == campaign_id
+            abandonment.get("record_sha256")
+            != predecessor["abandonment_sha256"]
         ):
-            records.append(record)
-    errors = _campaign_sequence_errors(records)
-    if errors:
-        raise ValidationError("; ".join(errors))
-    return sorted(records, key=lambda item: int(item["campaign"]["sequence"]))
+            raise ValidationError(
+                f"Confirmation campaign {campaign_id} predecessor abandonment "
+                "digest is stale"
+            )
+        children.setdefault(predecessor["campaign_id"], []).append(campaign_id)
+    if len(roots) != 1:
+        raise ValidationError(
+            "exact Claim versions must have exactly one root Confirmation campaign"
+        )
+    forks = sorted(
+        campaign_id
+        for campaign_id, child_ids in children.items()
+        if len(child_ids) > 1
+    )
+    if forks:
+        raise ValidationError(
+            "Confirmation campaign restart chain forks after: " + ", ".join(forks)
+        )
+    chain: list[list[dict[str, Any]]] = []
+    seen: set[str] = set()
+    campaign_id = roots[0]
+    while campaign_id not in seen:
+        records = groups.get(campaign_id)
+        if records is None:
+            raise ValidationError(
+                "Confirmation campaign restart references a campaign outside "
+                "the exact Claim-version chain"
+            )
+        seen.add(campaign_id)
+        chain.append(records)
+        child_ids = children.get(campaign_id, [])
+        if not child_ids:
+            break
+        campaign_id = child_ids[0]
+    if len(seen) != len(groups):
+        raise ValidationError(
+            "Confirmation campaigns for exact Claim versions do not form one "
+            "complete predecessor chain"
+        )
+    return chain
+
+
+def require_active_confirmation_campaign_tail(
+    paths: StudyPaths,
+    confirmation: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Require one selected campaign to be the unique active chain tail.
+
+    This gate is for admitting new Runs or new supporting confirmatory
+    Evidence. Historical Run and Evidence validation deliberately does not
+    call it.
+    """
+
+    require_consistent_confirmation_authority(paths)
+    loaded = load_final_confirmation(
+        paths,
+        str(confirmation.get("confirmation_id", "")),
+    )
+    if loaded != confirmation:
+        raise ValidationError(
+            "Confirmation object does not match its immutable record"
+        )
+    chain = _confirmation_campaign_chain(paths, confirmation.get("claims", []))
+    if not chain:
+        raise ValidationError(
+            "Confirmation campaign predecessor chain is missing"
+        )
+    selected_campaign_id = str(
+        confirmation.get("campaign", {}).get("campaign_id", "")
+    )
+    tail = chain[-1]
+    tail_campaign_id = str(tail[0]["campaign"]["campaign_id"])
+    if selected_campaign_id != tail_campaign_id:
+        raise ValidationError(
+            f"Confirmation campaign {selected_campaign_id} is not the unique "
+            "active tail of its exact Claim-version chain"
+        )
+    if (
+        load_confirmation_campaign_abandonment(paths, tail_campaign_id)
+        is not None
+    ):
+        raise ValidationError(
+            f"Confirmation campaign {tail_campaign_id} is abandoned; it is not "
+            "an active campaign tail"
+        )
+    return tail
+
+
+def _campaign_context(
+    paths: StudyPaths,
+    claims: Sequence[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    chain = _confirmation_campaign_chain(paths, claims)
+    if not chain:
+        return [], None
+    tail = chain[-1]
+    campaign_id = str(tail[0]["campaign"]["campaign_id"])
+    abandonment = load_confirmation_campaign_abandonment(paths, campaign_id)
+    if abandonment is not None:
+        return [], abandonment
+    return tail, None
 
 
 def _campaign_draft_metadata(
     paths: StudyPaths,
     claims: Sequence[dict[str, Any]],
 ) -> dict[str, Any]:
-    records = _existing_campaign_records(paths, claims)
-    campaign_id = confirmation_campaign_id(claims)
+    records, abandonment = _campaign_context(paths, claims)
+    predecessor_campaign = (
+        None
+        if abandonment is None
+        else {
+            "campaign_id": str(abandonment["campaign_id"]),
+            "abandonment_sha256": str(abandonment["record_sha256"]),
+        }
+    )
+    campaign_id = confirmation_campaign_id(claims, predecessor_campaign)
     if not records:
         return {
             "campaign_id": campaign_id,
@@ -446,10 +690,13 @@ def _campaign_draft_metadata(
             "changes": [],
             "supersedes": None,
             "invalidity_reason": None,
+            "predecessor_campaign": predecessor_campaign,
+            "restart_rationale": "" if predecessor_campaign is not None else None,
         }
     predecessor = _confirmation_ref(records[-1])
+    first_campaign = records[0]["campaign"]
     return {
-        "campaign_id": campaign_id,
+        "campaign_id": str(first_campaign["campaign_id"]),
         "sequence": len(records) + 1,
         "predecessor": predecessor,
         "continuation_kind": None,
@@ -457,6 +704,10 @@ def _campaign_draft_metadata(
         "changes": [],
         "supersedes": None,
         "invalidity_reason": None,
+        "predecessor_campaign": copy.deepcopy(
+            first_campaign.get("predecessor_campaign")
+        ),
+        "restart_rationale": first_campaign.get("restart_rationale"),
     }
 
 
@@ -513,20 +764,55 @@ def _finalize_campaign_metadata(
     claims: Sequence[dict[str, Any]],
     raw: Any,
 ) -> dict[str, Any]:
-    records = _existing_campaign_records(paths, claims)
+    records, abandonment = _campaign_context(paths, claims)
     if len(records) >= _MAX_CAMPAIGN_CONFIRMATIONS:
         raise ValidationError(
             "Confirmation campaign reached its maximum record count"
         )
-    campaign_id = confirmation_campaign_id(claims)
-    if not records:
-        return _campaign_draft_metadata(paths, claims)
-    _require_prior_campaign_complete(paths, records)
     if not isinstance(raw, dict):
-        raise ValidationError(
-            "a continuation Confirmation requires campaign disclosure metadata"
-        )
+        raise ValidationError("Confirmation requires campaign disclosure metadata")
+    if not records:
+        expected = _campaign_draft_metadata(paths, claims)
+        for field in (
+            "campaign_id",
+            "sequence",
+            "predecessor",
+            "continuation_kind",
+            "changes",
+            "supersedes",
+            "invalidity_reason",
+            "predecessor_campaign",
+        ):
+            if raw.get(field) != expected[field]:
+                raise ValidationError(
+                    f"initial Confirmation campaign {field} is stale or invalid"
+                )
+        if abandonment is None:
+            if raw.get("restart_rationale") is not None:
+                raise ValidationError(
+                    "a root Confirmation campaign cannot declare a restart rationale"
+                )
+        else:
+            expected["restart_rationale"] = _require_nonempty_text(
+                raw.get("restart_rationale"), "campaign restart rationale"
+            )
+        return expected
+    _require_prior_campaign_complete(paths, records)
+    first_campaign = records[0]["campaign"]
+    campaign_id = str(first_campaign["campaign_id"])
     predecessor = _confirmation_ref(records[-1])
+    expected_fields = {
+        "campaign_id": campaign_id,
+        "sequence": len(records) + 1,
+        "predecessor": predecessor,
+        "predecessor_campaign": first_campaign.get("predecessor_campaign"),
+        "restart_rationale": first_campaign.get("restart_rationale"),
+    }
+    for field, expected in expected_fields.items():
+        if raw.get(field) != expected:
+            raise ValidationError(
+                f"continuation Confirmation campaign {field} is stale or invalid"
+            )
     kind = raw.get("continuation_kind")
     if kind not in {"replication", "corrective_supersession"}:
         raise ValidationError(
@@ -568,7 +854,105 @@ def _finalize_campaign_metadata(
         "changes": list(changes),
         "supersedes": copy.deepcopy(supersedes),
         "invalidity_reason": invalidity_reason,
+        "predecessor_campaign": copy.deepcopy(
+            first_campaign.get("predecessor_campaign")
+        ),
+        "restart_rationale": first_campaign.get("restart_rationale"),
     }
+
+
+def confirmation_draft_state(
+    paths: StudyPaths,
+    draft_path: Path,
+) -> dict[str, Any]:
+    """Classify one mutable draft without granting it scientific authority."""
+
+    if draft_path.is_symlink() or not draft_path.is_file():
+        return {
+            "state": "invalid",
+            "reason": "draft is not a regular file",
+        }
+    try:
+        draft = load_json(draft_path)
+        if not isinstance(draft, dict) or draft.get("status") != "draft":
+            raise ValidationError("draft status or object shape is invalid")
+        claims = draft.get("claims")
+        if not isinstance(claims, list) or not claims:
+            raise ValidationError("draft Claim bindings are missing")
+        current = _load_claims(paths)
+        expected_claims: list[dict[str, Any]] = []
+        for binding in claims:
+            if not isinstance(binding, dict):
+                raise ValidationError("draft Claim binding is invalid")
+            claim_id = require_id("claim", str(binding.get("claim_id", "")))
+            claim = current.get(claim_id)
+            if claim is None:
+                raise ValidationError(
+                    f"current Claim no longer exists: {claim_id}"
+                )
+            expected_claims.append(_claim_binding(claim))
+        if claims != expected_claims:
+            return {
+                "state": "stale",
+                "reason": "Claim statement or scope changed after draft creation",
+            }
+        expected_campaign = _campaign_draft_metadata(paths, claims)
+        campaign = draft.get("campaign")
+        if not isinstance(campaign, dict):
+            raise ValidationError("draft campaign metadata is missing")
+        identity_fields = (
+            "campaign_id",
+            "sequence",
+            "predecessor",
+            "predecessor_campaign",
+        )
+        changed = [
+            field
+            for field in identity_fields
+            if campaign.get(field) != expected_campaign.get(field)
+        ]
+        if changed:
+            return {
+                "state": "stale",
+                "reason": (
+                    "campaign lifecycle advanced after draft creation: "
+                    + ", ".join(changed)
+                ),
+            }
+    except (OSError, ValidationError, WorkflowError, ValueError) as exc:
+        return {"state": "invalid", "reason": str(exc)}
+    return {"state": "resumable", "reason": None}
+
+
+def _active_drafts_for_claim_versions(
+    paths: StudyPaths,
+    claims: Sequence[dict[str, Any]],
+) -> list[Path]:
+    target = _claim_version_key(claims)
+    matches: list[Path] = []
+    if not paths.active_work.is_dir():
+        return matches
+    for path in sorted(
+        paths.active_work.glob("CONF-*.confirmation.draft.json")
+    ):
+        confirmation_id = path.name.removesuffix(
+            ".confirmation.draft.json"
+        )
+        if (paths.confirmations / f"{confirmation_id}.json").is_file():
+            continue
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            value = load_json(path)
+            raw_claims = value.get("claims") if isinstance(value, dict) else None
+            if (
+                isinstance(raw_claims, list)
+                and _claim_version_key(raw_claims) == target
+            ):
+                matches.append(path)
+        except (OSError, ValidationError, WorkflowError, ValueError):
+            continue
+    return matches
 
 
 @serialized_study_authority
@@ -593,6 +977,23 @@ def create_confirmation_draft(
         raise ValidationError(
             "Confirmation references missing current Claim(s): " + ", ".join(missing)
         )
+    selected_claims = [
+        _claim_binding(current[claim_id]) for claim_id in selected_ids
+    ]
+    conflicting_drafts = _active_drafts_for_claim_versions(
+        paths,
+        selected_claims,
+    )
+    if conflicting_drafts:
+        raise WorkflowError(
+            "an active Confirmation draft already targets the same exact "
+            "Claim-version set; resume it or explicitly disposition a stale "
+            "draft with confirmation-draft-discard: "
+            + ", ".join(
+                path.relative_to(paths.root).as_posix()
+                for path in conflicting_drafts
+            )
+        )
     final_path = paths.confirmations / f"{confirmation_id}.json"
     if final_path.exists():
         raise WorkflowError(f"Confirmation Record already exists: {final_path}")
@@ -608,13 +1009,81 @@ def create_confirmation_draft(
             "study_id": paths.study_id,
             "confirmation_id": confirmation_id,
             "status": "draft",
-            "claims": [_claim_binding(current[claim_id]) for claim_id in selected_ids],
+            "claims": selected_claims,
             "created_at": utc_now(),
         }
     )
     draft["campaign"] = _campaign_draft_metadata(paths, draft["claims"])
     atomic_write_json(draft_path, draft, overwrite=False)
     return draft_path
+
+
+@serialized_study_authority
+def discard_stale_confirmation_draft(
+    paths: StudyPaths,
+    confirmation_id: str,
+    *,
+    reason: str,
+) -> Path:
+    """Explicitly remove one non-resumable draft from the active Workspace."""
+
+    paths.assert_safe_layout()
+    require_id("confirmation", confirmation_id)
+    reason = _require_nonempty_text(
+        reason,
+        "stale-draft disposition reason",
+    ).strip()
+    source = (
+        paths.active_work
+        / f"{confirmation_id}.confirmation.draft.json"
+    )
+    if source.is_symlink() or not source.is_file():
+        raise ValidationError(
+            f"Confirmation draft is not a regular active file: {source}"
+        )
+    state = confirmation_draft_state(paths, source)
+    if state["state"] == "resumable":
+        raise ValidationError(
+            "a resumable Confirmation draft cannot be discarded as stale"
+        )
+    source_sha256 = sha256_file(source)
+    archive_directory = paths.archived_work / "confirmation-drafts"
+    archive_directory.mkdir(parents=True, exist_ok=True)
+    archived = (
+        archive_directory
+        / f"{confirmation_id}.{source_sha256}.stale-draft.json"
+    )
+    disposition = (
+        archive_directory
+        / f"{confirmation_id}.{source_sha256}.disposition.json"
+    )
+    if archived.exists() or disposition.exists():
+        raise WorkflowError(
+            "this exact Confirmation draft already has an archived disposition"
+        )
+    os.replace(source, archived)
+    try:
+        atomic_write_json(
+            disposition,
+            {
+                "schema_version": 1,
+                "record_type": "confirmation_draft_disposition",
+                "study_id": paths.study_id,
+                "confirmation_id": confirmation_id,
+                "source_sha256": source_sha256,
+                "classification": state["state"],
+                "classification_reason": state["reason"],
+                "reason": reason,
+                "discarded_at": utc_now(),
+            },
+            overwrite=False,
+            mode=0o444,
+            require_parent_fsync=True,
+        )
+    except Exception:
+        os.replace(archived, source)
+        raise
+    return disposition
 
 
 def _require_nonempty_text(value: Any, label: str) -> str:
@@ -882,6 +1351,8 @@ def finalize_confirmation(paths: StudyPaths, source: Path) -> Path:
             "Confirmation registry is invalid before finalization:\n"
             + "\n".join(issue.render() for issue in registry_errors)
         )
+    previous_inventory = confirmation_authority_inventory(paths)
+    require_consistent_confirmation_authority(paths, previous_inventory)
     draft_path = _safe_source_path(paths, source)
     draft = load_json(draft_path)
     if not isinstance(draft, dict):
@@ -929,7 +1400,7 @@ def finalize_confirmation(paths: StudyPaths, source: Path) -> Path:
         )
     campaign = _finalize_campaign_metadata(paths, claims, draft.get("campaign"))
     finalized: dict[str, Any] = {
-        "schema_version": 3,
+        "schema_version": 4,
         "study_id": paths.study_id,
         "confirmation_id": confirmation_id,
         "status": "finalized",
@@ -958,6 +1429,10 @@ def finalize_confirmation(paths: StudyPaths, source: Path) -> Path:
         overwrite=False,
         mode=0o444,
         require_parent_fsync=True,
+    )
+    advance_confirmation_sequence(
+        paths,
+        previous_inventory=previous_inventory,
     )
     return target
 
@@ -998,8 +1473,39 @@ def _static_record_errors(paths: StudyPaths, path: Path, value: Any) -> list[str
     if not isinstance(campaign, dict):
         errors.append("Confirmation requires campaign metadata")
     else:
+        schema_version = value.get("schema_version")
+        predecessor_campaign: dict[str, str] | None = None
+        if schema_version == 4:
+            try:
+                predecessor_campaign = _campaign_predecessor_ref(
+                    campaign.get("predecessor_campaign")
+                )
+            except ValidationError as exc:
+                errors.append(str(exc))
+            restart_rationale = campaign.get("restart_rationale")
+            if predecessor_campaign is None:
+                if restart_rationale is not None:
+                    errors.append(
+                        "root Confirmation campaign restart_rationale must be null"
+                    )
+            elif (
+                not isinstance(restart_rationale, str)
+                or not restart_rationale.strip()
+            ):
+                errors.append(
+                    "restarted Confirmation campaign requires a restart_rationale"
+                )
+        elif (
+            "predecessor_campaign" in campaign
+            or "restart_rationale" in campaign
+        ):
+            errors.append(
+                "legacy Confirmation campaign cannot declare v4 restart metadata"
+            )
         try:
-            expected_campaign_id = confirmation_campaign_id(claims)
+            expected_campaign_id = confirmation_campaign_id(
+                claims, predecessor_campaign
+            )
         except ValidationError as exc:
             errors.append(str(exc))
         else:
@@ -1107,6 +1613,7 @@ def _static_record_errors(paths: StudyPaths, path: Path, value: Any) -> list[str
 
 def load_final_confirmation(paths: StudyPaths, confirmation_id: str) -> dict[str, Any]:
     require_id("confirmation", confirmation_id)
+    require_consistent_confirmation_authority(paths)
     path = paths.confirmations / f"{confirmation_id}.json"
     if path.is_symlink() or not path.is_file():
         raise ValidationError(f"finalized Confirmation Record does not exist: {confirmation_id}")
@@ -1116,6 +1623,541 @@ def load_final_confirmation(paths: StudyPaths, confirmation_id: str) -> dict[str
         raise ValidationError("invalid finalized Confirmation Record: " + "; ".join(errors))
     assert isinstance(value, dict)
     return value
+
+
+def _confirmation_abandonment_path(
+    paths: StudyPaths,
+    campaign_id: str,
+) -> Path:
+    if _CAMPAIGN_ID_PATTERN.fullmatch(campaign_id) is None:
+        raise ValidationError(f"invalid Confirmation campaign identifier: {campaign_id!r}")
+    return paths.confirmations / f"{campaign_id}{_CAMPAIGN_ABANDONMENT_SUFFIX}"
+
+
+def _campaign_abandonment_snapshot(
+    records: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    if not records:
+        raise ValidationError(
+            "Confirmation campaign abandonment requires at least one record"
+        )
+    ordered = sorted(
+        records,
+        key=lambda item: int(item.get("campaign", {}).get("sequence", 0)),
+    )
+    claim_versions = [
+        {"claim_id": claim_id, "spec_sha256": spec_sha256}
+        for claim_id, spec_sha256 in _claim_version_key(ordered[0]["claims"])
+    ]
+    confirmation_records = [
+        {
+            "confirmation_id": str(record["confirmation_id"]),
+            "sha256": str(record["record_sha256"]),
+            "sequence": int(record["campaign"]["sequence"]),
+        }
+        for record in ordered
+    ]
+    planned_slot_ids = [
+        f"{record['confirmation_id']}/{slot['slot_id']}"
+        for record in ordered
+        for slot in record.get("run_slots", [])
+        if isinstance(slot, dict)
+    ]
+    return {
+        "claim_versions": claim_versions,
+        "confirmation_records": confirmation_records,
+        "planned_slot_ids": planned_slot_ids,
+    }
+
+
+def _abandonment_static_errors(
+    paths: StudyPaths,
+    path: Path,
+    value: Any,
+    *,
+    confirmation_records: Sequence[dict[str, Any]] | None = None,
+) -> list[str]:
+    errors: list[str] = []
+    from .validation import errors_only, object_schema_issues
+
+    for issue in errors_only(
+        object_schema_issues(
+            paths.root,
+            "confirmation_abandonment",
+            path,
+            value,
+        )
+    ):
+        errors.append(issue.message)
+    if not isinstance(value, dict):
+        return errors or ["Confirmation campaign abandonment must be an object"]
+    campaign_id = value.get("campaign_id")
+    if value.get("study_id") != paths.study_id:
+        errors.append(
+            "Confirmation campaign abandonment study_id does not match Study directory"
+        )
+    if (
+        not isinstance(campaign_id, str)
+        or path.name
+        != f"{campaign_id}{_CAMPAIGN_ABANDONMENT_SUFFIX}"
+    ):
+        errors.append(
+            "Confirmation campaign abandonment identity does not match filename"
+        )
+    if value.get("scope") != "whole_campaign":
+        errors.append(
+            "Confirmation campaign abandonment must cover the whole campaign"
+        )
+    if value.get("status") != "abandoned":
+        errors.append("Confirmation campaign abandonment status is invalid")
+    if value.get("record_sha256") != record_digest(value, "record_sha256"):
+        errors.append(
+            "Confirmation campaign abandonment record_sha256 does not match record"
+        )
+    authorization = value.get("authorization")
+    if not isinstance(authorization, dict) or set(authorization) != {
+        "mode",
+        "source",
+        "assurance",
+        "instruction",
+        "instruction_sha256",
+    }:
+        errors.append(
+            "Confirmation campaign abandonment authorization has an invalid structure"
+        )
+    else:
+        instruction = authorization.get("instruction")
+        if authorization.get("mode") != "agent_initiated":
+            errors.append(
+                "Confirmation campaign abandonment authorization mode is invalid"
+            )
+        if authorization.get("source") != "explicit_user_instruction":
+            errors.append(
+                "Confirmation campaign abandonment requires explicit user authorization"
+            )
+        if authorization.get("assurance") != "cooperative":
+            errors.append(
+                "Confirmation campaign abandonment authorization assurance must "
+                "be cooperative"
+            )
+        if not isinstance(instruction, str) or not instruction.strip():
+            errors.append(
+                "Confirmation campaign abandonment authorization instruction "
+                "must be non-empty"
+            )
+        elif authorization.get("instruction_sha256") != sha256_json(instruction):
+            errors.append(
+                "Confirmation campaign abandonment authorization instruction "
+                "hash is invalid"
+            )
+    if path.exists():
+        metadata = path.stat()
+        if metadata.st_mode & 0o222:
+            errors.append(
+                "Confirmation campaign abandonment record must be read-only"
+            )
+        if metadata.st_nlink != 1:
+            errors.append(
+                "Confirmation campaign abandonment record must not have hard links"
+            )
+    if isinstance(campaign_id, str):
+        try:
+            matching = [
+                record
+                for record in (
+                    _all_confirmation_records(paths)
+                    if confirmation_records is None
+                    else confirmation_records
+                )
+                if record.get("campaign", {}).get("campaign_id") == campaign_id
+            ]
+            if not matching:
+                raise ValidationError(
+                    f"Confirmation campaign has no records: {campaign_id}"
+                )
+            if confirmation_records is None:
+                campaign_records = confirmation_campaign_records(
+                    paths,
+                    matching[0],
+                )
+            else:
+                campaign_errors = _campaign_sequence_errors(matching)
+                if campaign_errors:
+                    raise ValidationError("; ".join(campaign_errors))
+                campaign_records = sorted(
+                    matching,
+                    key=lambda item: int(item["campaign"]["sequence"]),
+                )
+            expected = _campaign_abandonment_snapshot(campaign_records)
+        except (OSError, ValidationError, WorkflowError) as exc:
+            errors.append(str(exc))
+        else:
+            for field, expected_value in expected.items():
+                if value.get(field) != expected_value:
+                    errors.append(
+                        "Confirmation campaign abandonment does not preserve "
+                        f"the complete {field}"
+                    )
+    return errors
+
+
+def load_confirmation_campaign_abandonment(
+    paths: StudyPaths,
+    campaign_id: str,
+) -> dict[str, Any] | None:
+    """Load one immutable whole-campaign abandonment, if it exists."""
+
+    require_consistent_confirmation_authority(paths)
+    path = _confirmation_abandonment_path(paths, campaign_id)
+    if not path.exists() and not path.is_symlink():
+        return None
+    if path.is_symlink() or not path.is_file():
+        raise ValidationError(
+            f"Confirmation campaign abandonment is not a regular file: {path}"
+        )
+    value = load_json(path)
+    errors = _abandonment_static_errors(paths, path, value)
+    if errors:
+        raise ValidationError(
+            "invalid Confirmation campaign abandonment: " + "; ".join(errors)
+        )
+    assert isinstance(value, dict)
+    return value
+
+
+def _validate_abandonment_decision(
+    decision: Mapping[str, Any],
+) -> tuple[str, str, str]:
+    if not isinstance(decision, Mapping):
+        raise ValidationError(
+            "Confirmation campaign abandonment decision input must be an object"
+        )
+    partial_keys = {
+        "slot_id",
+        "slot_ids",
+        "planned_slot_ids",
+        "confirmation_ids",
+        "confirmation_records",
+    }
+    if partial_keys & set(decision):
+        raise ValidationError(
+            "selective Confirmation record or slot abandonment is prohibited; "
+            "only the whole campaign may be abandoned"
+        )
+    required = {
+        "input_version",
+        "campaign_id",
+        "rationale",
+        "authorization",
+    }
+    if set(decision) != required or decision.get("input_version") != 1:
+        raise ValidationError(
+            "Confirmation campaign abandonment input must contain exactly "
+            "input_version=1, campaign_id, rationale, and authorization"
+        )
+    campaign_id = decision.get("campaign_id")
+    if (
+        not isinstance(campaign_id, str)
+        or _CAMPAIGN_ID_PATTERN.fullmatch(campaign_id) is None
+    ):
+        raise ValidationError(
+            "Confirmation campaign abandonment campaign_id is invalid"
+        )
+    rationale = _require_nonempty_text(
+        decision.get("rationale"), "campaign abandonment rationale"
+    )
+    authorization = decision.get("authorization")
+    if not isinstance(authorization, Mapping) or set(authorization) != {
+        "source",
+        "instruction",
+    }:
+        raise ValidationError(
+            "Confirmation campaign abandonment authorization must contain "
+            "exactly source and instruction"
+        )
+    if authorization.get("source") != "explicit_user_instruction":
+        raise ValidationError(
+            "Confirmation campaign abandonment requires an explicit user instruction"
+        )
+    instruction = _require_nonempty_text(
+        authorization.get("instruction"),
+        "campaign abandonment authorization instruction",
+    ).strip()
+    return campaign_id, rationale, instruction
+
+
+@serialized_study_authority
+def abandon_confirmation_campaign(
+    paths: StudyPaths,
+    confirmation_id: str,
+    decision: Mapping[str, Any],
+) -> Path:
+    """Append one authorized, immutable whole-campaign abandonment record."""
+
+    paths.assert_safe_layout()
+    require_id("confirmation", confirmation_id)
+    campaign_id, rationale, instruction = _validate_abandonment_decision(decision)
+    registry_errors = [
+        issue
+        for issue in confirmation_record_issues(paths)
+        if issue.level == "ERROR"
+    ]
+    if registry_errors:
+        raise ValidationError(
+            "Confirmation registry is invalid before campaign abandonment:\n"
+            + "\n".join(issue.render() for issue in registry_errors)
+        )
+    previous_inventory = confirmation_authority_inventory(paths)
+    require_consistent_confirmation_authority(paths, previous_inventory)
+    confirmation = load_final_confirmation(paths, confirmation_id)
+    actual_campaign = confirmation.get("campaign")
+    actual_campaign_id = (
+        actual_campaign.get("campaign_id")
+        if isinstance(actual_campaign, dict)
+        else None
+    )
+    if campaign_id != actual_campaign_id:
+        raise ValidationError(
+            "Confirmation campaign abandonment decision does not match the "
+            "selected Confirmation"
+        )
+    chain = _confirmation_campaign_chain(paths, confirmation["claims"])
+    if not chain or chain[-1][0]["campaign"]["campaign_id"] != campaign_id:
+        raise ValidationError(
+            "only the latest Confirmation campaign in an exact Claim-version "
+            "chain may be abandoned"
+        )
+    target = _confirmation_abandonment_path(paths, campaign_id)
+    if target.exists():
+        raise WorkflowError(
+            f"Confirmation campaign is already abandoned: {campaign_id}"
+        )
+    campaign_records = confirmation_campaign_records(paths, confirmation)
+    snapshot = _campaign_abandonment_snapshot(campaign_records)
+    record: dict[str, Any] = {
+        "schema_version": 1,
+        "study_id": paths.study_id,
+        "record_type": "confirmation_campaign_abandonment",
+        "campaign_id": campaign_id,
+        "scope": "whole_campaign",
+        "status": "abandoned",
+        **snapshot,
+        "rationale": rationale,
+        "authorization": {
+            "mode": "agent_initiated",
+            "source": "explicit_user_instruction",
+            "assurance": "cooperative",
+            "instruction": instruction,
+            "instruction_sha256": sha256_json(instruction),
+        },
+        "abandoned_at": utc_now(),
+        "record_sha256": None,
+    }
+    record["record_sha256"] = record_digest(record, "record_sha256")
+    errors = _abandonment_static_errors(paths, target, record)
+    if errors:
+        raise ValidationError(
+            "Confirmation campaign abandonment does not satisfy its immutable "
+            "contract: " + "; ".join(errors)
+        )
+    atomic_write_json(
+        target,
+        record,
+        overwrite=False,
+        mode=0o444,
+        require_parent_fsync=True,
+    )
+    advance_confirmation_sequence(
+        paths,
+        previous_inventory=previous_inventory,
+    )
+    return target
+
+
+def _raw_valid_confirmation_records(paths: StudyPaths) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for path in sorted(paths.confirmations.glob("CONF-*.json")):
+        if path.is_symlink() or not path.is_file():
+            raise ValidationError(
+                f"Confirmation authority record is not a regular file: {path}"
+            )
+        value = load_json(path)
+        errors = _static_record_errors(paths, path, value)
+        if errors:
+            raise ValidationError(
+                "invalid finalized Confirmation Record during recovery: "
+                + "; ".join(errors)
+            )
+        assert isinstance(value, dict)
+        records.append(value)
+    return records
+
+
+def _raw_confirmation_abandonments(
+    paths: StudyPaths,
+    *,
+    confirmation_records: Sequence[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    records: dict[str, dict[str, Any]] = {}
+    for path in sorted(
+        paths.confirmations.glob(f"CAMP-*{_CAMPAIGN_ABANDONMENT_SUFFIX}")
+    ):
+        if path.is_symlink() or not path.is_file():
+            raise ValidationError(
+                f"Confirmation campaign abandonment is not a regular file: {path}"
+            )
+        value = load_json(path)
+        if not isinstance(value, dict):
+            raise ValidationError(
+                f"Confirmation campaign abandonment must be an object: {path}"
+            )
+        errors = _abandonment_static_errors(
+            paths,
+            path,
+            value,
+            confirmation_records=confirmation_records,
+        )
+        if errors:
+            raise ValidationError(
+                "invalid Confirmation campaign abandonment during recovery: "
+                + "; ".join(errors)
+            )
+        campaign_id = str(value.get("campaign_id", ""))
+        if campaign_id in records:
+            raise ValidationError(
+                f"duplicate Confirmation campaign abandonment: {campaign_id}"
+            )
+        records[campaign_id] = value
+    return records
+
+
+def _validate_raw_confirmation_campaign_graph(
+    paths: StudyPaths,
+    records: Sequence[dict[str, Any]],
+) -> None:
+    claim_sets: dict[
+        tuple[tuple[str, str], ...],
+        Sequence[dict[str, Any]],
+    ] = {}
+    for record in records:
+        key = _claim_version_key(record.get("claims", []))
+        claim_sets.setdefault(key, record["claims"])
+    ordered = sorted(claim_sets)
+    for index, left in enumerate(ordered):
+        for right in ordered[index + 1 :]:
+            overlap = set(left) & set(right)
+            if overlap and left != right:
+                claim_id = sorted(overlap)[0][0]
+                raise ValidationError(
+                    "a Claim version participates in different Confirmation "
+                    f"campaign Claim sets: {claim_id}"
+                )
+    abandonments = _raw_confirmation_abandonments(
+        paths,
+        confirmation_records=records,
+    )
+    for claims in claim_sets.values():
+        _confirmation_campaign_chain(
+            paths,
+            claims,
+            confirmation_records=records,
+            abandonments=abandonments,
+        )
+
+
+@serialized_study_authority
+def recover_confirmation_sequence(paths: StudyPaths) -> Path:
+    """Index one valid immutable record left by an interrupted publish."""
+
+    temporary_paths = confirmation_sequence_temporary_paths(paths)
+    if temporary_paths:
+        raise ValidationError(
+            "Confirmation authority recovery refuses unfinished sequence "
+            "temporary files"
+        )
+    sequence = require_confirmation_sequence(paths)
+    current = confirmation_authority_inventory(paths)
+    if len(current) != int(sequence["high_water_mark"]) + 1:
+        raise ValidationError(
+            "Confirmation authority recovery requires exactly one unindexed record"
+        )
+    candidate_indexes = [
+        index
+        for index in range(len(current))
+        if sha256_json(current[:index] + current[index + 1 :])
+        == sequence["inventory_sha256"]
+    ]
+    if len(candidate_indexes) != 1:
+        raise ValidationError(
+            "Confirmation authority recovery cannot uniquely reconstruct the "
+            "prior inventory"
+        )
+    candidate = current[candidate_indexes[0]]
+    record_id = str(candidate["record_id"])
+    confirmation_records = _raw_valid_confirmation_records(paths)
+    if candidate["record_type"] == "confirmation":
+        path = paths.confirmations / f"{record_id}.json"
+        value = load_json(path)
+        if not isinstance(value, dict) or value.get("schema_version") != 4:
+            raise ValidationError(
+                "Confirmation authority recovery accepts only a current "
+                "schema-v4 record; legacy v2/v3 history requires explicit "
+                "migration"
+            )
+        errors = _static_record_errors(paths, path, value)
+    else:
+        path = (
+            paths.confirmations
+            / f"{record_id}{_CAMPAIGN_ABANDONMENT_SUFFIX}"
+        )
+        value = load_json(path)
+        if not isinstance(value, dict) or value.get("schema_version") != 1:
+            raise ValidationError(
+                "Confirmation authority recovery accepts only a current "
+                "schema-v1 campaign abandonment"
+            )
+        errors = _abandonment_static_errors(
+            paths,
+            path,
+            value,
+            confirmation_records=confirmation_records,
+        )
+    if errors:
+        raise ValidationError(
+            "unindexed Confirmation authority record is invalid: "
+            + "; ".join(errors)
+        )
+    _validate_raw_confirmation_campaign_graph(
+        paths,
+        confirmation_records,
+    )
+    if candidate["record_type"] == "campaign_abandonment":
+        matching = [
+            record
+            for record in confirmation_records
+            if record.get("campaign", {}).get("campaign_id") == record_id
+        ]
+        if not matching:
+            raise ValidationError(
+                "unindexed Confirmation campaign abandonment has no campaign"
+            )
+        chain = _confirmation_campaign_chain(
+            paths,
+            matching[0]["claims"],
+            confirmation_records=confirmation_records,
+            abandonments=_raw_confirmation_abandonments(
+                paths,
+                confirmation_records=confirmation_records,
+            ),
+        )
+        if not chain or chain[-1][0]["campaign"]["campaign_id"] != record_id:
+            raise ValidationError(
+                "only the latest Confirmation campaign in an exact "
+                "Claim-version chain may be recovered as abandoned"
+            )
+    recover_unindexed_confirmation_authority(paths)
+    require_consistent_confirmation_authority(paths)
+    return paths.confirmation_sequence
 
 
 def _require_binding_current(
@@ -1300,7 +2342,7 @@ def validate_confirmation_run(
     if normalized_run_inputs != planned_inputs:
         differing.append("input_bindings")
     outcome_contract = slot.get("outcome_contract")
-    if confirmation.get("schema_version") == 3:
+    if confirmation.get("schema_version") in {3, 4}:
         if not isinstance(outcome_contract, dict):
             differing.append("outcome_contract")
         else:
@@ -1385,6 +2427,13 @@ def validate_confirmation_slot(
     if _SLOT_PATTERN.fullmatch(slot_id) is None:
         raise ValidationError(f"invalid confirmation slot identifier: {slot_id!r}")
     confirmation = load_final_confirmation(paths, confirmation_id)
+    campaign_id = str(confirmation.get("campaign", {}).get("campaign_id", ""))
+    if load_confirmation_campaign_abandonment(paths, campaign_id) is not None:
+        raise ValidationError(
+            f"Confirmation campaign {campaign_id} is abandoned; no new "
+            "confirmatory Run may consume its slots"
+        )
+    require_active_confirmation_campaign_tail(paths, confirmation)
     validate_confirmation_current(paths, confirmation)
     slots = [item for item in confirmation["run_slots"] if item.get("slot_id") == slot_id]
     if len(slots) != 1:
@@ -1403,7 +2452,7 @@ def validate_confirmation_slot(
     }
     differing = [key for key, value in comparisons.items() if slot.get(key) != value]
     outcome_contract = slot.get("outcome_contract")
-    if confirmation.get("schema_version") == 3 and isinstance(
+    if confirmation.get("schema_version") in {3, 4} and isinstance(
         outcome_contract, dict
     ):
         supplied_outputs: set[str] = set()
@@ -1440,9 +2489,26 @@ def validate_confirmation_slot(
 
 
 def confirmation_record_issues(paths: StudyPaths) -> list[ValidationIssue]:
-    """Return static integrity issues for immutable Confirmation Records."""
+    """Return integrity issues for Confirmation records and campaign lifecycle."""
 
-    issues: list[ValidationIssue] = []
+    issues: list[ValidationIssue] = [
+        ValidationIssue(
+            "ERROR",
+            str(path),
+            "unfinished Confirmation-authority sequence temporary file is present",
+        )
+        for path in confirmation_sequence_temporary_paths(paths)
+    ]
+    try:
+        require_consistent_confirmation_authority(paths)
+    except (OSError, ValidationError, WorkflowError) as exc:
+        issues.append(
+            ValidationIssue(
+                "ERROR",
+                str(paths.confirmation_sequence),
+                str(exc),
+            )
+        )
     if not paths.confirmations.exists():
         return issues
     if paths.confirmations.is_symlink() or not paths.confirmations.is_dir():
@@ -1452,42 +2518,70 @@ def confirmation_record_issues(paths: StudyPaths) -> list[ValidationIssue]:
             )
         ]
     valid_records: list[dict[str, Any]] = []
+    registry_entries_valid = True
     for entry in sorted(paths.confirmations.iterdir()):
         if entry.is_symlink() or not entry.is_file():
+            registry_entries_valid = False
             issues.append(
                 ValidationIssue(
                     "ERROR", str(entry), "Confirmation entry must be a regular JSON file"
                 )
             )
             continue
-        if re.fullmatch(r"CONF-[0-9]{4,}\.json", entry.name) is None:
+        is_confirmation = (
+            re.fullmatch(r"CONF-[0-9]{4,}\.json", entry.name) is not None
+        )
+        is_abandonment = (
+            re.fullmatch(
+                r"CAMP-[0-9a-f]{64}\.abandonment\.json",
+                entry.name,
+            )
+            is not None
+        )
+        if not is_confirmation and not is_abandonment:
+            registry_entries_valid = False
             issues.append(
                 ValidationIssue("ERROR", str(entry), "unexpected Confirmation filename")
             )
             continue
+        value: Any = None
         try:
             value = load_json(entry)
-            errors = _static_record_errors(paths, entry, value)
+            errors = (
+                _static_record_errors(paths, entry, value)
+                if is_confirmation
+                else _abandonment_static_errors(paths, entry, value)
+            )
         except (OSError, ValidationError, WorkflowError) as exc:
             errors = [str(exc)]
-        if not errors and isinstance(value, dict):
+        if errors:
+            registry_entries_valid = False
+        if is_confirmation and not errors and isinstance(value, dict):
             valid_records.append(value)
         issues.extend(ValidationIssue("ERROR", str(entry), error) for error in errors)
     campaign_groups: dict[str, list[dict[str, Any]]] = {}
-    claim_owners: dict[tuple[str, str], str] = {}
+    claim_sets: dict[
+        tuple[tuple[str, str], ...],
+        Sequence[dict[str, Any]],
+    ] = {}
     for record in valid_records:
         campaign = record["campaign"]
         campaign_id = str(campaign["campaign_id"])
         campaign_groups.setdefault(campaign_id, []).append(record)
-        for claim_version in _claim_version_key(record["claims"]):
-            previous = claim_owners.setdefault(claim_version, campaign_id)
-            if previous != campaign_id:
+        version_key = _claim_version_key(record["claims"])
+        claim_sets.setdefault(version_key, record["claims"])
+    ordered_claim_sets = sorted(claim_sets)
+    for index, left in enumerate(ordered_claim_sets):
+        for right in ordered_claim_sets[index + 1 :]:
+            overlap = set(left) & set(right)
+            if overlap and left != right:
+                claim_id = sorted(overlap)[0][0]
                 issues.append(
                     ValidationIssue(
                         "ERROR",
                         str(paths.confirmations),
-                        "a Claim version participates in multiple Confirmation "
-                        f"campaigns: {claim_version[0]}",
+                        "a Claim version participates in different Confirmation "
+                        f"campaign Claim sets: {claim_id}",
                     )
                 )
     for campaign_id, records in sorted(campaign_groups.items()):
@@ -1499,6 +2593,19 @@ def confirmation_record_issues(paths: StudyPaths) -> list[ValidationIssue]:
             )
             for error in _campaign_sequence_errors(records)
         )
+    if registry_entries_valid:
+        for claim_versions, claims in sorted(claim_sets.items()):
+            try:
+                _confirmation_campaign_chain(paths, claims)
+            except (OSError, ValidationError, WorkflowError) as exc:
+                claim_ids = ", ".join(claim_id for claim_id, _ in claim_versions)
+                issues.append(
+                    ValidationIssue(
+                        "ERROR",
+                        str(paths.confirmations),
+                        f"Confirmation campaign chain for {claim_ids} is invalid: {exc}",
+                    )
+                )
     return issues
 
 

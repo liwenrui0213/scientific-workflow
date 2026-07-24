@@ -12,7 +12,8 @@ from typing import Any
 
 
 _MUTATION = re.compile(
-    r"(?:^|[;&|]\s*|\s)(?:rm|unlink|mv|cp|install|truncate|tee|sed\s+-i|perl\s+-i)\b"
+    r"(?:^|[;&|]\s*|\s)(?:rm|unlink|mv|cp|install|truncate|tee|chmod|chown|"
+    r"ln|dd|rsync|sed\s+-i|perl\s+-i)\b"
     r"|(?:>>?|\.write_(?:text|bytes)|\.unlink\(|\.touch\(|os\.remove|os\.replace)"
     r"|(?:\bopen\s*\(\s*[^,]+,\s*(?:mode\s*=\s*)?['\"][^'\"]*[wax+][^'\"]*['\"])"
     r"|(?:\.open\s*\(\s*(?:mode\s*=\s*)?['\"][^'\"]*[wax+][^'\"]*['\"])"
@@ -25,7 +26,7 @@ _HUMAN_COMMAND = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _VERDICT_COMMAND = re.compile(
-    r"(?:studyctl|tools\.studyctl).*\bverdict\b",
+    r"(?:studyctl|tools\.studyctl).*(?<![-\w])verdict(?![-\w])",
     re.IGNORECASE | re.DOTALL,
 )
 _SHELL_CONTROL = re.compile(r"[;&|><`$()\r\n]")
@@ -178,6 +179,49 @@ def _study_regex(study_root: str, suffix: str) -> re.Pattern[str]:
     )
 
 
+_PATH_FRAGMENT = re.compile(
+    r"(?<![A-Za-z0-9_.-])"
+    r"((?:/|\.\.?/)?[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+"
+    r"|[A-Za-z0-9_.-]+\.(?:json|md))"
+)
+
+
+def _payload_with_repository_paths(
+    payload: str,
+    *,
+    cwd: Path,
+    repository_root: Path,
+) -> str:
+    """Append repository-relative aliases for paths mentioned by a tool call.
+
+    A caller may run from the repository root, a Study directory, or a deeper
+    subdirectory. Protection patterns use repository-relative authority paths,
+    so lexical path fragments are resolved against the tool cwd before
+    matching. This is a cooperative guardrail, not a shell parser or a
+    kernel-enforced sandbox.
+    """
+
+    aliases: list[str] = []
+    seen: set[str] = set()
+    repository = repository_root.resolve()
+    for match in _PATH_FRAGMENT.finditer(payload):
+        raw = match.group(1)
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            candidate = cwd / candidate
+        try:
+            relative = candidate.resolve(strict=False).relative_to(repository)
+        except (OSError, ValueError):
+            continue
+        rendered = relative.as_posix()
+        if rendered not in seen:
+            aliases.append(rendered)
+            seen.add(rendered)
+    if not aliases:
+        return payload
+    return payload + "\n" + "\n".join(aliases)
+
+
 def _referenced_evidence(
     repository_root: Path,
     study_root: str,
@@ -229,12 +273,18 @@ def decide(event: dict[str, Any]) -> str | None:
     )
     sequence_pattern = _study_regex(
         study_root,
-        r"(?:OBSERVATIONS|EVIDENCE|CHECKPOINTS|GRAPH_RECORDS)\.sequence\.json(?:\b|$)",
+        r"(?:OBSERVATIONS|EVIDENCE|CONFIRMATIONS|CHECKPOINTS|GRAPH_RECORDS|REVIEW_VERDICTS)"
+        r"\.sequence\.json(?:\b|$)",
+    )
+    review_history_pattern = _study_regex(
+        study_root,
+        r"review-history/(?:REVIEW|REVIEW_PACKET)-[0-9a-f]{64}\.json(?:\b|$)",
     )
     graph_record_pattern = _study_regex(
         study_root,
         r"(?:intents/INTENT-[0-9]{4,}\.v[0-9]{4,}\.json|"
         r"control-plans/CG-[0-9]{4,}\.v[0-9]{4,}\.json|"
+        r"control-plans/lifecycle/PLAN-EVENT-[0-9]{6,}\.json|"
         r"formal/PLAN\.json)(?:\b|$)",
     )
     checkpoint_pattern = _study_regex(
@@ -254,7 +304,8 @@ def decide(event: dict[str, Any]) -> str | None:
     )
     confirmation_pattern = _study_regex(
         study_root,
-        r"formal/confirmations/CONF-[0-9]{4,}\.json(?:\b|$)",
+        r"formal/confirmations/(?:CONF-[0-9]{4,}\.json|"
+        r"CAMP-[0-9a-f]{64}\.abandonment\.json)(?:\b|$)",
     )
     if tool_name == "Bash" or "bash" in tool_name.lower():
         if _HUMAN_COMMAND.search(payload):
@@ -266,7 +317,11 @@ def decide(event: dict[str, Any]) -> str | None:
             )
         if not _MUTATION.search(payload):
             return None
-        lowered = payload.lower()
+        lowered = _payload_with_repository_paths(
+            payload,
+            cwd=cwd,
+            repository_root=repository_root,
+        ).lower()
         if approval_pattern.search(lowered):
             return "Brief approval records may be written only by the interactive studyctl gate."
         if verdict_pattern.search(lowered):
@@ -276,9 +331,14 @@ def decide(event: dict[str, Any]) -> str | None:
         if validation_pattern.search(lowered):
             return "Validation proofs may be written only by studyctl validate-changes."
         if confirmation_pattern.search(lowered):
-            return "Frozen Confirmation Records may be written only by studyctl confirmation-finalize."
+            return (
+                "Confirmation records may be written only by studyctl "
+                "confirmation-finalize or confirmation-abandon."
+            )
         if run_pattern.search(lowered):
             return "Run manifests are sealed execution records and must not be changed or removed."
+        if review_history_pattern.search(lowered):
+            return "Imported Review archives are sealed authority and must not be changed or removed directly."
         if (
             sequence_pattern.search(lowered)
             or checkpoint_pattern.search(lowered)
@@ -312,7 +372,11 @@ def decide(event: dict[str, Any]) -> str | None:
         return None
 
     for action, raw_path in [*_patch_targets(payload), *_direct_targets(event)]:
-        normalized = raw_path.replace("\\", "/").lstrip("./")
+        normalized = _payload_with_repository_paths(
+            raw_path.replace("\\", "/"),
+            cwd=cwd,
+            repository_root=repository_root,
+        )
         lowered = normalized.lower()
         if approval_pattern.search(lowered):
             return "Brief approval records may be written only by the interactive studyctl gate."
@@ -327,9 +391,18 @@ def decide(event: dict[str, Any]) -> str | None:
             "update",
             "delete",
         }:
-            return "Frozen Confirmation Records may be written only by studyctl confirmation-finalize."
+            return (
+                "Confirmation records may be written only by studyctl "
+                "confirmation-finalize or confirmation-abandon."
+            )
         if run_pattern.search(lowered) and action in {"add", "update", "delete"}:
             return "Run manifests are sealed execution records and must not be changed or removed."
+        if review_history_pattern.search(lowered) and action in {
+            "add",
+            "update",
+            "delete",
+        }:
+            return "Imported Review archives are sealed authority and must not be changed or removed directly."
         if (
             sequence_pattern.search(lowered)
             or checkpoint_pattern.search(lowered)

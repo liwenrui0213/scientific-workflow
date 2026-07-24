@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/scientific-workflow/plan-lifecycle-event.schema.json",
+  "title": "Immutable active PLAN lifecycle event",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "record_type",
+    "study_id",
+    "event_id",
+    "sequence",
+    "action",
+    "prior_state",
+    "resulting_state",
+    "plan_ref",
+    "intent_ref",
+    "previous_event",
+    "reason",
+    "created_at",
+    "record_sha256"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "record_type": {"const": "plan_lifecycle_event"},
+    "study_id": {"type": "string", "pattern": "^SC-[0-9]{4,}$"},
+    "event_id": {
+      "type": "string",
+      "pattern": "^PLAN-EVENT-[0-9]{6,}$"
+    },
+    "sequence": {"type": "integer", "minimum": 1},
+    "action": {"enum": ["activated", "deactivated"]},
+    "prior_state": {
+      "enum": [
+        "never_activated",
+        "legacy_active_unattested",
+        "active",
+        "inactive"
+      ]
+    },
+    "resulting_state": {"enum": ["active", "inactive"]},
+    "plan_ref": {"$ref": "#/$defs/plan_ref"},
+    "intent_ref": {"$ref": "#/$defs/intent_ref"},
+    "previous_event": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/event_ref"}
+      ]
+    },
+    "reason": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "string", "minLength": 1, "maxLength": 4096}
+      ]
+    },
+    "created_at": {"type": "string", "minLength": 1, "maxLength": 64},
+    "record_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  },
+  "$defs": {
+    "plan_ref": {
+      "type": "object",
+      "required": ["control_graph_id", "version", "sha256"],
+      "properties": {
+        "control_graph_id": {
+          "type": "string",
+          "pattern": "^CG-[0-9]{4,}$"
+        },
+        "version": {"type": "integer", "minimum": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "intent_ref": {
+      "type": "object",
+      "required": ["intent_id", "version", "sha256"],
+      "properties": {
+        "intent_id": {
+          "type": "string",
+          "pattern": "^INTENT-[0-9]{4,}$"
+        },
+        "version": {"type": "integer", "minimum": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "event_ref": {
+      "type": "object",
+      "required": ["event_id", "sequence", "sha256"],
+      "properties": {
+        "event_id": {
+          "type": "string",
+          "pattern": "^PLAN-EVENT-[0-9]{6,}$"
+        },
+        "sequence": {"type": "integer", "minimum": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

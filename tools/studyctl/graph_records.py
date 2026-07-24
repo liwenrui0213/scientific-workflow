@@ -37,6 +37,7 @@ _PLAN_FINAL = re.compile(r"^(CG-[0-9]{4,})\.v([0-9]{4,})\.json$")
 _PLAN_DRAFT = re.compile(
     r"^(CG-[0-9]{4,})\.v([0-9]{4,})\.control-graph\.draft\.json$"
 )
+_PLAN_EVENT = re.compile(r"^(PLAN-EVENT-([0-9]{6,}))\.json$")
 # The maximal current Claims/Frontier projection is intentionally kept below
 # the 98,304-byte ACTIVE_CONTEXT hard limit. Reserve at most 8 KiB of that
 # envelope for graph navigation so a large but schema-valid Frontier remains
@@ -66,6 +67,34 @@ def control_graph_draft_paths(paths: StudyPaths) -> list[Path]:
     if not paths.active_work.is_dir():
         return []
     return sorted(paths.active_work.glob("CG-*.control-graph.draft.json"))
+
+
+def _plan_lifecycle_directory(paths: StudyPaths) -> Path:
+    return paths.control_graphs / "lifecycle"
+
+
+def plan_lifecycle_event_paths(paths: StudyPaths) -> list[Path]:
+    directory = _plan_lifecycle_directory(paths)
+    if not directory.exists() and not directory.is_symlink():
+        return []
+    try:
+        metadata = directory.lstat()
+    except OSError as exc:
+        raise ValidationError(
+            f"PLAN lifecycle directory cannot be inspected: {exc}"
+        ) from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise ValidationError(
+            "PLAN lifecycle path must be a regular non-symlink directory"
+        )
+    files: list[Path] = []
+    for path in sorted(directory.iterdir()):
+        if _PLAN_EVENT.fullmatch(path.name) is None:
+            raise ValidationError(
+                f"PLAN lifecycle directory contains an unknown entry: {path}"
+            )
+        files.append(path)
+    return files
 
 
 def _schema_errors(
@@ -257,11 +286,14 @@ def _strict_final_record_ids(
     *,
     pattern: re.Pattern[str],
     label: str,
+    ignored_entries: Sequence[str] = (),
 ) -> list[str]:
     if not directory.is_dir():
         return []
     record_ids: set[str] = set()
     for path in sorted(directory.iterdir()):
+        if path.name in ignored_entries:
+            continue
         match = pattern.fullmatch(path.name)
         if match is None:
             raise ValidationError(
@@ -291,6 +323,9 @@ def _visible_graph_record_inventory(paths: StudyPaths) -> list[dict[str, Any]]:
                 if kind == "experiment_intent"
                 else "Control Graph"
             ),
+            ignored_entries=(
+                ("lifecycle",) if kind == "control_graph" else ()
+            ),
         ):
             for version, path, record in _versioned_final_records(
                 paths, record_id=record_id, kind=kind
@@ -304,6 +339,18 @@ def _visible_graph_record_inventory(paths: StudyPaths) -> list[dict[str, Any]]:
                         "file_sha256": sha256_file(path),
                     }
                 )
+    for event_path, event in _plan_lifecycle_records(
+        paths, enforce_sequence=False
+    ):
+        inventory.append(
+            {
+                "kind": "plan_lifecycle",
+                "id": event["event_id"],
+                "version": 1,
+                "record_sha256": event["record_sha256"],
+                "file_sha256": sha256_file(event_path),
+            }
+        )
     inventory.sort(
         key=lambda item: (item["kind"], item["id"], item["version"])
     )
@@ -333,6 +380,258 @@ def _record_ref(value: dict[str, Any], *, kind: str) -> dict[str, Any]:
         "version": value["version"],
         "sha256": digest,
     }
+
+
+def _plan_event_ref(value: dict[str, Any]) -> dict[str, Any]:
+    digest = value.get("record_sha256")
+    if not isinstance(digest, str):
+        raise ValidationError("PLAN lifecycle event has no record digest")
+    return {
+        "event_id": value["event_id"],
+        "sequence": value["sequence"],
+        "sha256": digest,
+    }
+
+
+def _plan_lifecycle_records(
+    paths: StudyPaths,
+    *,
+    enforce_sequence: bool,
+) -> list[tuple[Path, dict[str, Any]]]:
+    """Replay immutable PLAN activation/deactivation events in exact order."""
+
+    records: list[tuple[Path, dict[str, Any]]] = []
+    previous: dict[str, Any] | None = None
+    for index, path in enumerate(plan_lifecycle_event_paths(paths), start=1):
+        match = _PLAN_EVENT.fullmatch(path.name)
+        if match is None:  # pragma: no cover - guarded by path enumeration
+            raise ValidationError(f"invalid PLAN lifecycle filename: {path}")
+        for message in _sealed_file_issues(
+            path, label="PLAN lifecycle event"
+        ):
+            raise ValidationError(message)
+        value = load_json(path)
+        if not isinstance(value, dict):
+            raise ValidationError("PLAN lifecycle event must be an object")
+        _raise_schema_errors(
+            paths,
+            "plan_lifecycle_event",
+            path,
+            value,
+            label="PLAN lifecycle event",
+        )
+        expected_id = f"PLAN-EVENT-{index:06d}"
+        if (
+            value.get("study_id") != paths.study_id
+            or value.get("event_id") != expected_id
+            or value.get("sequence") != index
+            or match.group(1) != expected_id
+            or int(match.group(2)) != index
+        ):
+            raise ValidationError(
+                "PLAN lifecycle identity/sequence does not match its filename"
+            )
+        if value.get("record_sha256") != record_digest(
+            value, "record_sha256"
+        ):
+            raise ValidationError("PLAN lifecycle event digest is invalid")
+        expected_previous = (
+            _plan_event_ref(previous) if previous is not None else None
+        )
+        if value.get("previous_event") != expected_previous:
+            raise ValidationError(
+                "PLAN lifecycle previous_event does not match prior event"
+            )
+
+        action = value.get("action")
+        prior_state = value.get("prior_state")
+        resulting_state = value.get("resulting_state")
+        reason = value.get("reason")
+        if previous is None:
+            valid_first = (
+                action == "activated"
+                and prior_state
+                in {"never_activated", "legacy_active_unattested"}
+                and resulting_state == "active"
+            ) or (
+                action == "deactivated"
+                and prior_state == "legacy_active_unattested"
+                and resulting_state == "inactive"
+            )
+            if not valid_first:
+                raise ValidationError(
+                    "first PLAN lifecycle event has an invalid state transition"
+                )
+        else:
+            if prior_state != previous.get("resulting_state"):
+                raise ValidationError(
+                    "PLAN lifecycle prior_state does not match prior result"
+                )
+            if action == "activated":
+                if prior_state != "inactive" or resulting_state != "active":
+                    raise ValidationError(
+                        "PLAN activation must transition inactive -> active"
+                    )
+            elif action == "deactivated":
+                if prior_state != "active" or resulting_state != "inactive":
+                    raise ValidationError(
+                        "PLAN deactivation must transition active -> inactive"
+                    )
+                if value.get("plan_ref") != previous.get("plan_ref"):
+                    raise ValidationError(
+                        "PLAN deactivation must bind the previously active graph"
+                    )
+            else:  # pragma: no cover - schema rejects this first
+                raise ValidationError("unsupported PLAN lifecycle action")
+        if action == "activated" and reason is not None:
+            raise ValidationError("PLAN activation reason must be null")
+        if action == "deactivated" and (
+            not isinstance(reason, str) or not reason.strip()
+        ):
+            raise ValidationError(
+                "PLAN deactivation requires a non-empty reason"
+            )
+
+        plan_ref = value.get("plan_ref")
+        if not isinstance(plan_ref, dict):
+            raise ValidationError("PLAN lifecycle plan_ref must be an object")
+        graph = _load_final_control_graph_without_sequence(
+            paths,
+            str(plan_ref.get("control_graph_id", "")),
+            plan_ref.get("version"),
+        )
+        if plan_ref != _record_ref(graph, kind="Control Graph"):
+            raise ValidationError(
+                "PLAN lifecycle event has a stale Control Graph reference"
+            )
+        if value.get("intent_ref") != graph.get("realizes_intent"):
+            raise ValidationError(
+                "PLAN lifecycle event has a stale Experiment Intent reference"
+            )
+        records.append((path, value))
+        previous = value
+
+    if enforce_sequence:
+        _require_graph_record_history(paths)
+    return records
+
+
+def _latest_plan_lifecycle_event(
+    paths: StudyPaths,
+    *,
+    enforce_sequence: bool = True,
+) -> tuple[Path, dict[str, Any]] | None:
+    records = _plan_lifecycle_records(paths, enforce_sequence=False)
+    if enforce_sequence:
+        _require_graph_record_history(paths)
+    return records[-1] if records else None
+
+
+def control_graph_lifecycle(
+    paths: StudyPaths,
+    control_graph_id: str,
+    version: int,
+) -> dict[str, Any]:
+    """Return auditable lifecycle state for one immutable graph version."""
+
+    graph = load_final_control_graph(paths, control_graph_id, version)
+    expected_ref = _record_ref(graph, kind="Control Graph")
+    return _control_graph_lifecycle_from_events(
+        paths,
+        expected_ref,
+        _plan_lifecycle_records(paths, enforce_sequence=False),
+    )
+
+
+def _control_graph_lifecycle_from_events(
+    paths: StudyPaths,
+    expected_ref: dict[str, Any],
+    events: Sequence[tuple[Path, dict[str, Any]]],
+) -> dict[str, Any]:
+    matches = [
+        (path, event)
+        for path, event in events
+        if event.get("plan_ref") == expected_ref
+    ]
+    if not matches:
+        return {"state": "never_activated", "last_event": None}
+    path, event = matches[-1]
+    return {
+        "state": event["resulting_state"],
+        "last_event": {
+            **_plan_event_ref(event),
+            "action": event["action"],
+            "path": path.relative_to(paths.root).as_posix(),
+            "size": path.stat().st_size,
+        },
+    }
+
+
+def _append_plan_lifecycle_event(
+    paths: StudyPaths,
+    *,
+    action: str,
+    prior_state: str,
+    graph: dict[str, Any],
+    reason: str | None,
+) -> Path:
+    previous_inventory = _require_graph_record_history(paths)
+    records = _plan_lifecycle_records(paths, enforce_sequence=False)
+    sequence = len(records) + 1
+    previous = records[-1][1] if records else None
+    event: dict[str, Any] = {
+        "schema_version": 1,
+        "record_type": "plan_lifecycle_event",
+        "study_id": paths.study_id,
+        "event_id": f"PLAN-EVENT-{sequence:06d}",
+        "sequence": sequence,
+        "action": action,
+        "prior_state": prior_state,
+        "resulting_state": (
+            "active" if action == "activated" else "inactive"
+        ),
+        "plan_ref": _record_ref(graph, kind="Control Graph"),
+        "intent_ref": copy.deepcopy(graph["realizes_intent"]),
+        "previous_event": (
+            _plan_event_ref(previous) if previous is not None else None
+        ),
+        "reason": reason,
+        "created_at": utc_now(),
+        "record_sha256": None,
+    }
+    event["record_sha256"] = record_digest(event, "record_sha256")
+    destination = (
+        _plan_lifecycle_directory(paths) / f"{event['event_id']}.json"
+    )
+    _raise_schema_errors(
+        paths,
+        "plan_lifecycle_event",
+        destination,
+        event,
+        label="PLAN lifecycle event",
+    )
+    directory = _plan_lifecycle_directory(paths)
+    directory.mkdir(mode=0o755, parents=False, exist_ok=True)
+    metadata = directory.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise ValidationError(
+            "PLAN lifecycle path must be a regular non-symlink directory"
+        )
+    atomic_write_json(
+        destination,
+        event,
+        overwrite=False,
+        mode=0o444,
+        require_parent_fsync=True,
+    )
+    from .graph_record_sequence import advance_graph_record_sequence
+
+    advance_graph_record_sequence(
+        paths,
+        previous_inventory=previous_inventory,
+        current_inventory=_visible_graph_record_inventory(paths),
+    )
+    return destination
 
 
 def _latest_final(
@@ -1014,21 +1313,75 @@ def require_current_control_graph(
 def activate_control_graph(
     paths: StudyPaths, control_graph_id: str, version: int
 ) -> Path:
-    """Materialize a current immutable ControlGraphSpec as formal/PLAN.json."""
+    """Activate one graph with an immutable lifecycle event and PLAN pointer."""
 
     value = require_current_control_graph(paths, control_graph_id, version)
+    expected_ref = _record_ref(value, kind="Control Graph")
+    plan_path = paths.formal / "PLAN.json"
+    latest = _latest_plan_lifecycle_event(paths)
+    materialized = _materialized_control_graph(
+        paths, require_current=False
+    )
+    if latest is not None and latest[1]["resulting_state"] == "active":
+        if latest[1]["plan_ref"] != expected_ref:
+            raise ValidationError(
+                "another Control Graph is active; deactivate PLAN before "
+                "activating a different graph"
+            )
+        if materialized is not None:
+            if _record_ref(materialized, kind="Control Graph") != expected_ref:
+                raise ValidationError(
+                    "formal/PLAN.json does not match the active lifecycle event"
+                )
+            # Idempotent retry of an already completed activation.
+            return plan_path
+        # Recover materialization after an activation event was durably
+        # appended but PLAN.json publication was interrupted.
+    else:
+        if materialized is not None:
+            materialized_ref = _record_ref(
+                materialized, kind="Control Graph"
+            )
+            if latest is not None:
+                raise ValidationError(
+                    "formal/PLAN.json remains after deactivation; complete "
+                    "PLAN deactivation before reactivation"
+                )
+            if materialized_ref != expected_ref:
+                raise ValidationError(
+                    "a legacy active PLAN must be explicitly deactivated "
+                    "before activating a different graph"
+                )
+            prior_state = "legacy_active_unattested"
+        else:
+            prior_state = (
+                "never_activated"
+                if latest is None
+                else str(latest[1]["resulting_state"])
+            )
+        _append_plan_lifecycle_event(
+            paths,
+            action="activated",
+            prior_state=prior_state,
+            graph=value,
+            reason=None,
+        )
+
     source = (
         paths.control_graphs
         / f"{value['control_graph_id']}.v{int(value['version']):04d}.json"
     )
     payload = source.read_bytes()
-    destination = paths.formal / "PLAN.json"
-    atomic_write_bytes(destination, payload, overwrite=True, mode=0o444)
-    return destination
+    atomic_write_bytes(plan_path, payload, overwrite=True, mode=0o444)
+    return plan_path
 
 
-def active_control_graph(paths: StudyPaths) -> dict[str, Any] | None:
-    """Return the active ControlGraphSpec, or ``None`` when no PLAN is active."""
+def _materialized_control_graph(
+    paths: StudyPaths,
+    *,
+    require_current: bool,
+) -> dict[str, Any] | None:
+    """Replay PLAN.json as an exact pointer to one immutable graph record."""
 
     plan_path = paths.formal / "PLAN.json"
     if not plan_path.exists() and not plan_path.is_symlink():
@@ -1044,10 +1397,13 @@ def active_control_graph(paths: StudyPaths) -> dict[str, Any] | None:
             "formal/PLAN.json must be an activated ControlGraphSpec with "
             "record_type='control_graph_spec'"
         )
-    _require_graph_record_history(paths)
     control_graph_id = str(value.get("control_graph_id", ""))
     version = value.get("version")
-    current = require_current_control_graph(paths, control_graph_id, version)
+    current = (
+        require_current_control_graph(paths, control_graph_id, version)
+        if require_current
+        else load_final_control_graph(paths, control_graph_id, version)
+    )
     source = paths.control_graphs / f"{control_graph_id}.v{version:04d}.json"
     if plan_path.read_bytes() != source.read_bytes():
         raise ValidationError(
@@ -1057,6 +1413,108 @@ def active_control_graph(paths: StudyPaths) -> dict[str, Any] | None:
     if value != current:
         raise ValidationError("formal/PLAN.json content is stale")
     return current
+
+
+def active_control_graph(paths: StudyPaths) -> dict[str, Any] | None:
+    """Return the active ControlGraphSpec, or ``None`` when no PLAN is active."""
+
+    latest = _latest_plan_lifecycle_event(paths)
+    materialized = _materialized_control_graph(
+        paths, require_current=True
+    )
+    if materialized is None:
+        if latest is not None and latest[1]["resulting_state"] == "active":
+            raise ValidationError(
+                "PLAN lifecycle records an active graph but formal/PLAN.json "
+                "is missing"
+            )
+        return None
+    if latest is None:
+        # Compatibility for Studies with a pre-lifecycle active PLAN. A later
+        # explicit activation/deactivation records this legacy prior state.
+        return materialized
+    if latest[1]["resulting_state"] != "active":
+        raise ValidationError(
+            "formal/PLAN.json is present although PLAN lifecycle is inactive"
+        )
+    if latest[1]["plan_ref"] != _record_ref(
+        materialized, kind="Control Graph"
+    ):
+        raise ValidationError(
+            "formal/PLAN.json does not match the active lifecycle event"
+        )
+    return materialized
+
+
+@serialized_study_authority
+def deactivate_control_graph(paths: StudyPaths, *, reason: str) -> Path:
+    """Explicitly deactivate PLAN while preserving an immutable audit event."""
+
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValidationError("PLAN deactivation requires a non-empty reason")
+    paths.assert_safe_layout()
+    latest = _latest_plan_lifecycle_event(paths)
+    plan_path = paths.formal / "PLAN.json"
+    pointer_present = plan_path.exists() or plan_path.is_symlink()
+
+    def require_removable_pointer() -> None:
+        if not pointer_present:
+            return
+        try:
+            metadata = plan_path.lstat()
+        except OSError as exc:
+            raise ValidationError(
+                f"formal/PLAN.json cannot be inspected for deactivation: {exc}"
+            ) from exc
+        if not (stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)):
+            raise ValidationError(
+                "formal/PLAN.json must be a regular file or symbolic-link "
+                "pointer before it can be removed"
+            )
+
+    if latest is None:
+        # A legacy PLAN has no lifecycle authority from which its exact graph
+        # identity can be recovered, so it must still be readable before the
+        # first transition is appended.
+        materialized = _materialized_control_graph(
+            paths, require_current=False
+        )
+        if materialized is None:
+            raise ValidationError("PLAN has never been activated")
+        graph = materialized
+        prior_state = "legacy_active_unattested"
+    elif latest[1]["resulting_state"] == "inactive":
+        if not pointer_present:
+            raise ValidationError("PLAN is already inactive")
+        # The lifecycle event is authoritative and PLAN.json is only its
+        # reconstructable materialized pointer. Recover an interrupted unlink
+        # even when the residual pointer bytes were corrupted.
+        require_removable_pointer()
+        plan_path.unlink()
+        return latest[0]
+    else:
+        plan_ref = latest[1]["plan_ref"]
+        graph = load_final_control_graph(
+            paths,
+            str(plan_ref["control_graph_id"]),
+            int(plan_ref["version"]),
+        )
+        # Do not let a damaged cache pointer make the append-only lifecycle
+        # impossible to retire. The exact active graph comes from the sealed
+        # lifecycle event; the pointer is removed after the new event commits.
+        require_removable_pointer()
+        prior_state = "active"
+
+    event_path = _append_plan_lifecycle_event(
+        paths,
+        action="deactivated",
+        prior_state=prior_state,
+        graph=graph,
+        reason=reason.strip(),
+    )
+    if plan_path.exists() or plan_path.is_symlink():
+        plan_path.unlink()
+    return event_path
 
 
 def _sealed_file_issues(path: Path, *, label: str) -> list[str]:
@@ -1199,11 +1657,11 @@ def graph_record_issues(paths: StudyPaths) -> list[ValidationIssue]:
             except (OSError, ValidationError, ValueError) as exc:
                 _record_issue(issues, path, str(exc))
     plan_path = paths.formal / "PLAN.json"
-    if plan_path.is_file():
-        try:
-            active_control_graph(paths)
-        except (OSError, ValidationError, ValueError) as exc:
-            _record_issue(issues, plan_path, str(exc))
+    try:
+        _plan_lifecycle_records(paths, enforce_sequence=False)
+        active_control_graph(paths)
+    except (OSError, ValidationError, ValueError) as exc:
+        _record_issue(issues, plan_path, str(exc))
     return issues
 
 
@@ -1223,6 +1681,7 @@ def _validate_all_visible_graph_semantics_without_sequence(
         paths.control_graphs,
         pattern=_PLAN_FINAL,
         label="Control Graph",
+        ignored_entries=("lifecycle",),
     ):
         for _, _, record in _versioned_final_records(
             paths, record_id=graph_id, kind="control_graph"
@@ -1233,6 +1692,7 @@ def _validate_all_visible_graph_semantics_without_sequence(
                 require_current_intent=False,
                 enforce_sequence=False,
             )
+    _plan_lifecycle_records(paths, enforce_sequence=False)
 
 
 def graph_record_sequence_issues(paths: StudyPaths) -> list[ValidationIssue]:
@@ -1377,6 +1837,9 @@ def current_graph_record_locators(paths: StudyPaths) -> dict[str, Any]:
     intent_history: list[dict[str, Any]] = []
     plan_history: list[dict[str, Any]] = []
     draft_items: list[dict[str, Any]] = []
+    lifecycle_events = _plan_lifecycle_records(
+        paths, enforce_sequence=False
+    )
     intent_ids = sorted(
         {
             match.group(1)
@@ -1424,20 +1887,28 @@ def current_graph_record_locators(paths: StudyPaths) -> dict[str, Any]:
         if not records:
             continue
         for _, path, record in records:
+            graph_ref = _record_ref(record, kind="Control Graph")
             plan_history.append(
                 {
-                    **_record_ref(record, kind="Control Graph"),
+                    **graph_ref,
                     "realizes_intent": record["realizes_intent"],
+                    "lifecycle": _control_graph_lifecycle_from_events(
+                        paths, graph_ref, lifecycle_events
+                    ),
                     "path": path.relative_to(paths.root).as_posix(),
                     "size": path.stat().st_size,
                 }
             )
         latest = records[-1][2]
+        latest_ref = _record_ref(latest, kind="Control Graph")
         path = paths.control_graphs / f"{plan_id}.v{int(latest['version']):04d}.json"
         plan_items.append(
             {
-                **_record_ref(latest, kind="Control Graph"),
+                **latest_ref,
                 "realizes_intent": latest["realizes_intent"],
+                "lifecycle": _control_graph_lifecycle_from_events(
+                    paths, latest_ref, lifecycle_events
+                ),
                 "path": path.relative_to(paths.root).as_posix(),
                 "size": path.stat().st_size,
             }

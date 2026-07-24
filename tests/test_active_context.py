@@ -317,6 +317,7 @@ class ActiveContextTests(WorkflowTestCase):
         )
         finalize_compaction(paths, third_plan)
         self.assertEqual(compaction_pressure(paths)["level"], "normal")
+        self.commit_all("freeze post-compaction independent Review scope")
         packet = load_json(create_review_packet(paths))
         self.assertEqual(packet["study_id"], paths.study_id)
         self.assertEqual(packet["evidence"], [])

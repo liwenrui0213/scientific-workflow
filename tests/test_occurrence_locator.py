@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+import subprocess
 import unittest
+from unittest.mock import patch
 
 from tests.helpers import WorkflowTestCase
 from tools.studyctl.active_context import (
@@ -16,7 +18,7 @@ from tools.studyctl.compaction import (
     prepare_compaction,
 )
 from tools.studyctl.hashing import atomic_write_json, load_json, sha256_file
-from tools.studyctl.models import StudyPaths, ValidationError
+from tools.studyctl.models import StudyPaths, ValidationError, utc_now
 from tools.studyctl.run_registry import execute_run
 
 
@@ -172,6 +174,135 @@ class OccurrenceLocatorTests(WorkflowTestCase):
         self.assertEqual(
             run_index["inventory_sha256"],
             second["run_occurrences"]["inventory_sha256"],
+        )
+
+    def test_running_attempt_is_only_marked_in_progress(self) -> None:
+        paths = self.initialize_approved_with_claim()
+        real_popen = subprocess.Popen
+        observed: list[dict[str, object]] = []
+
+        def observe_running(*args: object, **kwargs: object):
+            manifests = sorted(paths.runs.glob("RUN-*/manifest.json"))
+            if manifests and not observed:
+                running = load_json(manifests[0])
+                if running.get("status") == "running":
+                    locator = build_occurrence_locator(paths)
+                    items = locator["run_occurrences"]["items"]
+                    self.assertEqual(len(items), 1)
+                    observed.append(items[0])
+            return real_popen(*args, **kwargs)
+
+        with patch(
+            "tools.studyctl.run_registry.subprocess.Popen",
+            side_effect=observe_running,
+        ):
+            terminal = execute_run(
+                paths,
+                argv=[sys.executable, "-c", "print(4)"],
+                purpose="running occurrence boundary fixture",
+                output_paths=[".objects/not-yet-produced.txt"],
+                cohort_id="COHORT-001",
+                hardware_class="test-cpu",
+                precision="exact-integer",
+            )
+
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(observed[0]["status"], "running")
+        self.assertEqual(observed[0]["facts"], ["in_progress"])
+        self.assertEqual(
+            observed[0]["missing_declared_output_count"], 0
+        )
+        self.assertNotIn(
+            "evidence_ineligible_attempt", observed[0]["facts"]
+        )
+        self.assertEqual(terminal["status"], "succeeded")
+        terminal_item = build_occurrence_locator(paths)[
+            "run_occurrences"
+        ]["items"][0]
+        self.assertEqual(
+            terminal_item["facts"],
+            [
+                "missing_declared_output",
+                "evidence_ineligible_attempt",
+            ],
+        )
+
+    def test_archived_claim_disposition_remains_visible_after_prune(
+        self,
+    ) -> None:
+        paths = self.initialize_approved_with_claim()
+        self.add_proposed_claim(
+            paths, "CLAIM-0002", lifecycle="active"
+        )
+        manifest = self.successful_run(paths)
+        evidence = self.finalized_supporting_evidence(
+            paths,
+            [manifest],
+            claim_id="CLAIM-0002",
+        )
+
+        claims = load_json(paths.claims)
+        archived_claim = next(
+            claim
+            for claim in claims["claims"]
+            if claim["claim_id"] == "CLAIM-0002"
+        )
+        archived_claim["lifecycle"] = "retired"
+        archived_claim["state"] = "partially_supported"
+        archived_claim["evidence_basis"] = "exploratory"
+        archived_claim["supporting_evidence"] = [
+            {
+                "evidence_id": evidence["evidence_id"],
+                "version": evidence["version"],
+                "sha256": evidence["record_sha256"],
+            }
+        ]
+        archived_claim["uncertainty"] = (
+            "Limited to the deterministic fixture scope."
+        )
+        archived_claim["updated_at"] = utc_now()
+        claims["frontier"]["claim_ids"] = ["CLAIM-0001"]
+        claims["revision"] += 1
+        claims["updated_at"] = utc_now()
+        atomic_write_json(paths.claims, claims)
+
+        prepared_path = prepare_compaction(paths)
+        prepared = load_json(prepared_path)
+        plan = self.compaction_plan(
+            paths,
+            occurrence_inventory=self.occurrence_binding(
+                prepared["occurrences"]
+            ),
+            name="archive-disposition-plan.json",
+        )
+        finalize_compaction(paths, plan)
+
+        claims = load_json(paths.claims)
+        claims["claims"] = [
+            claim
+            for claim in claims["claims"]
+            if claim["claim_id"] != "CLAIM-0002"
+        ]
+        claims["revision"] += 1
+        claims["updated_at"] = utc_now()
+        atomic_write_json(paths.claims, claims)
+
+        locator = build_occurrence_locator(paths)
+        self.assertEqual(
+            locator["finalized_undispositioned_evidence"]["items"],
+            [],
+        )
+        archived_sources = locator["authority"][
+            "archived_claim_dispositions"
+        ]
+        self.assertEqual(archived_sources["total_count"], 1)
+        source_item = archived_sources["items"][0]
+        self.assertEqual(source_item["claim_id"], "CLAIM-0002")
+        self.assertEqual(source_item["dispositioned_evidence_count"], 1)
+        source_path = paths.root / source_item["source"]["path"]
+        self.assertTrue(source_path.is_file())
+        self.assertEqual(
+            source_item["source"]["sha256"], sha256_file(source_path)
         )
 
     def test_empty_representative_failures_cannot_hide_occurrence_history(

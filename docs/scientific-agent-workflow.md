@@ -160,13 +160,17 @@ parameter objects; `studyctl` treats those objects as opaque rather than
 pretending to validate their behavior.
 
 `plan-activate` materializes the selected immutable graph byte-for-byte as
-`formal/PLAN.json`, which subsequent Runs snapshot. `studyctl` does not
+`formal/PLAN.json`, which explicitly Plan-bound Runs snapshot. `studyctl` does not
 schedule the whole graph or interpret its conditions or retries. The default
 executor label is `external`; actual orchestration belongs to the Agent or an
 external executor. For one selected node, `studyctl run --plan-node NODE_ID`
 can bind Run schema v5 to the exact graph ID/version/hash, finalized Intent ref,
 node ID, and node-spec hash. An active PLAN never binds an ordinary Run
-implicitly, and a set of bound Runs is not a graph-completion engine.
+implicitly or enter its formal-artifact snapshot. A set of bound Runs is not a
+graph-completion engine. Activation and deactivation append immutable lifecycle
+events to the graph-record sequence. Deactivation removes only the materialized
+`formal/PLAN.json` pointer; the graph and its complete lifecycle remain
+replayable.
 
 Finalized graph records are committed through
 `GRAPH_RECORDS.sequence.json`. Its monotone high-water mark equals the exact
@@ -584,6 +588,10 @@ python -m tools.studyctl plan-new SC-0001 \
 # ControlGraph v2 does not require a DAG, fixed node kinds, or one retry policy.
 python -m tools.studyctl plan-finalize SC-0001 --file <plan-draft>
 python -m tools.studyctl plan-activate SC-0001 --id CG-0001 --version 1
+
+# When this execution topology is no longer active:
+python -m tools.studyctl plan-deactivate SC-0001 \
+  --reason "The planned mesh campaign completed; ordinary exploration resumes."
 ```
 
 Intent and Plan drafts remain mutable Workspace files. Finalization writes new
@@ -591,13 +599,16 @@ read-only, versioned records under `intents/` and `control-plans/`; it never
 turns the draft itself into authority. `formal/PLAN.json` contains only the
 currently activated complete ControlGraphSpec. Historical Plan records stay
 outside `formal/` so every later Run does not recursively copy the entire Plan
-history.
+history. `plan-deactivate` distinguishes an explicit exit from a PLAN that was
+never activated. Its reason and exact Plan/Intent references are sealed in
+`control-plans/lifecycle/`; the command never edits the frozen graph.
 
-`GRAPH_RECORDS.sequence.json` binds every finalized Intent and Plan version by
-canonical-record and exact-file digest. Finalization publishes the sealed
-record, then advances this sequence while holding the Study authority lock. If
-the process stops between those commits, all ordinary graph operations fail
-closed. After verifying the one additional record, recover only forward:
+`GRAPH_RECORDS.sequence.json` binds every finalized Intent and Plan version and
+every PLAN lifecycle event by canonical-record and exact-file digest.
+Finalization or lifecycle transition publishes the sealed record, then advances
+this sequence while holding the Study authority lock. If the process stops
+between those commits, all ordinary graph operations fail closed. After
+verifying the one additional record, recover only forward:
 
 ```bash
 python -m tools.studyctl recover-graph-record-sequence SC-0001
@@ -616,7 +627,7 @@ actual size of declared outputs; an unexpected storage overrun is preserved as
 an `incomplete` Run and blocks later Runs until the human authorizes a larger
 Brief budget.
 
-Five physical authority files form the logical ledger family described above.
+Several physical authority files form the logical ledger family described above.
 Their guarantees are intentionally unequal and narrow; none evaluates an
 Observation or Claim.
 
@@ -768,7 +779,9 @@ python -m tools.studyctl confirmation-new SC-0001 \
 Edit only the author-owned fields in the returned draft: candidate descriptions
 and paths; held-out status, rationale, and paths; analysis and decision rules;
 stopping and exclusion rules; and every planned slot. For a continuation, also
-fill the generated campaign disclosure fields described below. Leave
+fill the generated campaign disclosure fields described below. For the first
+record after an authorized whole-campaign abandonment, fill the generated
+`restart_rationale` without changing its predecessor binding. Leave
 `campaign_id`, campaign sequence, predecessor, `bindings`, code state,
 formal-artifact bindings, freshness, watermarks, freeze time, and digests out of
 the draft: finalization derives and adds them from live files and verified Run
@@ -824,14 +837,16 @@ retried by hiding a failure; change the design explicitly and freeze a new
 Confirmation Record instead. Exploratory and legacy Runs cannot be edited or
 re-labeled into confirmatory Runs.
 
-All Confirmations for the same exact Claim version belong to one derived
-campaign. Let \(I\) be a Claim ID, let \(S\) be its statement, let \(Q\) be its
-scope, and define the version digest
-\(h=\operatorname{SHA256}(\operatorname{canonicalJSON}(\{S,Q\}))\). The
-campaign identity is derived from the sorted set of pairs \((I,h)\) frozen by
-the Confirmation; it is not chosen by the author. A Claim version cannot be
-placed into a second campaign by adding or removing another Claim from the
-Confirmation set.
+While a campaign is active, all Confirmations for the same exact Claim-version
+set belong to that one derived campaign. Let \(I\) be a Claim ID, \(S\) its
+statement, \(Q\) its scope, and
+\(h=\operatorname{SHA256}(\operatorname{canonicalJSON}(\{S,Q\}))\) its version
+digest. Let \(V\) be the sorted array of objects
+`{claim_id: I, spec_sha256: h}`. The initial campaign ID is the literal prefix
+`CAMP-` followed by
+\(\operatorname{SHA256}(\operatorname{canonicalJSON}(V))\). It is derived, not
+chosen by the author. A Claim version cannot be detached from its campaign by
+adding or removing another Claim from the Confirmation set.
 
 A later Confirmation can be finalized only after every slot in all preceding
 campaign records has exactly one terminal attempt. Its draft must then disclose
@@ -847,6 +862,109 @@ The predecessor, sequence, and campaign identity are recomputed at finalization,
 so editing those fields cannot detach a retry from its history. A frozen but
 unexecuted predecessor remains pending; creating a new record is not an
 administrative way to cancel its slots.
+
+If the entire campaign is no longer scientifically appropriate, use the
+separate whole-campaign abandonment boundary. The decision input must contain
+exactly the following fields:
+
+```json
+{
+  "input_version": 1,
+  "campaign_id": "CAMP-<64-hex-digest>",
+  "rationale": "Why no new confirmatory execution should enter this campaign.",
+  "authorization": {
+    "source": "explicit_user_instruction",
+    "instruction": "Abandon this whole Confirmation campaign."
+  }
+}
+```
+
+Then append the lifecycle record:
+
+```bash
+python -m tools.studyctl confirmation-abandon SC-0001 CONF-0001 \
+  --file work/active/confirmation-abandon.json
+```
+
+The command rejects missing or extra decision fields and rejects any
+`slot_id`, `slot_ids`, `confirmation_ids`, or similar selector. It writes one
+read-only
+`formal/confirmations/CAMP-<digest>.abandonment.json` that pins every Claim
+version, Confirmation record, and planned slot in the campaign. It never
+deletes or rewrites Confirmations, slots, Runs, Evidence, or other history.
+The immutable record preserves the instruction and its digest, labels the
+operation `agent_initiated`, and records `assurance: cooperative`. This is an
+auditable process assertion that an explicit user instruction was supplied; it
+is not cryptographic authentication of the speaker.
+
+Every finalized Confirmation and whole-campaign abandonment is also bound by
+the single read-only `CONFIRMATIONS.sequence.json` authority. Its monotone
+high-water mark and complete inventory digest make deletion, replacement, and
+an unindexed tail visible. If a valid immutable record was durably written but
+the process stopped before advancing this authority, recover only that one
+uniquely reconstructable record:
+
+```bash
+python -m tools.studyctl recover-confirmation-sequence SC-0001
+```
+
+The recovery command only advances; it cannot recreate or remove history.
+Until recovery succeeds, abandonment lookup, new Run admission, supporting
+confirmatory Evidence, active context, Review, and Claim promotion fail closed.
+A broken symbolic link at an expected abandonment path is invalid authority,
+not evidence that no abandonment exists.
+
+A genuinely pre-sequence Study with a non-empty history containing only valid,
+read-only finalized schema v2/v3 Confirmations uses the explicit one-time
+migration instead:
+
+```bash
+python -m tools.studyctl migrate-confirmation-sequence SC-0001
+```
+
+This migration rejects an empty registry, schema v4 records, campaign
+abandonments, malformed or writable records, and any existing sequence.
+
+After abandonment, no new Run may consume any unused slot in that campaign.
+An already-running attempt remains `in_progress` and later seals normally, but
+the bounded active context labels its campaign `abandoned`; abandoned records
+do not appear as pending execution or automatically create an
+awaiting-Evidence action. Existing finalized Evidence remains immutable and
+may still document contradictions, limitations, failed attempts, or historical
+context. The abandoned campaign cannot form a new supporting confirmatory
+Evidence basis and cannot continue to satisfy the `numerically_supported`
+gate.
+
+The same exact Claim-version set may start a new campaign only after that
+append-only abandonment. Let \(C_k\) be the predecessor campaign ID and \(a_k\)
+the `record_sha256` of its abandonment record. Define
+\(A_k=\{\texttt{campaign_id}:C_k,
+\texttt{abandonment_sha256}:a_k\}\). The successor ID is the literal prefix
+`CAMP-` followed by
+\(\operatorname{SHA256}(\operatorname{canonicalJSON}(
+\{\texttt{claim_versions}:V,\texttt{predecessor_campaign}:A_k\}))\).
+Its first Confirmation starts at sequence 1, pins \(A_k\) in
+`predecessor_campaign`, and requires a non-empty author-supplied
+`restart_rationale`. Later records continue only within that new campaign.
+Confirmatory Evidence cannot combine Runs from the predecessor and successor
+campaigns. Historical v2/v3 Confirmation bytes remain valid; newly finalized
+records use v4 restart metadata.
+
+A mutable Confirmation draft created before abandonment or restart is
+classified under `stale_drafts`, not resumable work. A second draft for the
+same exact Claim-version set is refused until the stale draft is explicitly
+archived with a reason:
+
+```bash
+python -m tools.studyctl confirmation-draft-discard SC-0001 CONF-0002 \
+  --reason "The authorized campaign abandonment made this draft stale."
+```
+
+This Workspace disposition does not rewrite finalized Confirmation authority.
+For every newly admitted slot and every new supporting confirmatory Evidence,
+the system replays the complete predecessor-abandonment chain and requires the
+selected campaign to be its unique non-abandoned tail. Historical Runs and
+Evidence remain readable after later campaign transitions.
 
 Confirmatory Evidence may be authored after results are available, but its
 result-independent fields are recomputed from the complete campaign, not only
@@ -1057,7 +1175,7 @@ python -m tools.studyctl context SC-0001
 python -m tools.studyctl status SC-0001
 ```
 
-`profile-validate` checks repository adaptation. `validate-changes` executes and pins the host validation contract. `check-changes` regenerates `generated/CHANGES.json` from Git. `validate` checks schemas, IDs, immutable digests, approval freshness, ExperimentIntent and ControlGraphSpec lineage and exact bindings, active PLAN materialization, optional Run-node control bindings, profile/CHANGESET/validation state, actual change scope, Confirmation bindings and slot coverage, Run dependency integrity and eligibility, Observation/Evidence finalized-inventory sequences and Run-derived Intent refs, Evidence Claim-spec and Observation bindings, Claim evidence strength, Cohort compatibility, Checkpoint links, and Verdict structure. `context` regenerates the bounded `generated/ACTIVE_CONTEXT.json` selector; `status` regenerates `generated/STATUS.md`. Generated files are projections and are never authoritative.
+`profile-validate` checks repository adaptation. `validate-changes` executes and pins the host validation contract. `check-changes` regenerates `generated/CHANGES.json` from Git. `validate` checks schemas, IDs, immutable digests, approval freshness, ExperimentIntent and ControlGraphSpec lineage and exact bindings, active PLAN materialization, optional Run-node control bindings, profile/CHANGESET/validation state, actual change scope, Confirmation bindings, campaign-abandonment chains, and slot coverage, Run dependency integrity and eligibility, Observation/Evidence finalized-inventory sequences and Run-derived Intent refs, Evidence Claim-spec and Observation bindings, Claim evidence strength, Cohort compatibility, Checkpoint links, and Verdict structure. `context` first performs the same authoritative Study validation and only then regenerates the bounded `generated/ACTIVE_CONTEXT.json` selector. An invalid Study therefore cannot replace the last valid active-context projection. `status` regenerates `generated/STATUS.md`. Generated files are projections and are never authoritative.
 
 ### Bounded active context and automatic compaction pressure
 
@@ -1069,17 +1187,25 @@ and content hashes rather than full semantic payloads. The approved Brief,
 active formal artifacts, and latest Checkpoint are represented by
 path/hash/size and compact count summaries. A separate bounded Confirmation
 index exposes editable drafts, pending/running slots, and records awaiting
-Evidence. The `graph_records` index exposes its sequence high-water/inventory
+Evidence. Its immutable history labels each campaign `active` or `abandoned`
+and gives an exact abandonment locator when applicable. Abandoned unused slots
+are preserved as unconsumed history but are not pending work; a running attempt
+remains visible as `in_progress`. The `graph_records` index exposes its sequence high-water/inventory
 binding, bounded exact locators for the latest finalized ExperimentIntent and
 ControlGraphSpec per ID, and never mixes in mutable drafts. Top-level
 `workspace.graph_record_drafts` carries the bounded draft index with
 `workspace.assurance: mutable_non_authoritative`. Both projections preserve
 full-history counts and inventory hashes but never embed record bodies.
 The bounded `occurrences` locator separately exposes only deterministic
-attention facts: failed/interrupted/incomplete Runs, missing declared outputs,
-Evidence-ineligible attempts, and finalized Evidence not yet dispositioned by
-a Claim. It includes exact source locators and a full-inventory hash but makes
-no causal diagnosis and no scientific assessment.
+attention facts. A nonterminal Run appears only as `in_progress`; it is not
+prematurely labeled as missing-output or Evidence-ineligible. After a Run
+reaches a terminal state, the locator may expose failed/interrupted/incomplete
+status, missing declared outputs, or Evidence ineligibility. It also exposes
+finalized Evidence not yet dispositioned by a current or immutable archived
+Claim. Exact source locators for archived Claim dispositions keep already
+resolved Evidence from reappearing after a Checkpoint-authorized Claim prune.
+The locator includes a full-inventory hash but makes no causal diagnosis and no
+scientific assessment.
 `decisive_observations` contains only short result previews,
 Run/Cohort counts, exact hashes, paths, and the Evidence IDs that use each
 Observation; it never injects complete Observation contents by default. Resume
@@ -1226,7 +1352,7 @@ python -m tools.studyctl check-changes SC-0001
 python -m tools.studyctl review-packet SC-0001
 ```
 
-The default review base comes from the repository profile; use `--base-ref` only for an explicit one-off override. The packet includes the repository profile and current Git change scope in addition to the scientific artifacts. It also includes bounded Confirmation Record and attempt locators plus full counts and inventory hashes. When `confirmation_records_truncated` or attempt `truncated` is true, the reviewer must inspect the referenced source inventory rather than treating unlisted records or attempts as absent. Start a fresh top-level Codex task for the review, set it to read-only, and invoke the repository `scientific-review` skill. The reviewer must check that the profile fits the host repository, compare the actual diff with `formal/CHANGESET.json`, verify the commit-bound `formal/VALIDATION.json`, confirm that production code/tests occupy their configured roots, audit every relevant confirmation attempt, and reject Evidence built from ineligible Runs. It must inspect source artifacts and return JSON matching `review.schema.json`; exact Intent, ControlGraph, Observation, Artifact, Evidence, Run, Claim, and Checkpoint references are available as source types when applicable. It must not edit code, Claims, Evidence or Verdicts. Save that JSON outside the reviewer session, then deterministically import and render it.
+The default review base comes from the repository profile; use `--base-ref` only for an explicit one-off override. The packet includes the repository profile and current Git change scope in addition to the scientific artifacts. It also includes bounded Confirmation Record, campaign-abandonment, and attempt locators plus full counts and separate complete-inventory hashes. Each Confirmation locator states the campaign status and binds its abandonment record when applicable. When `confirmation_records_truncated`, `campaign_abandonments_truncated`, or attempt `truncated` is true, the reviewer must inspect the corresponding source inventory rather than treating unlisted records or attempts as absent. Start a fresh top-level Codex task for the review, set it to read-only, and invoke the repository `scientific-review` skill. The reviewer must check that the profile fits the host repository, compare the actual diff with `formal/CHANGESET.json`, verify the commit-bound `formal/VALIDATION.json`, confirm that production code/tests occupy their configured roots, audit every relevant confirmation attempt and abandonment, and reject Evidence built from ineligible Runs or an abandoned campaign offered as confirmatory support. It must inspect source artifacts and return JSON matching `review.schema.json`; exact Intent, ControlGraph, Observation, Artifact, Evidence, Run, Claim, and Checkpoint references are available as source types when applicable. It must not edit code, Claims, Evidence or Verdicts. Save that JSON outside the reviewer session, then deterministically import and render it.
 
 Every review traces the mandatory core
 `Run / Artifact -> Observation -> Evidence -> Claim` and challenges the
@@ -1255,7 +1381,25 @@ python -m tools.studyctl review-render SC-0001 --file /path/to/review.json
 Importing the Review also archives the exact Review and corresponding
 `REVIEW_PACKET.json` as content-addressed, read-only, single-link records under
 the Study's `review-history/`. They remain replayable even though generated
-views are later regenerated.
+views are later regenerated. `REVIEW_VERDICTS.sequence.json` binds every
+complete imported Review/packet pair and every immutable Verdict in one
+append-only inventory. Removing an entire Review/Verdict chain, or injecting a
+fresh record that merely declares a legacy schema version, therefore fails
+closed instead of being mistaken for historical state. If exactly one complete
+Review import or Verdict was published before its sequence update, recover
+only that forward transition:
+
+```bash
+python -m tools.studyctl recover-review-verdict-sequence SC-0001
+```
+
+A genuinely pre-sequence Study requires the explicit one-time
+`migrate-review-verdict-sequence` command. That migration binds the visible
+legacy inventory only after replaying legacy Review structure and packet
+binding plus Verdict schema and decision semantics. It accepts historical
+Review packet v1 and Verdict v1/v2 records, not current packet v2 or Verdict v3
+records. It cannot prove that history was complete before migration, so
+external Git, backup, or audit evidence remains necessary.
 
 After reviewing both structured findings and sources, a separate trusted
 write-enabled Agent presents an exact decision summary containing:
@@ -1283,12 +1427,28 @@ python -m tools.studyctl verdict SC-0001 \
 commit, Brief/Checkpoint/Claim/Evidence hashes, recording timestamp, and
 record digest. Active Claims require a fresh Checkpoint, and the mechanical
 scope requires that Checkpoint to bind the current Brief approval and Claims.
-Verdict v2 also binds the archived Review digest and its Review Packet digest.
-If no independent Review was imported at the decision boundary, it records an
-explicit waiver instead; absence is never implicit.
-Every new Verdict requires a clean Git worktree so its commit identifies the
-reviewed implementation. The scope is checked again immediately before the
-immutable Verdict is written.
+Verdict schema v3 binds the archived Review and Review Packet digests and the
+exact current `ACTIVE_CONTEXT` identity. The packet is accepted only from a
+clean committed scientific worktree, and import deterministically rebuilds the
+complete packet from current authority before comparing every field. This
+replay covers the commit, Brief, latest Checkpoint, all active Claims, the full
+finalized Evidence inventory, Confirmation/campaign-abandonment inventory,
+derived validation summaries, and bounded context. Generated Review
+projections may remain mutable; immutable `review-history/` records may be
+uncommitted additions only.
+
+If no independent Review exists, or the imported Review is stale, Verdict
+recording fails closed unless the decision input separately supplies a
+`review_waiver` with a non-empty reason and exact human
+`authorization_text`. Agent-initiated input must identify that authorization
+as `explicit_user_instruction`; interactive recording requires the separate
+typed phrase `WAIVE INDEPENDENT REVIEW SC-...`. An overall instruction to
+record a Verdict is not itself a Review waiver. Every new Verdict requires an
+available Git repository, a non-null commit, and a clean scientific worktree.
+When an interactive decision file requests a waiver, `studyctl` ignores its
+claimed authorization text and requires that phrase again in the current
+terminal session.
+The scope is checked again immediately before the immutable Verdict is written.
 
 The immutable record keeps the explicit user instruction, its canonical hash,
 and `assurance: cooperative`; the Verdict record digest binds all decisions and
@@ -1300,15 +1460,18 @@ need adversarial identity assurance require an external approval or signing
 boundary.
 
 `scientific-workflow/templates/VERDICT.json` is the Agent-facing version-2
-decision input. It contains only the explicit instruction, Claim selection,
-and decision fields; `studyctl` still generates all mechanical scope. The
-interactive `python -m tools.studyctl verdict SC-0001` form remains available
-as a manual compatibility path and performs a typed terminal confirmation.
-The historical full-record `--file` form remains readable for compatibility,
-but it is never accepted by `--agent-initiated` and cannot bypass current
-authority or clean-worktree checks. Implementation acceptance and scientific
-acceptance remain independent. The human owns the decision and final scope;
-the Agent only translates and records the authorized content.
+decision input; it produces an immutable Verdict schema-v3 record. It contains
+only the explicit instruction, optional separately authorized
+`review_waiver`, Claim selection, and decision fields; `studyctl` still
+generates all mechanical scope. The interactive
+`python -m tools.studyctl verdict SC-0001` form remains available and performs
+typed terminal confirmations. Complete Verdict records of any schema version
+are historical read-only inputs: validation can replay legacy v1/v2 and current
+v3 records only when the Review/Verdict sequence already binds them, but no new
+`verdict` invocation accepts a full-record `--file`.
+Implementation acceptance and scientific acceptance remain independent. The
+human owns the decision and final scope; the Agent only translates and records
+the authorized content.
 
 ## Recover or reproduce a Run
 
@@ -1347,4 +1510,4 @@ It cannot prove from local files alone that a continuous tail was never deleted
 before migration; use Git, backups, scheduler records, or another external
 append-only anchor to establish that historical premise.
 
-The current implementation cannot automatically classify a process killed by `SIGKILL` or power loss. A crash before launch leaves a never-reused ledger reservation; a crash after launch authorization leaves the `running` Manifest and reservation. Both fail closed until explicit recovery. A terminal Manifest may be durable before its matching ledger update; the next locked registration can reconcile that one-way transition, while a missing Manifest always blocks rather than guessing. A graph record durable before its sequence update similarly requires the explicit one-record forward recovery above. The workflow also cannot prove human identity cryptographically, and checks only that a Cohort compatibility justification exists—not whether its scientific argument is sound. ExperimentIntent v2 permits `assessment_semantics: null`; when criteria are present they are frozen and auditable but are not mechanically bound to typed Evidence criterion results. ControlGraph v2 leaves topology and control-policy semantics to the Agent, and `studyctl` does not execute them. Local SHA-256 digests detect inconsistent bytes but are not authenticated signatures or an external rollback anchor; an actor who can replace an entire Study and all of its history is outside this local protocol. Filesystem checks still have an unavoidable time-of-check/time-of-use race against a malicious concurrent local process. GPU-hour and CPU-hour values remain self-reported reservations: their cumulative limits are enforced, but arbitrary schedulers are not independently metered. Declared-output storage is measured after execution. Git detects committed, staged, unstaged, and untracked repository paths, while external and dynamically resolved inputs still must be declared with `--input`. Project hooks remain small guardrails, not a complete security boundary; repository-profile validation, actual-diff checks, immutable snapshots, tests, clean review context, and human review are the enforcement layers.
+The current implementation cannot automatically classify a process killed by `SIGKILL` or power loss. A crash before launch leaves a never-reused ledger reservation; a crash after launch authorization leaves the `running` Manifest and reservation. A ledger-consistent `running` Manifest is represented as `in_progress`, not as a failed attempt, and remains ineligible for Evidence until terminal sealing. A terminal Manifest may be durable before its matching ledger update; the next locked registration can reconcile that one-way transition, while a missing Manifest always blocks rather than guessing. A graph, Confirmation, Review import, or Verdict durable before its sequence update similarly requires the applicable explicit one-record forward recovery above. The workflow also cannot prove human identity cryptographically, and checks only structural facts such as a non-empty Claim scope or conflict synthesis—not whether a label such as `everything`, a synthesis such as `ok`, or a repository-specific convergence/UQ argument is scientifically adequate. Those semantics remain duties of repository validators, independent review, and the human Verdict. ExperimentIntent v2 permits `assessment_semantics: null`; when criteria are present they are frozen and auditable but are not mechanically bound to typed Evidence criterion results. ControlGraph v2 leaves topology and control-policy semantics to the Agent, and `studyctl` does not execute them. Local SHA-256 digests detect inconsistent bytes but are not authenticated signatures or an external rollback anchor; an actor who can replace an entire Study and all of its sequence anchors is outside this local protocol. Filesystem checks still have an unavoidable time-of-check/time-of-use race against a malicious concurrent local process. GPU-hour and CPU-hour values remain self-reported reservations: their cumulative limits are enforced, but arbitrary schedulers are not independently metered. Declared-output storage is measured after execution. Git detects committed, staged, unstaged, and untracked repository paths, while external and dynamically resolved inputs still must be declared with `--input`. Project hooks remain small guardrails, not a complete security boundary; repository-profile validation, actual-diff checks, immutable snapshots, tests, clean review context, and human review are the enforcement layers.

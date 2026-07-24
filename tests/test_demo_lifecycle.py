@@ -26,7 +26,7 @@ from tools.studyctl.hashing import (
 from tools.studyctl.cli import main as studyctl_main
 from tools.studyctl.models import StudyPaths, ValidationError, utc_now
 from tools.studyctl.rendering import render_status
-from tools.studyctl.review import create_review_packet
+from tools.studyctl.review import create_review_packet, import_and_render_review
 from tools.studyctl.validation import errors_only, validate_study
 
 
@@ -87,6 +87,35 @@ class DemonstrationLifecycleTests(WorkflowTestCase):
         )
         return destination
 
+    @staticmethod
+    def independent_review(
+        paths: StudyPaths,
+        packet_path: Path,
+    ) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "study_id": paths.study_id,
+            "reviewed_at": "2026-07-24T00:00:00Z",
+            "reviewer": {
+                "identity": "Independent Demonstration Reviewer",
+                "source": "fresh read-only test session",
+            },
+            "review_packet_sha256": sha256_file(packet_path),
+            "summary": "The exact deterministic demonstration packet was reviewed.",
+            "requirement_coverage": [],
+            "implementation_findings": [],
+            "protected_condition_findings": [],
+            "cohort_findings": [],
+            "reproducibility_findings": [],
+            "scientific_claim_findings": [],
+            "contradictory_evidence_findings": [],
+            "formalization_findings": [],
+            "open_questions": [],
+            "recommended_human_checks": [
+                "Keep the scientific Verdict limited to this non-scientific fixture."
+            ],
+        }
+
     def test_complete_non_scientific_example_lifecycle(self) -> None:
         # 1-2. Initialize, draft, and procedurally approve the exact Brief bytes.
         paths = self.initialize()
@@ -117,17 +146,24 @@ class DemonstrationLifecycleTests(WorkflowTestCase):
         )
         self.assertFalse(note.exists())
 
-        # 8. Regenerate deterministic projections for status and independent review.
+        # 8. Freeze and independently review the exact deterministic state.
         status_path = render_status(paths)
+        self.commit_all("freeze the state submitted for independent Review")
         packet_path = create_review_packet(paths)
+        packet = load_json(packet_path)
+        review_source = self.root / ".objects" / "demonstration-review.json"
+        atomic_write_json(
+            review_source,
+            self.independent_review(paths, packet_path),
+        )
+        import_and_render_review(paths, review_source)
         self.assertIn("CLAIM-0001", status_path.read_text(encoding="utf-8"))
-        self.assertEqual(load_json(packet_path)["decisive_evidence"], [evidence_ref])
+        self.assertEqual(packet["decisive_evidence"], [evidence_ref])
 
         # 9. Validate and record separate implementation/scientific human decisions.
         verdict_id = "VERDICT-0001"
         verdict_stdout = TTYBuffer()
         decisions_path = self.verdict_decisions(paths)
-        self.commit_all("freeze the reviewed demonstration state")
         verdict_path = record_verdict(
             paths,
             decisions_path,
@@ -165,7 +201,13 @@ class DemonstrationLifecycleTests(WorkflowTestCase):
                     }
                 ],
                 "evidence": [evidence_ref],
+                "active_context": packet["review_scope"]["active_context"],
             },
+        )
+        self.assertEqual(verdict["review_basis"]["mode"], "reviewed")
+        self.assertEqual(
+            verdict["review_basis"]["review_packet"]["sha256"],
+            sha256_file(packet_path),
         )
         self.assertEqual(verdict["implementation_verdict"]["decision"], "accepted")
         self.assertEqual(
@@ -184,8 +226,13 @@ class DemonstrationLifecycleTests(WorkflowTestCase):
         self.commit_all("freeze the Agent-initiated Verdict scope")
         decision_path = self.root / ".objects" / "agent-verdict-decisions.json"
         instruction = (
-            "Record the implementation and scientific Verdict below for SC-0001 "
+            "Record the implementation and scientific Verdict below for SC-0001, "
+            "and explicitly waive independent Review for this deterministic fixture, "
             "without asking me to assemble its mechanical hashes."
+        )
+        waiver_text = (
+            "I explicitly waive independent Review for this deterministic "
+            "Agent-initiated Verdict fixture."
         )
         valid_input = {
             "input_version": 2,
@@ -202,6 +249,14 @@ class DemonstrationLifecycleTests(WorkflowTestCase):
                 "decision": "requires_more_evidence",
                 "rationale": "The fixture does not establish a scientific conclusion.",
                 "scope": "Only the deterministic fixture is judged.",
+            },
+            "review_waiver": {
+                "reason": (
+                    "This test exercises explicit Agent-initiated Verdict "
+                    "authorization without commissioning an independent Review."
+                ),
+                "source": "explicit_user_instruction",
+                "authorization_text": waiver_text,
             },
         }
 
@@ -301,6 +356,11 @@ class DemonstrationLifecycleTests(WorkflowTestCase):
             verdict["confirmation"]["mode"],
             "agent_initiated",
         )
+        self.assertEqual(verdict["review_basis"]["mode"], "waived")
+        self.assertEqual(
+            verdict["review_basis"]["authorization"]["text_sha256"],
+            sha256_json(waiver_text),
+        )
         self.assertEqual(
             verdict["verdict_sha256"],
             record_digest(verdict, "verdict_sha256"),
@@ -381,7 +441,7 @@ class DemonstrationLifecycleTests(WorkflowTestCase):
 
         self.assertFalse(paths.verdict.exists())
 
-    def test_full_verdict_cannot_bypass_checkpoint_approval_binding(self) -> None:
+    def test_complete_verdict_record_is_historical_read_only(self) -> None:
         paths = self.initialize_approved_with_claim()
         checkpoint = load_json(
             finalize_compaction(paths, self.compaction_plan(paths, None))
@@ -444,7 +504,7 @@ class DemonstrationLifecycleTests(WorkflowTestCase):
 
         with self.assertRaisesRegex(
             ValidationError,
-            "latest Checkpoint does not bind the current Brief approval; compact before Verdict",
+            "accepts only decision input",
         ):
             record_verdict(
                 paths,
@@ -467,7 +527,7 @@ class DemonstrationLifecycleTests(WorkflowTestCase):
 
         with self.assertRaisesRegex(
             ValidationError,
-            "Verdict requires a clean Git worktree",
+            "Verdict requires a clean scientific worktree",
         ):
             record_verdict(paths, stdin=TTYBuffer(), stdout=TTYBuffer())
 

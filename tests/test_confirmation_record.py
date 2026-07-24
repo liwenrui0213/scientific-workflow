@@ -12,6 +12,7 @@ from tests.helpers import WorkflowTestCase, completed_process
 from tools.studyctl.active_context import build_active_selector
 from tools.studyctl.compaction import prepare_compaction
 from tools.studyctl.confirmation import (
+    abandon_confirmation_campaign,
     create_confirmation_draft,
     finalize_confirmation,
     load_final_confirmation,
@@ -187,7 +188,7 @@ class ConfirmationRecordTests(WorkflowTestCase):
         record_path = self.paths.confirmations / "CONF-0001.json"
 
         self.assertEqual(record["record_sha256"], record_digest(record, "record_sha256"))
-        self.assertEqual(record["schema_version"], 3)
+        self.assertEqual(record["schema_version"], 4)
         self.assertEqual(record["campaign"]["sequence"], 1)
         self.assertTrue(record["campaign"]["campaign_id"].startswith("CAMP-"))
         self.assertEqual(record_path.stat().st_mode & 0o222, 0)
@@ -355,6 +356,7 @@ class ConfirmationRecordTests(WorkflowTestCase):
         self.assertEqual(revision_locator["total_count"], 1)
         self.assertEqual(revision_locator["items"][0]["evidence_id"], "EVID-0001")
         self.assertEqual(revision_locator["items"][0]["version"], 2)
+        self.assertEqual(errors_only(validate_study(self.paths)), [])
         revision_status = render_status(self.paths).read_text(encoding="utf-8")
         self.assertIn(
             "`CONF-0001` has confirmatory Evidence draft(s) to resume: "
@@ -411,11 +413,95 @@ class ConfirmationRecordTests(WorkflowTestCase):
             self.assertEqual(locator["size"], manifest_path.stat().st_size)
             self.assertEqual(locator["sha256"], sha256_file(manifest_path))
 
+            issues = validate_study(self.paths)
+            self.assertEqual(errors_only(issues), [])
+            self.assertTrue(
+                any(
+                    issue.level == "WARNING"
+                    and issue.message
+                    == "Run is in progress and not yet eligible for Evidence"
+                    for issue in issues
+                ),
+                [issue.render() for issue in issues],
+            )
             status = render_status(self.paths).read_text(encoding="utf-8")
             self.assertIn("`SLOT-001` as `RUN-000001`", status)
             result = future.result(timeout=10)
 
         self.assertEqual(result["status"], "succeeded")
+
+    def test_abandoned_running_campaign_remains_in_progress_not_pending(
+        self,
+    ) -> None:
+        self.argv = [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(2); print(4)",
+        ]
+        confirmation = self._finalize()
+        campaign_id = str(confirmation["campaign"]["campaign_id"])
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(self._confirmatory_run)
+            manifest_path: Path | None = None
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                manifests = sorted(self.paths.runs.glob("RUN-*/manifest.json"))
+                if manifests and load_json(manifests[0]).get("status") == "running":
+                    manifest_path = manifests[0]
+                    break
+                if future.done():
+                    break
+                time.sleep(0.01)
+            self.assertIsNotNone(
+                manifest_path,
+                "confirmatory Run never published its running Manifest",
+            )
+
+            abandonment_path = abandon_confirmation_campaign(
+                self.paths,
+                "CONF-0001",
+                {
+                    "input_version": 1,
+                    "campaign_id": campaign_id,
+                    "rationale": (
+                        "Stop admitting new work while retaining the already "
+                        "running attempt as immutable campaign history."
+                    ),
+                    "authorization": {
+                        "source": "explicit_user_instruction",
+                        "instruction": (
+                            "Abandon this entire campaign without deleting or "
+                            "rewriting the running attempt."
+                        ),
+                    },
+                },
+            )
+            confirmations = build_active_selector(self.paths)["confirmations"]
+            self.assertEqual(confirmations["pending_finalized"]["total_count"], 0)
+            self.assertEqual(confirmations["awaiting_evidence"]["total_count"], 0)
+            self.assertEqual(confirmations["in_progress"]["total_count"], 1)
+            in_progress = confirmations["in_progress"]["items"][0]
+            self.assertEqual(in_progress["campaign_status"], "abandoned")
+            self.assertEqual(
+                in_progress["abandonment"]["path"],
+                abandonment_path.relative_to(self.paths.root).as_posix(),
+            )
+            self.assertEqual(
+                in_progress["running_slots"]["items"][0]["status"],
+                "running",
+            )
+            result = future.result(timeout=10)
+
+        self.assertEqual(result["status"], "succeeded")
+        terminal = build_active_selector(self.paths)["confirmations"]
+        self.assertEqual(terminal["pending_finalized"]["total_count"], 0)
+        self.assertEqual(terminal["in_progress"]["total_count"], 0)
+        self.assertEqual(terminal["awaiting_evidence"]["total_count"], 0)
+        self.assertEqual(
+            terminal["history"]["items"][0]["campaign_status"],
+            "abandoned",
+        )
 
     def test_confirmation_resume_index_is_bounded_and_commits_full_history(self) -> None:
         for number in range(2, 11):

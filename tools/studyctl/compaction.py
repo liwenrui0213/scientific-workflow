@@ -44,7 +44,7 @@ from .models import (
     WorkflowError,
     utc_now,
 )
-from .rendering import active_formal_artifacts, render_status
+from .rendering import active_formal_artifacts, _render_status_under_authority
 from .run_ledger import (
     bootstrap_or_reconcile_ledger,
     ledger_commitment_totals,
@@ -1062,5 +1062,7 @@ def _finalize_compaction_locked(paths: StudyPaths, plan_path: Path) -> Path:
                 os.replace(destination, source)
                 os.chmod(source, original_mode)
         raise
-    render_status(paths)
+    # This function already runs inside ``study_authority_lock``. Keep status
+    # and projection refresh in that same snapshot without a nested flock.
+    _render_status_under_authority(paths)
     return checkpoint_path

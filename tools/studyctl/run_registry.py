@@ -769,11 +769,13 @@ def migrate_legacy_run_ledger(paths: StudyPaths) -> Path:
 def _capture_formal_artifacts(
     paths: StudyPaths,
     policy: dict[str, Any],
+    *,
+    include_plan: bool,
 ) -> list[tuple[Path, str, str, bytes]]:
     if not paths.formal.is_dir():
         return []
     plan_path = paths.formal / "PLAN.json"
-    if plan_path.is_file() and not plan_path.is_symlink():
+    if include_plan and plan_path.is_file() and not plan_path.is_symlink():
         from .graph_records import active_control_graph
 
         if active_control_graph(paths) is None:
@@ -783,9 +785,18 @@ def _capture_formal_artifacts(
     known_kinds = {
         (paths.study / str(relative)).resolve(): str(kind)
         for kind, relative in policy.get("formal_artifacts", {}).items()
+        if include_plan or kind != "PLAN"
     }
     records: list[tuple[Path, str, str, bytes]] = []
     for path in sorted(paths.formal.rglob("*"), key=lambda item: item.as_posix()):
+        if (
+            not include_plan
+            and (path == plan_path or plan_path in path.parents)
+        ):
+            # PLAN is an optional control pointer, not ambient scientific
+            # authority. Ignore it before even inspecting its file type so an
+            # ordinary Run never reads, resolves, validates, or snapshots it.
+            continue
         if path.is_symlink():
             raise ValidationError(f"symbolic links are not accepted as formal artifacts: {path}")
         if not path.is_file():
@@ -916,9 +927,13 @@ def _formal_artifacts_unchanged(
     paths: StudyPaths,
     policy: dict[str, Any],
     before_digest: str,
+    *,
+    include_plan: bool,
 ) -> bool:
     try:
-        current = _capture_formal_artifacts(paths, policy)
+        current = _capture_formal_artifacts(
+            paths, policy, include_plan=include_plan
+        )
     except (OSError, WorkflowError, ValidationError):
         return False
     return _formal_capture_digest(paths, current) == before_digest
@@ -1612,6 +1627,7 @@ def _seal_incomplete_after_failure(
     stdout_path: Path,
     stderr_path: Path,
     formal_capture_digest: str,
+    include_plan: bool,
     started_monotonic: float,
     exit_code: int | None,
     phase: str,
@@ -1674,7 +1690,12 @@ def _seal_incomplete_after_failure(
     manifest["budget"]["committed_after"] = projection["committed_after"]
     manifest["budget"]["violations"] = projection["violations"]
     manifest["formalization"]["artifacts_unchanged_during_run"] = (
-        _formal_artifacts_unchanged(paths, policy, formal_capture_digest)
+        _formal_artifacts_unchanged(
+            paths,
+            policy,
+            formal_capture_digest,
+            include_plan=include_plan,
+        )
     )
     for path in (stdout_path, stderr_path):
         try:
@@ -1973,7 +1994,6 @@ def execute_run(
 
         policy = load_policy(paths)
         protocol_path, protocol = _load_protocol(paths)
-        captured_formal_artifacts = _capture_formal_artifacts(paths, policy)
         control_binding = _run_control_binding(
             paths,
             control_node_id,
@@ -1984,6 +2004,11 @@ def execute_run(
             intent_id,
             intent_version,
             control_binding=control_binding,
+        )
+        captured_formal_artifacts = _capture_formal_artifacts(
+            paths,
+            policy,
+            include_plan=control_binding is not None,
         )
         if _captured_protected_artifacts(
             paths, captured_formal_artifacts
@@ -2412,7 +2437,10 @@ def execute_run(
             raise ValidationError("; ".join(sealing_errors))
         finalized_inputs = _finalize_input_records(inputs)
         formal_artifacts_unchanged = _formal_artifacts_unchanged(
-            paths, policy, formal_capture_digest
+            paths,
+            policy,
+            formal_capture_digest,
+            include_plan=control_binding is not None,
         )
         boundary = initial_manifest.get("execution_boundary", {})
         dependencies_evidence_eligible = (
@@ -2554,6 +2582,7 @@ def execute_run(
                     stdout_path=stdout_path,
                     stderr_path=stderr_path,
                     formal_capture_digest=formal_capture_digest,
+                    include_plan=control_binding is not None,
                     started_monotonic=started_monotonic,
                     exit_code=exit_code,
                     phase=(

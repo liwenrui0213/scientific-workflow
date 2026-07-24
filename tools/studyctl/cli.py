@@ -7,6 +7,10 @@ import sys
 from typing import Any, Sequence
 
 from .checkpoint_sequence import empty_checkpoint_sequence, write_checkpoint_sequence
+from .confirmation_sequence import (
+    empty_confirmation_sequence,
+    write_confirmation_sequence,
+)
 from .evidence_sequence import empty_evidence_sequence, write_evidence_sequence
 from .graph_record_sequence import (
     empty_graph_record_sequence,
@@ -16,6 +20,10 @@ from .execution_backends import SUPPORTED_EXECUTION_BACKENDS
 from .observation_sequence import (
     empty_observation_sequence,
     write_observation_sequence,
+)
+from .review_verdict_sequence import (
+    empty_review_verdict_sequence,
+    write_review_verdict_sequence,
 )
 from .hashing import atomic_write_bytes, atomic_write_json
 from .models import (
@@ -29,7 +37,7 @@ from .models import (
     utc_now,
 )
 from .run_ledger import empty_ledger, write_ledger
-from .validation import validate_study
+from .validation import assert_valid_study, validate_study
 
 
 def initialize_study(root: Path, study_id: str, title: str) -> Path:
@@ -64,6 +72,16 @@ def initialize_study(root: Path, study_id: str, title: str) -> Path:
         paths, empty_observation_sequence(paths), overwrite=False
     )
     write_evidence_sequence(paths, empty_evidence_sequence(paths), overwrite=False)
+    write_confirmation_sequence(
+        paths,
+        empty_confirmation_sequence(paths),
+        overwrite=False,
+    )
+    write_review_verdict_sequence(
+        paths,
+        empty_review_verdict_sequence(paths),
+        overwrite=False,
+    )
     write_checkpoint_sequence(
         paths, empty_checkpoint_sequence(paths), overwrite=False
     )
@@ -175,6 +193,43 @@ def build_parser() -> argparse.ArgumentParser:
     )
     evidence_sequence_recover.add_argument("study_id")
 
+    confirmation_sequence_recover = subparsers.add_parser(
+        "recover-confirmation-sequence",
+        help=(
+            "index exactly one immutable Confirmation or campaign-abandonment "
+            "record left unindexed by an interrupted finalization"
+        ),
+    )
+    confirmation_sequence_recover.add_argument("study_id")
+
+    confirmation_sequence_migrate = subparsers.add_parser(
+        "migrate-confirmation-sequence",
+        help=(
+            "create Confirmation sequence authority once for a non-empty "
+            "pre-sequence history containing only finalized legacy v2/v3 records"
+        ),
+    )
+    confirmation_sequence_migrate.add_argument("study_id")
+
+    review_verdict_sequence_recover = subparsers.add_parser(
+        "recover-review-verdict-sequence",
+        help=(
+            "index exactly one immutable Review import or Verdict left "
+            "unindexed by an interrupted publication"
+        ),
+    )
+    review_verdict_sequence_recover.add_argument("study_id")
+
+    review_verdict_sequence_migrate = subparsers.add_parser(
+        "migrate-review-verdict-sequence",
+        help=(
+            "create Review/Verdict sequence authority once for an explicitly "
+            "selected pre-sequence Study containing only legacy Review packet "
+            "v1 and Verdict v1/v2 records"
+        ),
+    )
+    review_verdict_sequence_migrate.add_argument("study_id")
+
     validate = subparsers.add_parser("validate", help="validate authoritative records and references")
     validate.add_argument("study_id")
 
@@ -245,6 +300,28 @@ def build_parser() -> argparse.ArgumentParser:
     confirmation_finalize.add_argument("study_id")
     confirmation_finalize.add_argument("--file", required=True)
 
+    confirmation_abandon = subparsers.add_parser(
+        "confirmation-abandon",
+        help=(
+            "append an explicitly authorized whole-campaign abandonment "
+            "without removing Confirmation history"
+        ),
+    )
+    confirmation_abandon.add_argument("study_id")
+    confirmation_abandon.add_argument("confirmation_id")
+    confirmation_abandon.add_argument("--file", required=True)
+
+    confirmation_draft_discard = subparsers.add_parser(
+        "confirmation-draft-discard",
+        help=(
+            "archive and explicitly disposition one stale or invalid "
+            "Confirmation draft"
+        ),
+    )
+    confirmation_draft_discard.add_argument("study_id")
+    confirmation_draft_discard.add_argument("confirmation_id")
+    confirmation_draft_discard.add_argument("--reason", required=True)
+
     intent_new = subparsers.add_parser(
         "intent-new",
         help="create a versioned ExperimentIntent draft (why evidence is needed)",
@@ -298,6 +375,16 @@ def build_parser() -> argparse.ArgumentParser:
     plan_activate.add_argument("study_id")
     plan_activate.add_argument("--id", dest="control_graph_id", required=True)
     plan_activate.add_argument("--version", type=int, required=True)
+
+    plan_deactivate = subparsers.add_parser(
+        "plan-deactivate",
+        help=(
+            "explicitly retire the active PLAN pointer while preserving an "
+            "immutable lifecycle event"
+        ),
+    )
+    plan_deactivate.add_argument("study_id")
+    plan_deactivate.add_argument("--reason", required=True)
 
     run = subparsers.add_parser("run", help="execute and seal a reproducible Run")
     run.add_argument("study_id")
@@ -503,6 +590,33 @@ def dispatch(args: argparse.Namespace) -> int:
 
         print(recover_evidence_sequence(paths))
         return 0
+    if name == "recover-confirmation-sequence":
+        from .confirmation import recover_confirmation_sequence
+
+        print(recover_confirmation_sequence(paths))
+        return 0
+    if name == "migrate-confirmation-sequence":
+        from .confirmation_sequence import (
+            migrate_legacy_confirmation_sequence,
+        )
+
+        print(migrate_legacy_confirmation_sequence(paths))
+        return 0
+    if name == "recover-review-verdict-sequence":
+        from .review_verdict_sequence import (
+            recover_unindexed_review_verdict_authority,
+        )
+
+        recover_unindexed_review_verdict_authority(paths)
+        print(paths.review_verdict_sequence)
+        return 0
+    if name == "migrate-review-verdict-sequence":
+        from .review_verdict_sequence import (
+            migrate_legacy_review_verdict_sequence,
+        )
+
+        print(migrate_legacy_review_verdict_sequence(paths))
+        return 0
     if name == "status":
         from .rendering import render_status
 
@@ -510,8 +624,16 @@ def dispatch(args: argparse.Namespace) -> int:
         return 0
     if name == "context":
         from .active_context import refresh_active_projection
+        from .locking import study_authority_lock
 
-        selector, _ = refresh_active_projection(paths)
+        # ACTIVE_CONTEXT is a navigation projection over authoritative
+        # records.  Never replace a previously valid projection with a view
+        # built from an internally inconsistent Study.  Hold the shared
+        # authority lock across validation and projection so no writer can
+        # change protected Study state between those two operations.
+        with study_authority_lock(paths):
+            assert_valid_study(paths)
+            selector, _ = refresh_active_projection(paths)
         print(selector)
         return 0
     if name == "check-formalization":
@@ -644,6 +766,29 @@ def dispatch(args: argparse.Namespace) -> int:
 
         print(finalize_confirmation(paths, Path(args.file)))
         return 0
+    if name == "confirmation-abandon":
+        from .confirmation import abandon_confirmation_campaign
+        from .hashing import load_json
+
+        print(
+            abandon_confirmation_campaign(
+                paths,
+                args.confirmation_id,
+                load_json(Path(args.file).resolve()),
+            )
+        )
+        return 0
+    if name == "confirmation-draft-discard":
+        from .confirmation import discard_stale_confirmation_draft
+
+        print(
+            discard_stale_confirmation_draft(
+                paths,
+                args.confirmation_id,
+                reason=args.reason,
+            )
+        )
+        return 0
     if name == "intent-new":
         from .graph_records import create_experiment_intent_draft
 
@@ -697,6 +842,11 @@ def dispatch(args: argparse.Namespace) -> int:
                 args.version,
             )
         )
+        return 0
+    if name == "plan-deactivate":
+        from .graph_records import deactivate_control_graph
+
+        print(deactivate_control_graph(paths, reason=args.reason))
         return 0
     if name == "observation-new":
         from .observation import create_observation_draft

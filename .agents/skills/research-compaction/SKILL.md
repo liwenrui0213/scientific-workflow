@@ -40,8 +40,10 @@ Frontier.
    decisions. Add Intent or PLAN only when its durable boundary or formal
    control complexity is warranted. Keep occurrence facts in Runs and reusable
    lessons in Evidence-backed Claims. Use the deterministic occurrence locator
-   so an empty `representative_failures` list cannot hide failed/ineligible
-   attempts or finalized-but-undispositioned Evidence.
+   so an empty `representative_failures` list cannot hide terminal
+   failed/ineligible attempts or finalized-but-undispositioned Evidence.
+   Nonterminal Runs are only `in_progress`; immutable archived Claim locators
+   prevent already-dispositioned Evidence from resurfacing after a legal prune.
 5. Rerun `compact-prepare`; write a schema-valid plan outside `work/active/`
    binding its input, Claims hash, and constant-size Evidence inventory. Carry
    Frontier once and name each scratch archive.
@@ -58,9 +60,11 @@ Frontier.
   PLAN, adopted host files, Runs/Artifacts, Observations, Evidence, output
   objects, unique anomalies, or references.
 - Preserve every confirmation attempt. Observation has no Claim assessment.
-- Observation sequence v2 and Evidence sequence v3 must match the complete
-  finalized inventory. Only the explicit one-record forward-recovery command
-  may repair one uniquely interrupted finalization.
+- Observation sequence v2, Evidence sequence v3, and the Confirmation and
+  Review/Verdict authority sequences must match their complete immutable
+  inventories. Only the explicit one-record forward-recovery command may repair
+  one uniquely interrupted publication. A pre-abandonment Confirmation draft is
+  stale Workspace, not resumable campaign state.
 - Preserve failures by exact Run reference. Run is fact, cause is hypothesis,
   and reusable lesson is an Evidence-backed scoped Claim; free-form “failed
   direction” notes are not authority.

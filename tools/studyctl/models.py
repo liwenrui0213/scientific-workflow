@@ -18,7 +18,8 @@ CHECKPOINT_SCHEMA_VERSION = 5
 COMPACTION_PLAN_SCHEMA_VERSION = 2
 EXPERIMENT_INTENT_SCHEMA_VERSION = 2
 CONTROL_GRAPH_SCHEMA_VERSION = 2
-VERDICT_SCHEMA_VERSION = 2
+REVIEW_PACKET_SCHEMA_VERSION = 2
+VERDICT_SCHEMA_VERSION = 3
 
 ID_PATTERNS = {
     "study": re.compile(r"^SC-[0-9]{4,}$"),
@@ -201,6 +202,20 @@ class StudyPaths:
         )
 
     @property
+    def confirmation_sequence(self) -> Path:
+        return self._safe_study_path(
+            Path("CONFIRMATIONS.sequence.json"),
+            label="CONFIRMATIONS.sequence.json",
+        )
+
+    @property
+    def review_verdict_sequence(self) -> Path:
+        return self._safe_study_path(
+            Path("REVIEW_VERDICTS.sequence.json"),
+            label="REVIEW_VERDICTS.sequence.json",
+        )
+
+    @property
     def checkpoint_sequence(self) -> Path:
         return self._safe_study_path(
             Path("CHECKPOINTS.sequence.json"), label="CHECKPOINTS.sequence.json"
@@ -291,6 +306,8 @@ class StudyPaths:
             self.claims,
             self.observation_sequence,
             self.evidence_sequence,
+            self.confirmation_sequence,
+            self.review_verdict_sequence,
             self.checkpoint_sequence,
             self.graph_record_sequence,
             self.verdict,

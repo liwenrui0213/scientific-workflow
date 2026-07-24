@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import redirect_stderr, redirect_stdout
+import io
 import math
 from pathlib import Path
 import stat
@@ -9,11 +11,15 @@ from unittest.mock import patch
 
 from tests.helpers import WorkflowTestCase
 from tools.studyctl.active_context import build_active_selector
+from tools.studyctl.cli import main as studyctl_main
 from tools.studyctl.formalization import artifact_ready
 from tools.studyctl.graph_records import (
+    active_control_graph,
     activate_control_graph,
+    control_graph_lifecycle,
     create_control_graph_draft,
     create_experiment_intent_draft,
+    deactivate_control_graph,
     finalize_control_graph,
     finalize_experiment_intent,
     recover_graph_record_sequence,
@@ -26,6 +32,7 @@ from tools.studyctl.hashing import (
     sha256_file,
 )
 from tools.studyctl.models import ValidationError
+from tools.studyctl.run_registry import execute_run
 from tools.studyctl.validation import validate_study
 
 
@@ -141,13 +148,20 @@ class GraphRecordTests(WorkflowTestCase):
             plans["items"][0]["realizes_intent"]["sha256"],
             intents["items"][0]["sha256"],
         )
-        self.assertEqual(selector["graph_records"]["sequence"]["high_water_mark"], 2)
+        self.assertEqual(selector["graph_records"]["sequence"]["high_water_mark"], 3)
         self.assertEqual(
             selector["graph_records"]["sequence"]["path"],
             f"studies/{paths.study_id}/GRAPH_RECORDS.sequence.json",
         )
 
-        manifest = self.successful_run(paths)
+        manifest = execute_run(
+            paths,
+            argv=[sys.executable, "-c", "print(2 + 2)"],
+            purpose="explicitly PLAN-bound fixture",
+            control_node_id="run_fixture",
+            hardware_class="test-cpu",
+            precision="exact-integer",
+        )
         plan_snapshots = [
             item
             for item in manifest["formal_artifacts"]
@@ -157,6 +171,216 @@ class GraphRecordTests(WorkflowTestCase):
         self.assertEqual(plan_snapshots[0]["sha256"], sha256_file(active_path))
         # Executing and validating a control graph cannot promote a Claim.
         self.assertEqual(load_json(paths.claims)["claims"][0]["state"], "proposed")
+
+    def test_plan_activation_and_deactivation_are_append_only(self) -> None:
+        paths = self.initialize_approved_with_claim()
+        self._final_intent(paths)
+        self._final_plan(paths)
+        self._final_plan(paths, graph_id="CG-0002")
+
+        self.assertEqual(
+            control_graph_lifecycle(paths, "CG-0001", 1),
+            {"state": "never_activated", "last_event": None},
+        )
+        self.assertEqual(
+            control_graph_lifecycle(paths, "CG-0002", 1),
+            {"state": "never_activated", "last_event": None},
+        )
+
+        activate_control_graph(paths, "CG-0001", 1)
+        active_state = control_graph_lifecycle(paths, "CG-0001", 1)
+        self.assertEqual(active_state["state"], "active")
+        activation_path = paths.root / active_state["last_event"]["path"]
+        activation = load_json(activation_path)
+        self.assertEqual(activation["action"], "activated")
+        self.assertEqual(activation["prior_state"], "never_activated")
+        self.assertIsNone(activation["previous_event"])
+        self.assertEqual(stat.S_IMODE(activation_path.stat().st_mode), 0o444)
+
+        deactivation_path = deactivate_control_graph(
+            paths,
+            reason="The prospective control graph completed its useful role.",
+        )
+        inactive_state = control_graph_lifecycle(paths, "CG-0001", 1)
+        deactivation = load_json(deactivation_path)
+        self.assertEqual(inactive_state["state"], "inactive")
+        self.assertEqual(deactivation["action"], "deactivated")
+        self.assertEqual(deactivation["prior_state"], "active")
+        self.assertEqual(
+            deactivation["previous_event"]["sha256"],
+            activation["record_sha256"],
+        )
+        self.assertFalse((paths.formal / "PLAN.json").exists())
+        self.assertTrue(activation_path.is_file())
+        self.assertEqual(
+            load_json(paths.graph_record_sequence)["high_water_mark"],
+            5,
+        )
+        self.assertEqual(
+            control_graph_lifecycle(paths, "CG-0002", 1),
+            {"state": "never_activated", "last_event": None},
+        )
+        self.assertEqual(
+            [
+                issue.render()
+                for issue in validate_study(paths)
+                if issue.level == "ERROR"
+            ],
+            [],
+        )
+
+    def test_plan_deactivation_rejects_never_active_state(self) -> None:
+        paths = self.initialize_approved_with_claim()
+        self._final_intent(paths)
+        self._final_plan(paths)
+
+        with self.assertRaisesRegex(
+            ValidationError, "never been activated"
+        ):
+            deactivate_control_graph(
+                paths, reason="There is no active graph to retire."
+            )
+
+        self.assertEqual(
+            control_graph_lifecycle(paths, "CG-0001", 1)["state"],
+            "never_activated",
+        )
+
+    def test_plan_lifecycle_event_deletion_is_detected(self) -> None:
+        paths = self.initialize_approved_with_claim()
+        self._final_intent(paths)
+        self._final_plan(paths)
+        activate_control_graph(paths, "CG-0001", 1)
+        state = control_graph_lifecycle(paths, "CG-0001", 1)
+        event_path = paths.root / state["last_event"]["path"]
+        payload = event_path.read_bytes()
+
+        event_path.unlink()
+
+        messages = [
+            issue.message
+            for issue in validate_study(paths)
+            if issue.level == "ERROR"
+        ]
+        self.assertTrue(
+            any("monotone sequence count" in message for message in messages),
+            messages,
+        )
+
+        event_path.write_bytes(payload)
+        event_path.chmod(0o444)
+        self.assertEqual(
+            [
+                issue.render()
+                for issue in validate_study(paths)
+                if issue.level == "ERROR"
+            ],
+            [],
+        )
+
+    def test_stale_active_plan_can_be_explicitly_deactivated(self) -> None:
+        paths = self.initialize_approved_with_claim()
+        self._final_intent(paths)
+        self._final_plan(paths)
+        activate_control_graph(paths, "CG-0001", 1)
+        self._final_intent(
+            paths,
+            objective="Supersede the Intent while preserving PLAN history.",
+        )
+
+        with self.assertRaisesRegex(ValidationError, "superseded"):
+            active_control_graph(paths)
+        validation_messages = [
+            issue.message
+            for issue in validate_study(paths)
+            if issue.level == "ERROR"
+        ]
+        self.assertTrue(
+            any("superseded" in message for message in validation_messages),
+            validation_messages,
+        )
+        invalid_stdout = io.StringIO()
+        invalid_stderr = io.StringIO()
+        with redirect_stdout(invalid_stdout), redirect_stderr(invalid_stderr):
+            self.assertEqual(
+                studyctl_main(
+                    ["--root", str(self.root), "context", paths.study_id]
+                ),
+                2,
+            )
+        self.assertEqual(invalid_stdout.getvalue(), "")
+        self.assertIn("superseded", invalid_stderr.getvalue())
+
+        event_path = deactivate_control_graph(
+            paths,
+            reason="The realized Intent was superseded.",
+        )
+
+        self.assertEqual(load_json(event_path)["action"], "deactivated")
+        self.assertEqual(
+            control_graph_lifecycle(paths, "CG-0001", 1)["state"],
+            "inactive",
+        )
+        self.assertFalse((paths.formal / "PLAN.json").exists())
+        self.assertEqual(
+            [
+                issue.render()
+                for issue in validate_study(paths)
+                if issue.level == "ERROR"
+            ],
+            [],
+        )
+        valid_stdout = io.StringIO()
+        valid_stderr = io.StringIO()
+        with redirect_stdout(valid_stdout), redirect_stderr(valid_stderr):
+            self.assertEqual(
+                studyctl_main(
+                    ["--root", str(self.root), "context", paths.study_id]
+                ),
+                0,
+            )
+        self.assertEqual(valid_stderr.getvalue(), "")
+        selector = load_json(Path(valid_stdout.getvalue().strip()))
+        graph = selector["graph_records"]["control_graphs"]["items"][0]
+        self.assertEqual(graph["lifecycle"]["state"], "inactive")
+
+    def test_corrupt_materialized_plan_does_not_block_lifecycle_deactivation(
+        self,
+    ) -> None:
+        paths = self.initialize_approved_with_claim()
+        intent_path = self._final_intent(paths)
+        graph_path = self._final_plan(paths)
+        intent = load_json(intent_path)
+        graph = load_json(graph_path)
+        activate_control_graph(paths, "CG-0001", 1)
+        plan_path = paths.formal / "PLAN.json"
+        plan_path.chmod(0o644)
+        plan_path.write_text("{not-json}\n", encoding="utf-8")
+
+        event_path = deactivate_control_graph(
+            paths,
+            reason=(
+                "Retire the sealed active graph after detecting a corrupted "
+                "materialized PLAN pointer."
+            ),
+        )
+
+        self.assertFalse(plan_path.exists())
+        event = load_json(event_path)
+        self.assertEqual(event["action"], "deactivated")
+        self.assertEqual(event["plan_ref"]["sha256"], graph["record_sha256"])
+        self.assertEqual(
+            event["intent_ref"]["sha256"], intent["record_sha256"]
+        )
+        self.assertIsNone(active_control_graph(paths))
+        self.assertEqual(
+            [
+                issue.render()
+                for issue in validate_study(paths)
+                if issue.level == "ERROR"
+            ],
+            [],
+        )
 
     def test_native_graph_sequence_detects_tail_and_whole_family_deletion(
         self,
@@ -676,7 +900,7 @@ class GraphRecordTests(WorkflowTestCase):
             errors,
         )
 
-    def test_generic_plan_is_rejected_before_any_control_graph_exists(self) -> None:
+    def test_generic_plan_does_not_capture_or_block_an_ordinary_run(self) -> None:
         paths = self.initialize_approved_with_claim()
         generic_plan = {
             "schema_version": 1,
@@ -696,8 +920,15 @@ class GraphRecordTests(WorkflowTestCase):
             any("activated ControlGraphSpec" in message for message in errors),
             errors,
         )
-        with self.assertRaisesRegex(ValidationError, "activated ControlGraphSpec"):
-            self.successful_run(paths)
+        manifest = self.successful_run(paths)
+        self.assertIsNone(manifest["control_binding"])
+        self.assertTrue(manifest["change_scope"]["evidence_eligible"])
+        self.assertFalse(
+            any(
+                item.get("kind") == "PLAN"
+                for item in manifest["formal_artifacts"]
+            )
+        )
 
 
 if __name__ == "__main__":

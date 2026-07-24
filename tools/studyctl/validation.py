@@ -44,6 +44,8 @@ from .models import (
     EVIDENCE_SCHEMA_VERSION,
     EXPERIMENT_INTENT_SCHEMA_VERSION,
     OBSERVATION_SCHEMA_VERSION,
+    REVIEW_PACKET_SCHEMA_VERSION,
+    VERDICT_SCHEMA_VERSION,
     ID_PATTERNS,
     StudyPaths,
     ValidationError,
@@ -73,11 +75,14 @@ SCHEMA_FILES = {
     "observation": "observation.schema.json",
     "evidence": "evidence.schema.json",
     "confirmation": "confirmation.schema.json",
+    "confirmation_abandonment": "confirmation-abandonment.schema.json",
     "claims": "claims.schema.json",
     "checkpoint": "checkpoint.schema.json",
     "experiment_intent": "experiment-intent.schema.json",
     "control_graph": "control-graph.schema.json",
+    "plan_lifecycle_event": "plan-lifecycle-event.schema.json",
     "review": "review.schema.json",
+    "review_packet": "review-packet.schema.json",
     "verdict": "verdict.schema.json",
     "brief_approval": "brief-approval.schema.json",
     "compaction_plan": "compaction-plan.schema.json",
@@ -93,6 +98,7 @@ CURRENT_ARTIFACT_SCHEMA_VERSIONS = {
     "checkpoint": CHECKPOINT_SCHEMA_VERSION,
     "experiment_intent": EXPERIMENT_INTENT_SCHEMA_VERSION,
     "control_graph": CONTROL_GRAPH_SCHEMA_VERSION,
+    "review_packet": REVIEW_PACKET_SCHEMA_VERSION,
 }
 
 _RUN_V2_TOP_LEVEL_KEYS = {
@@ -534,6 +540,7 @@ def object_schema_issues(
                 "checkpoint": "Checkpoint",
                 "experiment_intent": "Experiment Intent",
                 "control_graph": "Control Graph",
+                "review_packet": "Review Packet",
             }[name]
             return [
                 ValidationIssue(
@@ -2009,7 +2016,17 @@ def _run_issues(paths: StudyPaths) -> tuple[list[ValidationIssue], dict[str, tup
             status = manifest.get("status")
             integrity = manifest.get("integrity", {})
             if status == "running":
-                issues.append(ValidationIssue("ERROR", str(path), "Run is unsealed/running"))
+                # A ledger-consistent running Manifest is a valid execution
+                # fact, not a failed attempt or corrupted authority record.
+                # It remains ineligible for Evidence until terminal sealing,
+                # while ACTIVE_CONTEXT may safely expose it as in progress.
+                issues.append(
+                    ValidationIssue(
+                        "WARNING",
+                        str(path),
+                        "Run is in progress and not yet eligible for Evidence",
+                    )
+                )
                 execution = manifest.get("execution", {})
                 if any(
                     execution.get(key) is not None
@@ -2432,7 +2449,10 @@ def _evidence_issues(
             if key in evidence:
                 issues.append(ValidationIssue("ERROR", str(path), f"duplicate Evidence version {key}"))
             evidence[key] = (path, item)
-            if not errors_only(schema_validation):
+            if (
+                item.get("status") == "finalized"
+                and not errors_only(schema_validation)
+            ):
                 try:
                     validate_evidence_basis(paths, item)
                 except (ValidationError, WorkflowError, OSError) as exc:
@@ -2707,6 +2727,7 @@ def _strong_confirmatory_evidence(
     try:
         from .confirmation import (
             confirmation_campaign_records,
+            load_confirmation_campaign_abandonment,
             load_final_confirmation,
         )
 
@@ -2714,6 +2735,16 @@ def _strong_confirmatory_evidence(
             paths, str(latest_ref.get("confirmation_id", ""))
         )
         current_campaign = confirmation_campaign_records(paths, latest)
+        current_campaign_id = str(
+            current_campaign[0].get("campaign", {}).get("campaign_id", "")
+        )
+        if (
+            load_confirmation_campaign_abandonment(
+                paths, current_campaign_id
+            )
+            is not None
+        ):
+            return False
         runs = run_index(paths)
     except (OSError, ValidationError, WorkflowError):
         return False
@@ -2803,7 +2834,7 @@ def _strong_confirmatory_evidence(
         )
         if slot is None:
             return False
-        if confirmation.get("schema_version") == 3:
+        if confirmation.get("schema_version") in {3, 4}:
             outcome_contract = slot.get("outcome_contract")
             if not isinstance(outcome_contract, dict):
                 return False
@@ -3969,7 +4000,29 @@ def _verdict_issues(
     paths: StudyPaths,
     evidence: dict[tuple[str, int], tuple[Path, dict[str, Any]]],
 ) -> list[ValidationIssue]:
-    issues: list[ValidationIssue] = []
+    from .review_verdict_sequence import (
+        require_consistent_review_verdict_authority,
+        review_verdict_sequence_temporary_paths,
+    )
+
+    issues: list[ValidationIssue] = [
+        ValidationIssue(
+            "ERROR",
+            str(path),
+            "unfinished Review/Verdict-authority sequence temporary file is present",
+        )
+        for path in review_verdict_sequence_temporary_paths(paths)
+    ]
+    try:
+        require_consistent_review_verdict_authority(paths)
+    except (OSError, ValidationError, WorkflowError) as exc:
+        issues.append(
+            ValidationIssue(
+                "ERROR",
+                str(paths.review_verdict_sequence),
+                str(exc),
+            )
+        )
     checkpoint_index: dict[str, dict[str, Any]] = {}
     for checkpoint_path in checkpoint_paths(paths):
         try:
@@ -3992,11 +4045,26 @@ def _verdict_issues(
             issues.extend(object_schema_issues(paths.root, "verdict", path, item))
             if item.get("verdict_sha256") != record_digest(item, "verdict_sha256"):
                 issues.append(ValidationIssue("ERROR", str(path), "verdict_sha256 does not match"))
-            if item.get("schema_version") == 2:
+            verdict_schema_version = item.get("schema_version")
+            if verdict_schema_version in {2, VERDICT_SCHEMA_VERSION}:
                 try:
-                    from .review import validate_review_basis
+                    from .review import (
+                        validate_legacy_review_basis,
+                        validate_review_basis,
+                    )
 
-                    validate_review_basis(paths, item.get("review_basis"))
+                    if verdict_schema_version == 2:
+                        validate_legacy_review_basis(
+                            paths,
+                            item.get("review_basis"),
+                        )
+                    else:
+                        validate_review_basis(
+                            paths,
+                            item.get("review_basis"),
+                            judged_scope=item.get("judged_scope"),
+                            require_current=False,
+                        )
                 except (ValidationError, OSError, ValueError) as exc:
                     issues.append(
                         ValidationIssue(
